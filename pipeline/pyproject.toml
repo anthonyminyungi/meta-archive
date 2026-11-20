@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meta-archive-pipeline"
+version = "0.1.0"
+description = "Desktop CLI pipeline to collect, verify, merge, and build personal Instagram and Facebook archives"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2",
+    "typer",
+    "rich",
+]
+
+[project.optional-dependencies]
+collect = [
+    "playwright",
+    "httpx",
+    "imageio-ffmpeg",
+]
+build = [
+    "pillow",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+meta-archive = "meta_archive_pipeline.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meta_archive_pipeline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
