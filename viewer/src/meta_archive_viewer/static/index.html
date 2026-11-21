@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Meta Archive — 개인 아카이브 뷰어</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="#/instagram">
+          <span class="brand-badge">MA</span>
+          <span class="brand-text">
+            <strong>Meta Archive</strong>
+            <small id="overview-badge">로딩 중...</small>
+          </span>
+        </a>
+        <nav class="nav-tabs" aria-label="주 메뉴">
+          <a class="nav-tab" data-route="instagram" href="#/instagram">Instagram</a>
+          <a class="nav-tab" data-route="facebook" href="#/facebook">Facebook</a>
+          <a class="nav-tab" data-route="messages" href="#/messages">Messages</a>
+          <a class="nav-tab" data-route="search" href="#/search">Search</a>
+        </nav>
+        <div class="topbar-actions">
+          <button id="theme-toggle" class="btn btn-ghost" type="button" title="테마 전환">
+            테마
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main id="app-main" class="app-main">
+      <div class="loading-box">아카이브를 불러오는 중입니다...</div>
+    </main>
+
+    <div id="modal-root" class="overlay hidden" role="dialog" aria-modal="true"></div>
+    <div id="lightbox-root" class="overlay lightbox-overlay hidden" role="dialog" aria-modal="true"></div>
+    <div id="drawer-root" class="drawer-overlay hidden" role="dialog" aria-modal="true"></div>
+
+    <script type="module" src="/static/js/app.js"></script>
+  </body>
+</html>
