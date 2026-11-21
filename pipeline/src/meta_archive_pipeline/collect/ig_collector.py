@@ -908,21 +908,26 @@ def _write_json_atomic(path: Path, data: Any) -> None:
 def download_post_media(
     request_context: Any,
     shortcode: str,
-    candidates: Sequence[IgMediaDownloadCandidate],
+    candidates: Sequence[Any],
     media_dir: Path,
     *,
     created_timestamp: int | None = None,
+    rel_dir: str = "media/instagram/posts",
 ) -> list[MediaItem]:
-    """Download, verify, and (if needed) DASH-mux media items for an Instagram post."""
+    """Download, verify, and (if needed) DASH-mux media items for an Instagram/Facebook post."""
     os.makedirs(to_long_path(media_dir), exist_ok=True)
-    headers = {"Referer": "https://www.instagram.com/"}
+    headers = {
+        "Referer": "https://www.facebook.com/"
+        if "facebook" in rel_dir
+        else "https://www.instagram.com/"
+    }
     saved_items: list[MediaItem] = []
 
     for idx, cand in enumerate(candidates, start=1):
         ext = ".mp4" if cand.media_type == "video" else ".jpg"
         filename = f"{shortcode}_{idx:02d}{ext}"
         dest = media_dir / filename
-        rel_path = normalize_rel_path(f"media/instagram/posts/{filename}")
+        rel_path = normalize_rel_path(f"{rel_dir}/{filename}")
 
         width = cand.width
         height = cand.height
