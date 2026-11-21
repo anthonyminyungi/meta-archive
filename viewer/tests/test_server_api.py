@@ -1,0 +1,855 @@
+"""Comprehensive API, FTS5/Korean search, HTTP Range streaming, and security tests for meta-archive-viewer."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from meta_archive_viewer.app import create_app
+
+_SCHEMA_DDL = """
+CREATE TABLE schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    user_id TEXT,
+    username TEXT,
+    full_name TEXT,
+    bio TEXT,
+    avatar_local_path TEXT,
+    counts_json TEXT,
+    exported_at TEXT
+);
+CREATE TABLE posts (
+    post_id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    shortcode TEXT,
+    url TEXT,
+    post_type TEXT,
+    author_username TEXT,
+    author_name TEXT,
+    created_at TEXT,
+    timestamp_unix INTEGER,
+    caption TEXT,
+    hashtags_json TEXT,
+    location_name TEXT,
+    location_lat REAL,
+    location_lng REAL,
+    tagged_users_json TEXT,
+    likes_count INTEGER,
+    likes_is_truncated INTEGER,
+    reactions_total INTEGER,
+    reactions_json TEXT,
+    album_name TEXT,
+    shared_post_json TEXT,
+    audience TEXT,
+    is_archived INTEGER,
+    is_collab INTEGER,
+    source TEXT,
+    raw_json TEXT
+);
+CREATE TABLE media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_type TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    media_id TEXT,
+    media_type TEXT,
+    local_path TEXT,
+    xmp_path TEXT,
+    original_uri TEXT,
+    width INTEGER,
+    height INTEGER,
+    duration_sec REAL,
+    has_audio INTEGER,
+    is_audio_muted INTEGER,
+    taken_at_exif TEXT,
+    gps_lat REAL,
+    gps_lng REAL,
+    sha256 TEXT,
+    byte_size INTEGER,
+    is_carousel_cover INTEGER
+);
+CREATE TABLE comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    comment_id TEXT,
+    post_id TEXT NOT NULL,
+    parent_comment_id TEXT,
+    platform TEXT NOT NULL,
+    depth INTEGER NOT NULL,
+    author_username TEXT,
+    author_name TEXT,
+    text TEXT,
+    created_at TEXT,
+    timestamp_unix INTEGER,
+    like_count INTEGER,
+    media_json TEXT,
+    stickers_json TEXT,
+    reactions_json TEXT
+);
+CREATE TABLE likes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    user_id TEXT,
+    username TEXT,
+    full_name TEXT,
+    profile_url TEXT
+);
+CREATE TABLE stories (
+    story_id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    created_at TEXT,
+    timestamp_unix INTEGER,
+    source TEXT,
+    highlight_id TEXT,
+    highlight_title TEXT,
+    highlight_cover TEXT,
+    location_name TEXT,
+    stickers_json TEXT,
+    likes_count INTEGER,
+    raw_json TEXT
+);
+CREATE TABLE connections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    user_id TEXT,
+    username TEXT,
+    full_name TEXT,
+    profile_url TEXT,
+    avatar_local_path TEXT,
+    connected_at TEXT,
+    timestamp_unix INTEGER,
+    match_confidence TEXT
+);
+CREATE TABLE message_threads (
+    thread_id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    title TEXT,
+    participants_json TEXT,
+    is_e2ee INTEGER,
+    is_pending INTEGER,
+    message_count INTEGER,
+    last_timestamp_unix INTEGER
+);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    message_id TEXT,
+    platform TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    sender TEXT,
+    timestamp_unix INTEGER,
+    timestamp_ms INTEGER,
+    created_at TEXT,
+    text TEXT,
+    reactions_json TEXT,
+    reply_to_id TEXT,
+    shared_link TEXT,
+    is_unsent INTEGER,
+    call_duration INTEGER
+);
+CREATE VIRTUAL TABLE search_fts USING fts5(
+    entity_type UNINDEXED,
+    entity_id UNINDEXED,
+    platform UNINDEXED,
+    author,
+    body,
+    timestamp_unix UNINDEXED,
+    tokenize='trigram'
+);
+"""
+
+
+def _build_fixture_archive(root: Path, schema_version: str = "1") -> Path:
+    media_dir = root / "media"
+    (media_dir / "instagram" / "posts").mkdir(parents=True, exist_ok=True)
+    (media_dir / "instagram" / "stories").mkdir(parents=True, exist_ok=True)
+    (media_dir / "instagram" / "avatars").mkdir(parents=True, exist_ok=True)
+    (media_dir / "facebook" / "posts").mkdir(parents=True, exist_ok=True)
+    (media_dir / "facebook" / "messages").mkdir(parents=True, exist_ok=True)
+
+    (media_dir / "instagram" / "posts" / "jeju.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"J" * 30)
+    video_bytes = bytes(range(100))
+    (media_dir / "instagram" / "posts" / "jeju_clip.mp4").write_bytes(video_bytes)
+    (media_dir / "instagram" / "stories" / "hl_01.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"S" * 20)
+    (media_dir / "instagram" / "avatars" / "me.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"A" * 16)
+    (media_dir / "facebook" / "posts" / "album_cover.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"F" * 24)
+    (media_dir / "facebook" / "messages" / "dm_photo.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"M" * 20)
+
+    db_path = root / "archive.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_SCHEMA_DDL)
+    conn.executemany(
+        "INSERT INTO schema_meta (key, value) VALUES (?, ?)",
+        [
+            ("schema_version", schema_version),
+            ("built_at", "2026-11-21T05:00:00+00:00"),
+            ("pipeline_version", "0.1.0"),
+        ],
+    )
+
+    conn.execute(
+        """
+        INSERT INTO profiles (platform, user_id, username, full_name, bio, avatar_local_path, counts_json, exported_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "instagram",
+            "ig_u1",
+            "my_ig",
+            "홍길동",
+            "제주 여행 기록",
+            "media/instagram/avatars/me.jpg",
+            json.dumps({"posts": 2, "followers": 10, "following": 20}),
+            "2026-11-20T10:00:00+09:00",
+        ),
+    )
+
+    # Posts: IG active, IG archived, FB album post
+    conn.execute(
+        """
+        INSERT INTO posts (
+            post_id, platform, shortcode, url, post_type, author_username, author_name,
+            created_at, timestamp_unix, caption, hashtags_json, location_name, location_lat,
+            location_lng, tagged_users_json, likes_count, likes_is_truncated,
+            reactions_total, reactions_json, album_name, shared_post_json, audience,
+            is_archived, is_collab, source, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "ig:AAA111",
+            "instagram",
+            "AAA111",
+            "https://www.instagram.com/p/AAA111/",
+            "carousel",
+            "my_ig",
+            "홍길동",
+            "2025-05-10T14:30:00+09:00",
+            1746855000,
+            "제주도 바다가 정말 예뻤다 #제주도",
+            json.dumps(["제주도"]),
+            "제주 함덕",
+            33.54,
+            126.67,
+            json.dumps([{"username": "friend_one", "full_name": "김철수"}]),
+            12,
+            0,
+            0,
+            "{}",
+            None,
+            None,
+            None,
+            0,
+            0,
+            "merged",
+            "{}",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO posts (
+            post_id, platform, shortcode, url, post_type, author_username, author_name,
+            created_at, timestamp_unix, caption, hashtags_json, location_name, location_lat,
+            location_lng, tagged_users_json, likes_count, likes_is_truncated,
+            reactions_total, reactions_json, album_name, shared_post_json, audience,
+            is_archived, is_collab, source, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "ig:ARCH99",
+            "instagram",
+            "ARCH99",
+            None,
+            "photo",
+            "my_ig",
+            "홍길동",
+            "2024-02-01T10:00:00+09:00",
+            1706749200,
+            "보관해 둔 생일 사진",
+            json.dumps(["생일"]),
+            None,
+            None,
+            None,
+            "[]",
+            3,
+            0,
+            0,
+            "{}",
+            None,
+            None,
+            None,
+            1,
+            0,
+            "official",
+            "{}",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO posts (
+            post_id, platform, shortcode, url, post_type, author_username, author_name,
+            created_at, timestamp_unix, caption, hashtags_json, location_name, location_lat,
+            location_lng, tagged_users_json, likes_count, likes_is_truncated,
+            reactions_total, reactions_json, album_name, shared_post_json, audience,
+            is_archived, is_collab, source, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "fb:post_1",
+            "facebook",
+            None,
+            None,
+            "photo",
+            "fb_me",
+            "홍길동",
+            "2024-08-15T18:00:00+09:00",
+            1723712400,
+            "제주 여행 앨범 업로드 고마워요",
+            "[]",
+            "서귀포",
+            None,
+            None,
+            "[]",
+            0,
+            0,
+            5,
+            json.dumps({"total": 5, "breakdown": {"LIKE": 3, "LOVE": 2}}),
+            "여름휴가",
+            None,
+            "Friends",
+            0,
+            0,
+            "official",
+            "{}",
+        ),
+    )
+
+    # Media rows
+    conn.executemany(
+        """
+        INSERT INTO media (
+            owner_type, owner_id, platform, seq, media_id, media_type,
+            local_path, xmp_path, original_uri, width, height, duration_sec,
+            has_audio, is_audio_muted, taken_at_exif, gps_lat, gps_lng,
+            sha256, byte_size, is_carousel_cover
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "post",
+                "ig:AAA111",
+                "instagram",
+                0,
+                "m1",
+                "image",
+                "media/instagram/posts/jeju.jpg",
+                None,
+                None,
+                1080,
+                1080,
+                None,
+                None,
+                None,
+                "2025:05:10 14:30:00+09:00",
+                None,
+                None,
+                "sha1",
+                34,
+                0,
+            ),
+            (
+                "post",
+                "ig:AAA111",
+                "instagram",
+                1,
+                "m2",
+                "video",
+                "media/instagram/posts/jeju_clip.mp4",
+                None,
+                None,
+                1080,
+                1920,
+                12.5,
+                1,
+                0,
+                None,
+                None,
+                None,
+                "sha2",
+                100,
+                0,
+            ),
+            (
+                "post",
+                "fb:post_1",
+                "facebook",
+                0,
+                "m3",
+                "image",
+                "media/facebook/posts/album_cover.jpg",
+                None,
+                None,
+                800,
+                600,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "sha3",
+                28,
+                0,
+            ),
+            (
+                "story",
+                "ig_story_1",
+                "instagram",
+                0,
+                "ms1",
+                "image",
+                "media/instagram/stories/hl_01.jpg",
+                None,
+                None,
+                1080,
+                1920,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "sha4",
+                24,
+                0,
+            ),
+            (
+                "message",
+                "fb/e2ee:thread_1#1",
+                "facebook",
+                0,
+                "mm1",
+                "image",
+                "media/facebook/messages/dm_photo.jpg",
+                None,
+                None,
+                640,
+                480,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "sha5",
+                24,
+                0,
+            ),
+        ],
+    )
+
+    # Nested comments (parent depth 0 -> child depth 1)
+    conn.executemany(
+        """
+        INSERT INTO comments (
+            comment_id, post_id, parent_comment_id, platform, depth,
+            author_username, author_name, text, created_at, timestamp_unix,
+            like_count, media_json, stickers_json, reactions_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "c1",
+                "ig:AAA111",
+                None,
+                "instagram",
+                0,
+                "friend_one",
+                "김철수",
+                "생일 축하 겸 제주도 멋지다!",
+                "2025-05-10T15:00:00+09:00",
+                1746856800,
+                2,
+                "[]",
+                "[]",
+                None,
+            ),
+            (
+                "c2",
+                "ig:AAA111",
+                "c1",
+                "instagram",
+                1,
+                "my_ig",
+                "홍길동",
+                "고마워요 철수야",
+                "2025-05-10T15:05:00+09:00",
+                1746857100,
+                1,
+                "[]",
+                "[]",
+                None,
+            ),
+        ],
+    )
+
+    conn.execute(
+        """
+        INSERT INTO likes (post_id, platform, user_id, username, full_name, profile_url)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("ig:AAA111", "instagram", "u_friend", "friend_one", "김철수", None),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO stories (
+            story_id, platform, created_at, timestamp_unix, source,
+            highlight_id, highlight_title, highlight_cover, location_name, stickers_json, likes_count, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "ig_story_1",
+            "instagram",
+            "2025-05-10T16:00:00+09:00",
+            1746860400,
+            "merged",
+            "hl_jeju",
+            "제주기록",
+            "media/instagram/stories/hl_01.jpg",
+            "애월",
+            json.dumps(["바다"]),
+            4,
+            "{}",
+        ),
+    )
+
+    conn.executemany(
+        """
+        INSERT INTO connections (
+            platform, relation, user_id, username, full_name,
+            profile_url, avatar_local_path, connected_at, timestamp_unix, match_confidence
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "instagram",
+                "follower",
+                "u_friend",
+                "friend_one",
+                "김철수",
+                "https://www.instagram.com/friend_one/",
+                None,
+                "2024-01-01T00:00:00+09:00",
+                1704034800,
+                "high",
+            ),
+            (
+                "facebook",
+                "friend",
+                "fb_u2",
+                None,
+                "이영희",
+                None,
+                None,
+                "2023-03-01T00:00:00+09:00",
+                1677596400,
+                "exact",
+            ),
+        ],
+    )
+
+    conn.execute(
+        """
+        INSERT INTO message_threads (
+            thread_id, platform, title, participants_json, is_e2ee, is_pending, message_count, last_timestamp_unix
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "fb/e2ee:thread_1",
+            "facebook",
+            "김철수와의 비밀채팅",
+            json.dumps([{"username": "friend_one", "full_name": "김철수"}]),
+            1,
+            0,
+            2,
+            1746864000,
+        ),
+    )
+    conn.executemany(
+        """
+        INSERT INTO messages (
+            thread_id, message_id, platform, seq, sender, timestamp_unix,
+            timestamp_ms, created_at, text, reactions_json, reply_to_id, shared_link, is_unsent, call_duration
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "fb/e2ee:thread_1",
+                "msg_0",
+                "facebook",
+                0,
+                "김철수",
+                1746863000,
+                1746863000000,
+                "2025-05-10T16:43:20+09:00",
+                "제주 사진 보내줄게",
+                json.dumps([{"reaction": "❤", "actor": "홍길동"}]),
+                None,
+                None,
+                0,
+                None,
+            ),
+            (
+                "fb/e2ee:thread_1",
+                "msg_1",
+                "facebook",
+                1,
+                "홍길동",
+                1746864000,
+                1746864000000,
+                "2025-05-10T17:00:00+09:00",
+                "사진 고마워요",
+                "[]",
+                "msg_0",
+                None,
+                0,
+                None,
+            ),
+        ],
+    )
+
+    conn.executemany(
+        """
+        INSERT INTO search_fts (entity_type, entity_id, platform, author, body, timestamp_unix)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("post", "ig:AAA111", "instagram", "my_ig 홍길동", "제주도 바다가 정말 예뻤다 #제주도", 1746855000),
+            ("post", "ig:ARCH99", "instagram", "my_ig 홍길동", "보관해 둔 생일 사진 #생일", 1706749200),
+            ("post", "fb:post_1", "facebook", "fb_me 홍길동", "제주 여행 앨범 업로드 고마워요 여름휴가", 1723712400),
+            ("comment", "ig:AAA111", "instagram", "friend_one 김철수", "생일 축하 겸 제주도 멋지다!", 1746856800),
+            ("comment", "ig:AAA111", "instagram", "my_ig 홍길동", "고마워요 철수야", 1746857100),
+            ("message", "fb/e2ee:thread_1", "facebook", "김철수", "제주 사진 보내줄게", 1746863000),
+            ("story", "ig_story_1", "instagram", "", "제주기록 애월 바다", 1746860400),
+            ("connection", "friend_one", "instagram", "friend_one 김철수", "friend_one 김철수", 1704034800),
+        ],
+    )
+
+    conn.commit()
+    conn.execute("PRAGMA journal_mode=DELETE;")
+    conn.execute("VACUUM;")
+    conn.commit()
+    conn.close()
+    return root
+
+
+@pytest.fixture(scope="module")
+def archive_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Path, TestClient]]:
+    archive_dir = _build_fixture_archive(tmp_path_factory.mktemp("archive"))
+    with TestClient(create_app(archive_dir)) as client:
+        yield archive_dir, client
+
+
+def test_health_overview_and_ro_mode(archive_client: tuple[Path, TestClient]) -> None:
+    archive_dir, client = archive_client
+
+    res = client.get("/api/health")
+    assert res.status_code == 200
+    assert res.json()["schema_version"] == "1"
+
+    ov = client.get("/api/overview").json()
+    assert ov["totals"]["posts"] == 3
+    assert ov["totals"]["comments"] == 2
+    assert ov["by_platform"]["instagram"]["posts"] == 2
+    assert ov["by_platform"]["facebook"]["posts"] == 1
+
+    profiles = client.get("/api/profiles", params={"platform": "instagram"}).json()
+    assert len(profiles["items"]) == 1
+    assert profiles["items"][0]["username"] == "my_ig"
+
+    # immutable=1 read-only queries must never leave WAL or SHM sidecar files
+    for sidecar in ("archive.sqlite-wal", "archive.sqlite-shm", "archive.sqlite-journal"):
+        assert not (archive_dir / sidecar).exists()
+
+
+def test_missing_and_incompatible_schema_errors(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path / "missing")) as missing_client:
+        assert missing_client.get("/api/health").status_code == 503
+
+    bad_dir = _build_fixture_archive(tmp_path / "bad_schema", schema_version="999")
+    with TestClient(create_app(bad_dir)) as bad_client:
+        assert bad_client.get("/api/health").status_code == 500
+
+
+def test_posts_nested_comments_likes_stories_and_fb_views(
+    archive_client: tuple[Path, TestClient],
+) -> None:
+    _, client = archive_client
+
+    # Filter archived Instagram posts
+    res_arch = client.get("/api/posts", params={"platform": "instagram", "archived": "true"}).json()
+    assert res_arch["total"] == 1
+    assert res_arch["items"][0]["post_id"] == "ig:ARCH99"
+
+    # Year/month filter on Facebook posts
+    res_fb = client.get(
+        "/api/posts",
+        params={"platform": "facebook", "year": 2024, "month": 8, "album": "여름휴가"},
+    ).json()
+    assert res_fb["total"] == 1
+    assert res_fb["items"][0]["reactions"]["breakdown"]["LOVE"] == 2
+
+    # Post detail reconstructs nested comments + likes
+    detail = client.get("/api/posts/ig:AAA111").json()
+    assert len(detail["media"]) == 2
+    assert len(detail["comments"]) == 1
+    assert detail["comments"][0]["author_username"] == "friend_one"
+    assert len(detail["comments"][0]["replies"]) == 1
+    assert detail["comments"][0]["replies"][0]["text"] == "고마워요 철수야"
+    assert detail["likes_users"][0]["username"] == "friend_one"
+
+    # Highlights, stories, connections, albums, timeline
+    hls = client.get("/api/highlights").json()["items"]
+    assert hls[0]["highlight_id"] == "hl_jeju"
+    assert hls[0]["count"] == 1
+
+    stories = client.get("/api/stories", params={"highlight_id": "hl_jeju"}).json()
+    assert stories["total"] == 1
+    assert stories["items"][0]["media"]["local_path"] == "media/instagram/stories/hl_01.jpg"
+
+    conns = client.get("/api/connections", params={"platform": "instagram", "q": "김철수"}).json()
+    assert conns["total"] == 1
+    assert conns["items"][0]["username"] == "friend_one"
+
+    albums = client.get("/api/albums").json()["items"]
+    assert albums[0]["album_name"] == "여름휴가"
+
+    timeline = client.get("/api/timeline").json()["items"]
+    assert timeline == [{"year": 2024, "month": 8, "count": 1}]
+
+
+def test_threads_e2ee_message_media_and_person_activity(
+    archive_client: tuple[Path, TestClient],
+) -> None:
+    _, client = archive_client
+
+    threads = client.get("/api/threads", params={"platform": "facebook"}).json()
+    assert threads["total"] == 1
+    assert threads["items"][0]["is_e2ee"] is True
+
+    msgs = client.get("/api/threads/fb/e2ee:thread_1/messages").json()
+    assert msgs["total"] == 2
+    assert msgs["items"][1]["seq"] == 1
+    assert len(msgs["items"][1]["media"]) == 1
+    assert msgs["items"][1]["media"][0]["local_path"] == "media/facebook/messages/dm_photo.jpg"
+
+    # Person activity lookup expands username <-> full_name via connections
+    person = client.get("/api/people/friend_one").json()
+    assert len(person["connections"]) == 1
+    assert len(person["comments"]) == 1
+    assert len(person["liked_posts"]) == 1
+    assert len(person["messages"]) == 1
+    assert person["messages"][0]["thread_id"] == "fb/e2ee:thread_1"
+
+
+def test_hybrid_korean_search_short_and_trigram(
+    archive_client: tuple[Path, TestClient],
+) -> None:
+    _, client = archive_client
+
+    # 2-char Korean fallback via instr()
+    short_jeju = client.get("/api/search", params={"q": "제주"}).json()
+    assert short_jeju["mode"] == "instr_short"
+    assert short_jeju["total"] >= 4
+
+    short_bday = client.get("/api/search", params={"q": "생일", "entity_type": "comment"}).json()
+    assert short_bday["mode"] == "instr_short"
+    assert short_bday["total"] == 1
+
+    # 3+ char Korean via FTS5 trigram
+    tri = client.get("/api/search", params={"q": "고마워요"}).json()
+    assert tri["mode"] == "fts5_trigram"
+    assert tri["total"] == 2
+
+    tri_ig = client.get("/api/search", params={"q": "제주도", "platform": "instagram"}).json()
+    assert tri_ig["mode"] == "fts5_trigram"
+    assert tri_ig["total"] >= 2
+
+
+def test_media_range_streaming_and_path_traversal_guards(
+    archive_client: tuple[Path, TestClient],
+) -> None:
+    _, client = archive_client
+
+    # Full GET and HEAD
+    full_res = client.get("/media/instagram/posts/jeju_clip.mp4")
+    assert full_res.status_code == 200
+    assert full_res.headers["accept-ranges"] == "bytes"
+    assert len(full_res.content) == 100
+
+    head_res = client.head("/media/media/instagram/posts/jeju_clip.mp4")
+    assert head_res.status_code == 200
+    assert head_res.headers["content-length"] == "100"
+    assert head_res.content == b""
+
+    # HTTP Range 206 partial responses
+    r1 = client.get("/media/instagram/posts/jeju_clip.mp4", headers={"Range": "bytes=0-9"})
+    assert r1.status_code == 206
+    assert r1.headers["content-range"] == "bytes 0-9/100"
+    assert r1.content == bytes(range(0, 10))
+
+    r2 = client.get("/media/instagram/posts/jeju_clip.mp4", headers={"Range": "bytes=90-"})
+    assert r2.status_code == 206
+    assert r2.headers["content-range"] == "bytes 90-99/100"
+    assert r2.content == bytes(range(90, 100))
+
+    r3 = client.get("/media/instagram/posts/jeju_clip.mp4", headers={"Range": "bytes=-15"})
+    assert r3.status_code == 206
+    assert r3.headers["content-range"] == "bytes 85-99/100"
+    assert r3.content == bytes(range(85, 100))
+
+    # Out-of-bounds Range -> 416
+    r_bad = client.get("/media/instagram/posts/jeju_clip.mp4", headers={"Range": "bytes=500-600"})
+    assert r_bad.status_code == 416
+
+    # Path traversal and non-media files must NEVER succeed
+    for bad_path in (
+        "/media/../archive.sqlite",
+        "/media/%2e%2e/archive.sqlite",
+        "/media/archive.sqlite",
+        "/media/..\\archive.sqlite",
+        "/media/C:/Windows/win.ini",
+    ):
+        resp = client.get(bad_path)
+        assert resp.status_code in (400, 404), f"Unexpected {resp.status_code} for {bad_path}"
+
+
+def test_static_spa_serves_and_has_zero_external_cdns(
+    archive_client: tuple[Path, TestClient],
+) -> None:
+    _, client = archive_client
+
+    idx = client.get("/")
+    assert idx.status_code == 200
+    assert "text/html" in idx.headers["content-type"]
+
+    app_js = client.get("/static/js/app.js")
+    assert app_js.status_code == 200
+
+    static_dir = Path(__file__).resolve().parents[1] / "src" / "meta_archive_viewer" / "static"
+    for asset in static_dir.rglob("*"):
+        if asset.is_file() and asset.suffix in {".html", ".css", ".js"}:
+            text = asset.read_text(encoding="utf-8")
+            assert "http://" not in text and "https://" not in text, f"External URL found in {asset}"
