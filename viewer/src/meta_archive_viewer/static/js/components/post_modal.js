@@ -1,7 +1,7 @@
 /** Full post detail modal showing carousel, metadata, likes list, and nested comments. */
 
 import { api } from "../api.js";
-import { clear, el, formatDate, personButton } from "../dom.js";
+import { clear, el, extractReactionEntries, formatDate, personButton, renderSharedCard } from "../dom.js";
 import { renderCarousel } from "./carousel.js";
 import { renderCommentTree } from "./comments.js";
 
@@ -89,16 +89,7 @@ export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson }) {
             )
           : null;
 
-      let sharedBox = null;
-      if (post.shared_post) {
-        sharedBox = el(
-          "div",
-          { className: "shared-box" },
-          post.shared_post.title ? el("div", null, el("strong", null, post.shared_post.title)) : null,
-          post.shared_post.text ? el("div", null, post.shared_post.text) : null,
-          post.shared_post.url ? el("div", { style: "word-break:break-all;" }, post.shared_post.url) : null
-        );
-      }
+      const sharedBox = renderSharedCard(post.shared_post, onOpenLightbox);
 
       const reactionsSummary = [];
       if (post.likes_count > 0 || (post.likes_users && post.likes_users.length > 0)) {
@@ -110,10 +101,8 @@ export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson }) {
           )
         );
       }
-      if (post.reactions && post.reactions.breakdown) {
-        for (const [rtype, cnt] of Object.entries(post.reactions.breakdown)) {
-          reactionsSummary.push(el("span", { className: "pill" }, `${rtype}: ${cnt}`));
-        }
+      for (const [rtype, cnt] of extractReactionEntries(post.reactions)) {
+        reactionsSummary.push(el("span", { className: "pill" }, `${rtype}: ${cnt}`));
       }
 
       const likesBlock =

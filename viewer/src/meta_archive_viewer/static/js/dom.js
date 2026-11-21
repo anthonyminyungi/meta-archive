@@ -116,3 +116,76 @@ export function personButton(username, fullName, onOpenPerson) {
     label
   );
 }
+
+export function safeExternalHref(rawUrl) {
+  if (!rawUrl) return null;
+  try {
+    const parsed = new URL(String(rawUrl));
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
+export function extractReactionEntries(reactions) {
+  if (!reactions || typeof reactions !== "object") return [];
+  const map = reactions.by_type || reactions.breakdown;
+  if (!map || typeof map !== "object") return [];
+  return Object.entries(map);
+}
+
+export function renderSharedCard(sharedPost, onOpenLightbox) {
+  if (!sharedPost) return null;
+  const thumbSrc = mediaUrl(sharedPost.thumbnail_local_path);
+  const thumbEl = thumbSrc
+    ? el("img", {
+        className: "shared-card-thumb",
+        src: thumbSrc,
+        alt: sharedPost.title || sharedPost.domain || "shared link thumbnail",
+        loading: "lazy",
+        onClick: onOpenLightbox
+          ? () => onOpenLightbox([{ local_path: sharedPost.thumbnail_local_path, media_type: "image" }], 0)
+          : undefined,
+      })
+    : null;
+
+  const metaRow =
+    sharedPost.domain || sharedPost.author_name
+      ? el(
+          "div",
+          { className: "shared-card-meta" },
+          sharedPost.domain ? el("span", { className: "pill" }, sharedPost.domain) : null,
+          sharedPost.author_name ? el("span", { className: "pill" }, `원작자: ${sharedPost.author_name}`) : null
+        )
+      : null;
+
+  const href = safeExternalHref(sharedPost.url);
+  const urlNode = sharedPost.url
+    ? href
+      ? el(
+          "a",
+          {
+            className: "shared-card-url",
+            href,
+            target: "_blank",
+            rel: "noopener noreferrer",
+          },
+          sharedPost.url
+        )
+      : el("div", { className: "shared-card-url" }, sharedPost.url)
+    : null;
+
+  return el(
+    "div",
+    { className: "shared-card" },
+    thumbEl,
+    el(
+      "div",
+      { className: "shared-card-body" },
+      metaRow,
+      sharedPost.title ? el("div", { className: "shared-card-title" }, sharedPost.title) : null,
+      sharedPost.text ? el("div", { className: "shared-card-desc" }, sharedPost.text) : null,
+      urlNode
+    )
+  );
+}

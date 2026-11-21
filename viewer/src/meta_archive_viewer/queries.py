@@ -296,7 +296,9 @@ class ArchiveReader:
         if archived is not None:
             clauses.append("COALESCE(is_archived, 0) = ?")
             params.append(1 if archived else 0)
-        if post_type:
+        if post_type == "original":
+            clauses.append("COALESCE(post_type, 'post') != 'shared'")
+        elif post_type:
             clauses.append("post_type = ?")
             params.append(post_type)
         if album:

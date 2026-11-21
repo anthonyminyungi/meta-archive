@@ -1,7 +1,15 @@
 /** Facebook archive view: timeline year/month jump, reactions & nested comments, albums, friends. */
 
 import { api, mediaUrl } from "../api.js";
-import { avatarEl, clear, el, formatDate, personButton } from "../dom.js";
+import {
+  avatarEl,
+  clear,
+  el,
+  extractReactionEntries,
+  formatDate,
+  personButton,
+  renderSharedCard,
+} from "../dom.js";
 import { renderCarousel } from "../components/carousel.js";
 
 export async function renderFacebookView(container, ctx) {
@@ -23,6 +31,7 @@ export async function renderFacebookView(container, ctx) {
     year: null,
     month: null,
     album: null,
+    postTypeFilter: "", // "" | "original" | "shared"
     offset: 0,
     limit: 25,
     total: 0,
@@ -131,11 +140,31 @@ export async function renderFacebookView(container, ctx) {
       const chips = [];
       if (state.year) chips.push(`${state.year}년${state.month ? ` ${state.month}월` : ""}`);
       if (state.album) chips.push(`앨범: ${state.album}`);
+
+      const typeButtons = [
+        ["", "전체"],
+        ["original", "내 글·사진만"],
+        ["shared", "공유 글만"],
+      ].map(([val, label]) =>
+        el(
+          "button",
+          {
+            type: "button",
+            className: `btn${state.postTypeFilter === val ? " btn-primary" : ""}`,
+            onClick: () => {
+              state.postTypeFilter = val;
+              loadTimelinePosts(true);
+            },
+          },
+          label
+        )
+      );
+
       activeFilterRow.appendChild(
         el(
           "div",
           { className: "toolbar-group" },
-          el("span", { className: "pill pill-accent" }, chips.length ? chips.join(" · ") : "전체 게시물"),
+          el("span", { className: "pill pill-accent" }, chips.length ? chips.join(" · ") : "전체 기간"),
           el("span", { className: "pill" }, `${state.items.length} / ${state.total}건`),
           chips.length
             ? el(
@@ -150,11 +179,12 @@ export async function renderFacebookView(container, ctx) {
                     loadTimelinePosts(true);
                   },
                 },
-                "필터 초기화"
+                "기간/앨범 초기화"
               )
             : null
         )
       );
+      activeFilterRow.appendChild(el("div", { className: "toolbar-group" }, typeButtons));
 
       clear(feedHost);
       moreWrap.classList.toggle("hidden", state.items.length >= state.total);
@@ -169,22 +199,11 @@ export async function renderFacebookView(container, ctx) {
         if (post.reactions_total > 0) {
           reactionPills.push(el("span", { className: "pill pill-accent" }, `반응 ${post.reactions_total}`));
         }
-        if (post.reactions && post.reactions.breakdown) {
-          for (const [k, v] of Object.entries(post.reactions.breakdown)) {
-            reactionPills.push(el("span", { className: "pill" }, `${k} ${v}`));
-          }
+        for (const [k, v] of extractReactionEntries(post.reactions)) {
+          reactionPills.push(el("span", { className: "pill" }, `${k} ${v}`));
         }
 
-        let sharedNode = null;
-        if (post.shared_post) {
-          sharedNode = el(
-            "div",
-            { className: "shared-box" },
-            post.shared_post.title ? el("div", null, el("strong", null, post.shared_post.title)) : null,
-            post.shared_post.text ? el("div", null, post.shared_post.text) : null,
-            post.shared_post.url ? el("div", { style: "word-break:break-all;font-size:0.82rem;" }, post.shared_post.url) : null
-          );
-        }
+        const sharedNode = renderSharedCard(post.shared_post, ctx.openLightbox);
 
         feedHost.appendChild(
           el(
@@ -197,6 +216,7 @@ export async function renderFacebookView(container, ctx) {
                 "div",
                 { className: "post-author-block" },
                 personButton(post.author_username, post.author_name, ctx.openPerson),
+                post.post_type === "shared" ? el("span", { className: "pill pill-warn" }, "공유") : null,
                 post.album_name ? el("span", { className: "pill" }, `앨범: ${post.album_name}`) : null,
                 post.audience ? el("span", { className: "pill" }, post.audience) : null
               ),
@@ -233,6 +253,7 @@ export async function renderFacebookView(container, ctx) {
         year: state.year,
         month: state.month,
         album: state.album,
+        post_type: state.postTypeFilter || undefined,
       });
       state.total = res.total;
       state.items.push(...res.items);
