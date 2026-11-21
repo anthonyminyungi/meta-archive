@@ -22,6 +22,7 @@ from meta_archive_pipeline.collect.cdp import (
     extract_ssr_json_payloads,
 )
 from meta_archive_pipeline.collect.ig_collector import download_post_media, parse_dash_manifest
+from meta_archive_pipeline.official.fb_parser import clean_fb_external_url, extract_domain
 from meta_archive_pipeline.schema.models import (
     Comment,
     Connection,
@@ -35,6 +36,7 @@ from meta_archive_pipeline.schema.models import (
 from meta_archive_pipeline.schema.paths import normalize_rel_path
 from meta_archive_pipeline.utils.checkpoint import CheckpointStore
 from meta_archive_pipeline.utils.fs import atomic_write_bytes
+from meta_archive_pipeline.utils.media import download_media_via_context, verify_image
 
 FbPass = Literal["posts", "friends", "albums"]
 
@@ -69,6 +71,7 @@ class FbMediaDownloadCandidate:
     width: int | None = None
     height: int | None = None
     is_carousel_cover: bool = False
+    is_link_thumbnail: bool = False
 
 
 @dataclass
@@ -400,6 +403,114 @@ def _extract_fb_media_from_attachment(
         )
 
 
+def _pick_fb_text(val: Any) -> str | None:
+    if isinstance(val, str):
+        return val.strip() or None
+    if isinstance(val, dict) and isinstance(val.get("text"), str):
+        return val["text"].strip() or None
+    return None
+
+
+def _is_fb_internal_media_url(url: str) -> bool:
+    dom = extract_domain(url) or ""
+    if not (dom == "facebook.com" or dom.endswith(".facebook.com") or dom == "fb.com"):
+        return False
+    low = url.lower()
+    return any(seg in low for seg in ("/photo", "/videos/", "/reel/", "/watch", "/posts/"))
+
+
+def _extract_link_card_from_attachment(
+    att: dict[str, Any],
+) -> tuple[SharedPostRef, str | None] | None:
+    """Extract external link card (URL, title, description, domain, thumbnail URL) from a Comet attachment."""
+    nodes: list[dict[str, Any]] = [att]
+    styles = att.get("styles")
+    if isinstance(styles, dict) and isinstance(styles.get("attachment"), dict):
+        satt = styles["attachment"]
+        nodes.append(satt)
+        renderer = satt.get("story_attachment_link_renderer")
+        if isinstance(renderer, dict) and isinstance(renderer.get("attachment"), dict):
+            nodes.append(renderer["attachment"])
+
+    # Do not treat regular photo/video uploads or albums as external link cards.
+    for node in nodes:
+        media_obj = node.get("media")
+        if isinstance(media_obj, dict) and (
+            media_obj.get("__typename") in ("Photo", "Video")
+            or media_obj.get("album")
+            or media_obj.get("playable_url")
+            or media_obj.get("playable_url_quality_hd")
+            or media_obj.get("dash_manifest")
+            or media_obj.get("video_dash_manifest")
+        ):
+            return None
+
+    clean_url: str | None = None
+    title: str | None = None
+    desc: str | None = None
+    source_name: str | None = None
+    thumb_url: str | None = None
+
+    for node in nodes:
+        raw_candidates: list[Any] = [node.get("url")]
+        if isinstance(node.get("target"), dict):
+            raw_candidates.extend([node["target"].get("external_url"), node["target"].get("url")])
+        if isinstance(node.get("action_links"), list) and node["action_links"]:
+            first_act = node["action_links"][0]
+            if isinstance(first_act, dict):
+                raw_candidates.append(first_act.get("url"))
+
+        for raw_u in raw_candidates:
+            if not clean_url and isinstance(raw_u, str):
+                clean_url = clean_fb_external_url(raw_u)
+
+        title = title or _pick_fb_text(node.get("title_with_entities")) or _pick_fb_text(node.get("title"))
+        desc = desc or _pick_fb_text(node.get("description")) or _pick_fb_text(node.get("subtitle"))
+        source_name = source_name or _pick_fb_text(node.get("source"))
+
+        if not thumb_url and isinstance(node.get("media"), dict):
+            m = node["media"]
+            for img_key in ("image", "photo_image", "viewer_image"):
+                img = m.get(img_key)
+                if isinstance(img, dict) and isinstance(img.get("uri"), str) and img["uri"]:
+                    thumb_url = img["uri"]
+                    break
+
+    if not clean_url:
+        return None
+    if _is_fb_internal_media_url(clean_url) and not any((title, desc, source_name)):
+        return None
+
+    dom = extract_domain(clean_url)
+    if dom in ("facebook.com", "fb.com") and source_name:
+        dom = source_name
+    ref = SharedPostRef(
+        url=clean_url,
+        title=title,
+        text=desc,
+        domain=dom or source_name,
+    )
+    return ref, thumb_url
+
+
+def _merge_shared_post_refs(
+    first: SharedPostRef | None,
+    second: SharedPostRef | None,
+) -> SharedPostRef | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return SharedPostRef(
+        url=first.url or second.url,
+        author_name=first.author_name or second.author_name,
+        text=first.text or second.text,
+        title=first.title or second.title,
+        domain=first.domain or second.domain,
+        thumbnail_local_path=first.thumbnail_local_path or second.thumbnail_local_path,
+    )
+
+
 def _find_story_feedback(story: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(story.get("feedback"), dict):
         return story["feedback"]
@@ -529,11 +640,15 @@ def extract_fb_posts_from_payloads(
                     if isinstance(att_msg, dict) and isinstance(att_msg.get("text"), str)
                     else None
                 )
+                att_url = clean_fb_external_url(
+                    raw_attached.get("permalink_url") or raw_attached.get("url")
+                )
                 shared_post = SharedPostRef(
-                    url=raw_attached.get("permalink_url") or raw_attached.get("url"),
+                    url=att_url,
                     author_name=att_author,
                     text=att_text,
                     title=raw_attached.get("title") if isinstance(raw_attached.get("title"), str) else None,
+                    domain=extract_domain(att_url),
                 )
 
             feedback = _find_story_feedback(d)
@@ -563,17 +678,36 @@ def extract_fb_posts_from_payloads(
                                 if not album_name and isinstance(m.get("album"), dict):
                                     album_name = m["album"].get("name")
                                 _extract_fb_media_from_attachment(post_id, m, post_candidates)
-                    elif isinstance(att.get("media"), dict):
+                        continue
+
+                    link_info = _extract_link_card_from_attachment(att)
+                    if link_info is not None:
+                        link_ref, thumb_url = link_info
+                        shared_post = _merge_shared_post_refs(shared_post, link_ref)
+                        if thumb_url:
+                            post_candidates.append(
+                                FbMediaDownloadCandidate(
+                                    post_id=post_id,
+                                    media_id=None,
+                                    media_type="image",
+                                    progressive_url=thumb_url,
+                                    is_link_thumbnail=True,
+                                )
+                            )
+                        continue
+
+                    if isinstance(att.get("media"), dict):
                         m = att["media"]
                         if not album_name and isinstance(m.get("album"), dict):
                             album_name = m["album"].get("name")
                         _extract_fb_media_from_attachment(post_id, m, post_candidates)
 
+            regular_candidates = [c for c in post_candidates if not c.is_link_thumbnail]
             if album_name:
                 post_type: Literal["post", "carousel", "reel", "album_photo", "shared", "other"] = "album_photo"
-            elif shared_post is not None and not post_candidates:
+            elif shared_post is not None and not regular_candidates:
                 post_type = "shared"
-            elif len(post_candidates) > 1:
+            elif len(regular_candidates) > 1:
                 post_type = "carousel"
             else:
                 post_type = "post"
@@ -614,7 +748,7 @@ def extract_fb_posts_from_payloads(
                         "likes": LikesInfo(count=best_rx.total or None),
                         "comments": merged_comments,
                         "album_name": prev.album_name or new_post.album_name,
-                        "shared_post": prev.shared_post or new_post.shared_post,
+                        "shared_post": _merge_shared_post_refs(prev.shared_post, new_post.shared_post),
                     }
                 )
                 if not candidates_by_post[post_id] and post_candidates:
@@ -837,17 +971,44 @@ class FbCollector:
                     continue
                 store.set_status(post.post_id, "fetched")
                 post_cands = cand_by_post.get(post.post_id, [])
-                if self.request_context is not None and post_cands:
+                regular_cands = [c for c in post_cands if not c.is_link_thumbnail]
+                thumb_cands = [c for c in post_cands if c.is_link_thumbnail and c.progressive_url]
+                if self.request_context is not None and regular_cands:
                     saved_media = download_post_media(
                         self.request_context,
                         _safe_filename_stem(post.post_id),
-                        post_cands,
+                        regular_cands,
                         out / "media" / "posts",
                         created_timestamp=post.timestamp_unix,
                         rel_dir="media/facebook/posts",
                     )
                     post.media = saved_media
                     summary.media_saved += len(saved_media)
+                if (
+                    self.request_context is not None
+                    and post.shared_post is not None
+                    and thumb_cands
+                    and thumb_cands[0].progressive_url
+                ):
+                    stem = _safe_filename_stem(post.post_id)
+                    thumb_dest = out / "media" / "links" / f"{stem}_thumb.jpg"
+                    try:
+                        download_media_via_context(
+                            self.request_context,
+                            thumb_cands[0].progressive_url,
+                            thumb_dest,
+                            headers={"Referer": "https://www.facebook.com/"},
+                        )
+                        if verify_image(thumb_dest).ok:
+                            post.shared_post.thumbnail_local_path = normalize_rel_path(
+                                f"media/facebook/links/{stem}_thumb.jpg"
+                            )
+                            summary.media_saved += 1
+                        elif thumb_dest.exists():
+                            thumb_dest.unlink()
+                    except Exception:
+                        if thumb_dest.exists():
+                            thumb_dest.unlink()
                 store.set_status(post.post_id, "media_saved")
 
                 _write_json_atomic(

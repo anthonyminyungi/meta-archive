@@ -256,7 +256,22 @@ def test_parse_fb_official_and_e2ee_exports(tmp_path: Path) -> None:
                     {"data": [{"media": {"uri": "your_facebook_activity/posts/media/a.jpg", "creation_timestamp": 1680000000}}]},
                     {"data": [{"place": {"name": _garble("서울역"), "coordinate": {"latitude": 37.55, "longitude": 126.97}}}]},
                 ],
-            }
+            },
+            {
+                "timestamp": 1685000000,
+                "attachments": [
+                    {
+                        "data": [
+                            {
+                                "external_context": {
+                                    "name": _garble("유용한 블로그 글"),
+                                    "url": "https://l.facebook.com/l.php?u=https%3A%2F%2Fwww.blog.example.org%2Fpost%2F1&h=1",
+                                }
+                            }
+                        ]
+                    }
+                ],
+            },
         ],
     )
     _write_json(
@@ -316,12 +331,18 @@ def test_parse_fb_official_and_e2ee_exports(tmp_path: Path) -> None:
     bundle = parse_fb_official_export(fb_root, e2ee_root=e2ee_root)
     assert bundle.platform == "facebook"
     assert bundle.profile is not None and bundle.profile.full_name == "윤기"
-    assert len(bundle.posts) == 2
+    assert len(bundle.posts) == 3
     assert bundle.posts[0].album_name == "모바일 업로드"
     assert bundle.posts[0].post_type == "album_photo"
     assert bundle.posts[0].comments[0].text == "좋아요!"
     assert bundle.posts[0].location is not None and bundle.posts[0].location.name == "서울역"
-    assert bundle.posts[1].caption == "앨범 단독 사진"
+    shared_p = bundle.posts[1]
+    assert shared_p.post_type == "shared"
+    assert shared_p.shared_post is not None
+    assert shared_p.shared_post.url == "https://www.blog.example.org/post/1"
+    assert shared_p.shared_post.title == "유용한 블로그 글"
+    assert shared_p.shared_post.domain == "blog.example.org"
+    assert bundle.posts[2].caption == "앨범 단독 사진"
 
     assert len(bundle.connections) == 1
     assert bundle.connections[0].full_name == "홍길동"

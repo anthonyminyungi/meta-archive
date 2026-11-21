@@ -28,6 +28,7 @@ from meta_archive_pipeline.schema.models import (
     Post,
     Profile,
     ProfileCounts,
+    SharedPostRef,
     Story,
     UserRef,
 )
@@ -79,7 +80,21 @@ def _build_full_sample_archive(tmp_path: Path) -> Path:
                     )
                 ],
                 source="merged",
-            )
+            ),
+            Post(
+                platform="facebook",
+                post_id="fb_shared_1",
+                post_type="shared",
+                timestamp_unix=ts + 100,
+                caption="",
+                shared_post=SharedPostRef(
+                    url="https://tech.example.kr/post/9",
+                    title="분산 스토리지 설계 노트",
+                    text="메타 아카이브 참고 문서",
+                    domain="tech.example.kr",
+                ),
+                source="official_export",
+            ),
         ],
         stories=[
             Story(
@@ -132,7 +147,7 @@ def test_indexer_readonly_hybrid_korean_search_and_manifest(tmp_path: Path) -> N
     assert idx_res.db_path == paths.db_path
     assert manifest_path == paths.manifest_path
     assert file_count >= 8  # 5 data json + ambiguous report + image + xmp + sqlite
-    assert idx_res.counts["posts"] == 1
+    assert idx_res.counts["posts"] == 2
     assert idx_res.counts["comments"] == 2
     assert idx_res.counts["likes"] == 1
     assert idx_res.counts["messages"] == 1
@@ -167,6 +182,12 @@ def test_indexer_readonly_hybrid_korean_search_and_manifest(tmp_path: Path) -> N
 
         r3_reply = search_archive(conn, "고마워")
         assert any(r["entity_type"] == "comment" for r in r3_reply)
+
+        r3_shared = search_archive(conn, "스토리지")
+        assert any(r["entity_id"] == "fb_shared_1" for r in r3_shared)
+
+        r2_shared = search_archive(conn, "노트")
+        assert any(r["entity_id"] == "fb_shared_1" for r in r2_shared)
 
         r3_story = search_archive(conn, "겨울여행")
         assert any(r["entity_type"] == "story" for r in r3_story)

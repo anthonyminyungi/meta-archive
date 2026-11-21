@@ -372,3 +372,69 @@ def test_fb_collector_posts_friends_and_safety_pause(tmp_path: Path) -> None:
         request_context=req_ctx,
     ).run_pass_posts()
     assert sum_blocked.paused_reason is not None and "rate_limited" in sum_blocked.paused_reason
+
+
+def test_fb_external_link_card_extraction_and_thumbnail(tmp_path: Path) -> None:
+    link_payload = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "post_id": "fb_link_1",
+                "creation_time": 1712000000,
+                "message": {"text": "흥미로운 기술 글"},
+                "attachments": [
+                    {
+                        "styles": {
+                            "attachment": {
+                                "url": "https://l.facebook.com/l.php?u=https%3A%2F%2Fnews.example.com%2Ftech%2F1%3Ffbclid%3Dabc&h=xyz",
+                                "title_with_entities": {"text": "새로운 아키텍처 정리"},
+                                "description": {"text": "장기간 아카이브 구축 팁"},
+                                "source": {"text": "news.example.com"},
+                                "media": {
+                                    "image": {"uri": "https://cdn.fb.com/link_thumb.jpg"}
+                                },
+                            }
+                        }
+                    }
+                ],
+                "feedback": {"reaction_count": {"count": 2}},
+            }
+        }
+    }
+
+    posts, cands = extract_fb_posts_from_payloads([link_payload])
+    assert len(posts) == 1
+    p = posts[0]
+    assert p.post_type == "shared"
+    assert p.media == []
+    assert p.shared_post is not None
+    assert p.shared_post.url == "https://news.example.com/tech/1?fbclid=abc"
+    assert p.shared_post.title == "새로운 아키텍처 정리"
+    assert p.shared_post.text == "장기간 아카이브 구축 팁"
+    assert p.shared_post.domain == "news.example.com"
+    assert len(cands) == 1
+    assert cands[0].is_link_thumbnail is True
+
+    # End-to-end collector downloads thumbnail to media/links/ without adding to post.media
+    routes = {
+        "https://www.facebook.com/me": (
+            "<html></html>",
+            [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(link_payload))],
+        )
+    }
+    blobs = {"https://cdn.fb.com/link_thumb.jpg": _jpeg_bytes((90, 160, 200))}
+    out_dir = tmp_path / "fb_link_out"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = FbCollector(
+        _FakeFbPage(routes),
+        FbCollectConfig(output_dir=out_dir, collect_pass="posts", cooldown=cooldown),
+        request_context=_FakeRequestContext(blobs),
+    ).run_pass_posts()
+
+    assert summary.items_saved == 1
+    assert summary.media_saved == 1
+    assert (out_dir / "media" / "links" / "fb_link_1_thumb.jpg").exists()
+    saved = json.loads((out_dir / "posts" / "fb_link_1.json").read_text(encoding="utf-8"))
+    assert saved["post_type"] == "shared"
+    assert saved["media"] == []
+    assert saved["shared_post"]["thumbnail_local_path"] == "media/facebook/links/fb_link_1_thumb.jpg"

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -16,6 +17,7 @@ from typing import Any, Literal
 from PIL import Image
 
 from meta_archive_pipeline.official import OfficialExportBundle
+from meta_archive_pipeline.official.fb_parser import clean_fb_external_url
 from meta_archive_pipeline.schema.models import (
     Connection,
     LikesInfo,
@@ -25,6 +27,7 @@ from meta_archive_pipeline.schema.models import (
     Post,
     Profile,
     ProfileCounts,
+    SharedPostRef,
     Story,
     UserRef,
 )
@@ -174,6 +177,41 @@ def _merge_location(off_loc: Location | None, pw_loc: Location | None) -> Locati
     )
 
 
+def _normalize_url_key(raw_url: str | None) -> str | None:
+    cleaned = clean_fb_external_url(raw_url)
+    if not cleaned:
+        return None
+    parsed = urllib.parse.urlparse(cleaned)
+    query_pairs = [
+        (k, v)
+        for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
+        if k.lower() != "fbclid"
+    ]
+    norm_path = parsed.path.rstrip("/") or "/"
+    norm_query = urllib.parse.urlencode(query_pairs)
+    return urllib.parse.urlunparse(
+        (parsed.scheme.lower(), parsed.netloc.lower(), norm_path, "", norm_query, "")
+    )
+
+
+def _merge_shared_post(
+    off_sp: SharedPostRef | None,
+    pw_sp: SharedPostRef | None,
+) -> SharedPostRef | None:
+    if off_sp is None:
+        return pw_sp
+    if pw_sp is None:
+        return off_sp
+    return SharedPostRef(
+        url=pw_sp.url or off_sp.url,
+        author_name=pw_sp.author_name or off_sp.author_name,
+        text=pw_sp.text or off_sp.text,
+        title=pw_sp.title or off_sp.title,
+        domain=pw_sp.domain or off_sp.domain,
+        thumbnail_local_path=pw_sp.thumbnail_local_path or off_sp.thumbnail_local_path,
+    )
+
+
 def _merge_media_lists(
     off_media: Sequence[MediaItem],
     pw_media: Sequence[MediaItem],
@@ -240,11 +278,14 @@ def _merge_two_posts(
     )
     hashtags = list(dict.fromkeys([*pw.hashtags, *off.hashtags]))
     merged_media = _merge_media_lists(off.media, pw.media, official_roots, playwright_roots)
+    merged_shared = _merge_shared_post(off.shared_post, pw.shared_post)
     post_type = pw.post_type
     if off.post_type == "album_photo" and post_type == "post":
         post_type = "album_photo"
     elif off.post_type == "carousel" and len(merged_media) > 1:
         post_type = "carousel"
+    elif not merged_media and (off.post_type == "shared" or pw.post_type == "shared" or merged_shared is not None):
+        post_type = "shared"
 
     return Post(
         platform=pw.platform,
@@ -264,7 +305,7 @@ def _merge_two_posts(
         reactions=pw.reactions if pw.reactions.total > 0 else off.reactions,
         comments=pw.comments or off.comments,
         album_name=pw.album_name or off.album_name,
-        shared_post=pw.shared_post or off.shared_post,
+        shared_post=merged_shared,
         audience=pw.audience or off.audience,
         is_archived=off.is_archived or pw.is_archived,
         is_collab=pw.is_collab or off.is_collab,
@@ -308,6 +349,11 @@ def _score_post_pair(
     pw_cnt = len(_non_cover_media(pw))
     if off_cnt > 0 and off_cnt == pw_cnt:
         score += 1.0
+
+    off_url_key = _normalize_url_key(off.shared_post.url if off.shared_post else None)
+    pw_url_key = _normalize_url_key(pw.shared_post.url if pw.shared_post else None)
+    if off_url_key and pw_url_key and off_url_key == pw_url_key:
+        score += 3.0
 
     if score < 2.5:
         return None
@@ -831,6 +877,11 @@ def materialize_archive(
     for post in merge_result.posts:
         post_lat = post.location.lat if post.location else None
         post_lng = post.location.lng if post.location else None
+        if post.shared_post and post.shared_post.thumbnail_local_path:
+            dest_rel, _, _, _ = _materialize_media_file(
+                post.shared_post.thumbnail_local_path, post.platform, "links"
+            )
+            post.shared_post.thumbnail_local_path = dest_rel
         for m in post.media:
             _process_media_item(
                 m,

@@ -471,6 +471,17 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
             post_author = " ".join(
                 p for p in (post.author.username, post.author.full_name) if p
             )
+            shared_parts = (
+                (
+                    post.shared_post.title,
+                    post.shared_post.text,
+                    post.shared_post.author_name,
+                    post.shared_post.domain,
+                    post.shared_post.url,
+                )
+                if post.shared_post
+                else ()
+            )
             post_body = " ".join(
                 p
                 for p in (
@@ -478,6 +489,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     loc_name,
                     post.album_name,
                     " ".join(f"#{t}" for t in post.hashtags),
+                    *shared_parts,
                 )
                 if p
             )

@@ -26,6 +26,7 @@ from meta_archive_pipeline.schema.models import (
     Location,
     MediaItem,
     Post,
+    SharedPostRef,
     Story,
     UserRef,
 )
@@ -307,3 +308,63 @@ def test_materialize_archive_lossless_xmp_and_mtime(tmp_path: Path) -> None:
     assert posts_saved[0]["media"][0]["xmp_path"] == "media/instagram/posts/202311/pic.jpg.xmp"
     assert posts_saved[0]["media"][0]["sha256"] == orig_sha
     assert paths.ambiguous_matches_path.exists()
+
+
+def test_merge_shared_link_posts_by_url_and_materialize_thumbnail(tmp_path: Path) -> None:
+    pw_root = tmp_path / "collected"
+    thumb_src = pw_root / "media" / "links" / "fb1_thumb.jpg"
+    _pattern_image(thumb_src, variant="mountain")
+    orig_sha = sha256_file(thumb_src)
+
+    ts = 1712000000
+    off_post = Post(
+        platform="facebook",
+        post_id="fb_off_shared",
+        post_type="shared",
+        timestamp_unix=ts,
+        caption="",
+        shared_post=SharedPostRef(
+            url="https://news.example.com/article/42/",
+            title="공유 기사 제목",
+            domain="news.example.com",
+        ),
+        source="official_export",
+    )
+    pw_post = Post(
+        platform="facebook",
+        post_id="fb_pw_shared",
+        post_type="shared",
+        timestamp_unix=ts + 15,
+        caption="",
+        comments=[Comment(comment_id="fc1", author=UserRef(full_name="친구"), text="좋은 기사네")],
+        shared_post=SharedPostRef(
+            url="https://l.facebook.com/l.php?u=https%3A%2F%2Fnews.example.com%2Farticle%2F42%3Ffbclid%3Dxyz",
+            title="공유 기사 제목",
+            text="요약 설명",
+            domain="news.example.com",
+            thumbnail_local_path="media/facebook/links/fb1_thumb.jpg",
+        ),
+        source="playwright",
+    )
+
+    merged, amb = merge_posts([off_post], [pw_post], playwright_roots=[pw_root])
+    assert amb == []
+    assert len(merged) == 1
+    p = merged[0]
+    assert p.source == "merged"
+    assert p.post_type == "shared"
+    assert p.shared_post is not None
+    assert p.shared_post.text == "요약 설명"
+    assert p.shared_post.thumbnail_local_path == "media/facebook/links/fb1_thumb.jpg"
+    assert p.comments[0].text == "좋은 기사네"
+
+    from meta_archive_pipeline.build.merger import MergeResult
+
+    out_dir = tmp_path / "archive"
+    summary = materialize_archive(MergeResult(posts=merged), out_dir, source_roots=[pw_root])
+    assert summary.media_copied == 1
+    assert summary.xmp_written == 0
+    dest_thumb = out_dir / "media" / "facebook" / "links" / "fb1_thumb.jpg"
+    assert dest_thumb.exists()
+    assert sha256_file(dest_thumb) == orig_sha
+    assert not (out_dir / "media" / "facebook" / "links" / "fb1_thumb.jpg.xmp").exists()

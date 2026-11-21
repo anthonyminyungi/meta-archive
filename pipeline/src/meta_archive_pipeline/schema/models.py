@@ -137,6 +137,13 @@ class SharedPostRef(BaseModel):
     author_name: str | None = None
     text: str | None = None
     title: str | None = None
+    domain: str | None = None
+    thumbnail_local_path: str | None = None
+
+    @field_validator("thumbnail_local_path")
+    @classmethod
+    def _validate_thumbnail_path(cls, value: str | None) -> str | None:
+        return _normalize_optional_rel_path(value)
 
 
 class Post(BaseModel):

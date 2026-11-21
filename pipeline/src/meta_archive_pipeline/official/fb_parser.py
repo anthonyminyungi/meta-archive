@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,36 @@ from meta_archive_pipeline.schema.models import (
 )
 
 _HASHTAG_RE = re.compile(r"#([\w\uac00-\ud7a3]+)")
+
+
+def clean_fb_external_url(raw_url: str | None) -> str | None:
+    """Unwrap Facebook `l.facebook.com/l.php?u=...` redirect links and strip empty values."""
+    if not isinstance(raw_url, str):
+        return None
+    cleaned = raw_url.strip()
+    if not cleaned:
+        return None
+    parsed = urllib.parse.urlparse(cleaned)
+    host = parsed.netloc.lower()
+    if host.endswith("facebook.com") and parsed.path == "/l.php":
+        qs = urllib.parse.parse_qs(parsed.query)
+        target = qs.get("u", [None])[0]
+        if isinstance(target, str) and target.strip():
+            return target.strip()
+    return cleaned
+
+
+def extract_domain(url: str | None) -> str | None:
+    """Return normalized lowercase hostname (without leading `www.`) from a URL."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    parsed = urllib.parse.urlparse(url.strip())
+    host = parsed.netloc.lower()
+    if ":" in host and not host.startswith("["):
+        host = host.split(":", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
 
 
 def _first_existing(root: Path, candidates: tuple[str, ...]) -> Path | None:
@@ -119,9 +150,16 @@ def _parse_fb_posts(export_root: Path) -> list[Post]:
                         media_items.append(media_item_from_meta_entry(adata["media"]))
                     elif isinstance(adata.get("external_context"), dict) and shared_post is None:
                         ext = adata["external_context"]
+                        clean_url = clean_fb_external_url(
+                            ext.get("url") if isinstance(ext.get("url"), str) else None
+                        )
+                        desc = ext.get("description") if isinstance(ext.get("description"), str) else None
+                        src_name = ext.get("source") if isinstance(ext.get("source"), str) else None
                         shared_post = SharedPostRef(
-                            url=ext.get("url") if isinstance(ext.get("url"), str) else None,
+                            url=clean_url,
                             title=ext.get("name") if isinstance(ext.get("name"), str) else None,
+                            text=desc,
+                            domain=extract_domain(clean_url) or src_name,
                         )
                     elif isinstance(adata.get("place"), dict) and location is None:
                         pl = adata["place"]
