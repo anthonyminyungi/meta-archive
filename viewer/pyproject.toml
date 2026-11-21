@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meta-archive-viewer"
+version = "0.1.0"
+description = "Lightweight read-only web viewer for Meta Archive on TrueNAS SCALE"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.28",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meta_archive_viewer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
