@@ -98,9 +98,9 @@ flowchart TD
 >   - **Facebook 수집 범위:** 타임라인 게시물 규모 확인 후 연/월·활동 로그·사진 앨범·태그된 사진·메신저 E2EE 백업 수집 범위를 확정.
 
 > [!NOTE]
-> **2. `viewer/` 기술스택 최종 확정 (Phase 4 착수 시)**
-> - 현재는 `pipeline/` 완성(수집·검증·`archive/` 빌드)을 우선 진행하기 위해 `viewer/` 구현은 Phase 4 착수 시점으로 보류합니다.
-> - 기본 권장안은 **① Python(FastAPI) + Zero-Build JS**이며, `archive.sqlite` + 미디어 파일 계약으로 분리되어 있으므로 Phase 4 착수 시 필요에 따라 **③ Go 단일 바이너리** 또는 **② Vite + React/Svelte**로 자유롭게 선택할 수 있습니다.
+> **2. `viewer/` 기술스택 최종 확정 (확정 및 구현 완료)**
+> - **확정 스택: ① Python (`FastAPI` + `uvicorn[standard]`) + Zero-Build ES Module JS/CSS** (외부 CDN·Node.js 무의존, 100% 오프라인 동작).
+> - Phase 4(`viewer/src/meta_archive_viewer/`, `viewer/Dockerfile`, `viewer/compose.yaml`, `viewer/tests/test_server_api.py`) 구현 및 API/Range/검색 테스트 검증이 완료되었습니다.
 
 ---
 
