@@ -924,3 +924,20 @@ def test_static_spa_serves_and_has_zero_external_cdns(
         if asset.is_file() and asset.suffix in {".html", ".css", ".js"}:
             text = asset.read_text(encoding="utf-8")
             assert "http://" not in text and "https://" not in text, f"External URL found in {asset}"
+
+
+def test_avif_media_mime_sniffs_disguised_jpeg_and_true_avif(
+    archive_client: tuple[Path, TestClient],
+) -> None:
+    archive_dir, client = archive_client
+    fb_posts = archive_dir / "media" / "facebook" / "posts"
+    (fb_posts / "disguised.avif").write_bytes(b"\xff\xd8\xff\xe0" + b"J" * 20)
+    (fb_posts / "real.avif").write_bytes(b"\x00\x00\x00\x1cftypavif" + b"\x00" * 16)
+
+    r_jpeg = client.get("/media/facebook/posts/disguised.avif")
+    assert r_jpeg.status_code == 200
+    assert r_jpeg.headers["content-type"] == "image/jpeg"
+
+    r_avif = client.get("/media/facebook/posts/real.avif")
+    assert r_avif.status_code == 200
+    assert r_avif.headers["content-type"] == "image/avif"

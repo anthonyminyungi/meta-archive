@@ -19,8 +19,30 @@ from meta_archive_viewer.queries import ArchiveNotReadyError, ArchiveReader, Sch
 
 mimetypes.add_type("image/webp", ".webp")
 mimetypes.add_type("image/heic", ".heic")
+mimetypes.add_type("image/avif", ".avif")
 mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/quicktime", ".mov")
+
+
+def _guess_media_mime(path: Path) -> str:
+    """Return MIME type, sniffing actual magic bytes for `.avif` files (Meta exports JPEGs as `.avif`)."""
+    if path.suffix.lower() == ".avif":
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(12)
+            if head.startswith(b"\xff\xd8\xff"):
+                return "image/jpeg"
+            if head.startswith(b"\x89PNG\r\n\x1a\n"):
+                return "image/png"
+            if head.startswith((b"GIF87a", b"GIF89a")):
+                return "image/gif"
+            if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+                return "image/webp"
+        except OSError:
+            pass
+        return "image/avif"
+    mime, _ = mimetypes.guess_type(path.name)
+    return mime or "application/octet-stream"
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
@@ -252,8 +274,7 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
     def serve_media(rel_path: str, request: Request) -> Response:
         target = _resolve_media_file(resolved_archive, rel_path)
         file_size = target.stat().st_size
-        mime, _ = mimetypes.guess_type(target.name)
-        media_type = mime or "application/octet-stream"
+        media_type = _guess_media_mime(target)
         base_headers = {
             "Accept-Ranges": "bytes",
             "Cache-Control": "public, max-age=86400",

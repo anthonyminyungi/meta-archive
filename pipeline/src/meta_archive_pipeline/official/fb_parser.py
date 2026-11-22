@@ -27,10 +27,12 @@ from meta_archive_pipeline.schema.models import (
     Post,
     Profile,
     SharedPostRef,
+    Story,
     UserRef,
 )
 
 _HASHTAG_RE = re.compile(r"#([\w\uac00-\ud7a3]+)")
+_PROFILE_ALBUM_NAMES = {"프로필 사진", "profile pictures"}
 
 
 def clean_fb_external_url(raw_url: str | None) -> str | None:
@@ -71,6 +73,35 @@ def _first_existing(root: Path, candidates: tuple[str, ...]) -> Path | None:
     return None
 
 
+def _find_fb_profile_album_avatar(export_root: Path) -> str | None:
+    album_files: list[Path] = []
+    for rel_dir in ("your_facebook_activity/posts/album", "photos_and_videos/album"):
+        d = export_root.joinpath(*rel_dir.split("/"))
+        if d.exists():
+            album_files.extend(sorted(d.glob("*.json")))
+
+    for af in album_files:
+        data = load_fixed_json(af)
+        if not isinstance(data, dict):
+            continue
+        name = data.get("name")
+        if not isinstance(name, str) or name.strip().lower() not in _PROFILE_ALBUM_NAMES:
+            continue
+        cover = data.get("cover_photo")
+        if isinstance(cover, dict):
+            uri = normalize_uri_if_local(cover.get("uri"))
+            if uri:
+                return uri
+        photos = data.get("photos")
+        if isinstance(photos, list):
+            for ph in reversed(photos):
+                if isinstance(ph, dict):
+                    uri = normalize_uri_if_local(ph.get("uri"))
+                    if uri:
+                        return uri
+    return None
+
+
 def _parse_fb_profile(export_root: Path) -> Profile | None:
     info_path = _first_existing(
         export_root,
@@ -94,6 +125,8 @@ def _parse_fb_profile(export_root: Path) -> Profile | None:
     pic = pv2.get("profile_pic")
     if isinstance(pic, dict):
         avatar_uri = normalize_uri_if_local(pic.get("uri"))
+    if avatar_uri is None:
+        avatar_uri = _find_fb_profile_album_avatar(export_root)
 
     if not any((full_name, username, bio, avatar_uri)):
         return None
@@ -270,6 +303,155 @@ def _merge_fb_albums(export_root: Path, posts: list[Post]) -> list[Post]:
     return [*posts, *extra_posts]
 
 
+def _merge_fb_uncategorized_photos(export_root: Path, posts: list[Post]) -> list[Post]:
+    photo_path = _first_existing(
+        export_root,
+        (
+            "your_facebook_activity/posts/your_uncategorized_photos.json",
+            "photos_and_videos/your_uncategorized_photos.json",
+        ),
+    )
+    if photo_path is None:
+        return posts
+    data = load_fixed_json(photo_path)
+    raw_list = data.get("other_photos_v2") if isinstance(data, dict) else data
+    if not isinstance(raw_list, list):
+        return posts
+
+    uri_to_post: dict[str, Post] = {
+        m.local_path: p for p in posts for m in p.media if m.local_path
+    }
+    extra_posts: list[Post] = []
+    for idx, ph in enumerate(raw_list):
+        if not isinstance(ph, dict) or not ph.get("uri"):
+            continue
+        item = media_item_from_meta_entry(ph)
+        ts = safe_int(ph.get("creation_timestamp"))
+        desc = ph.get("description") if isinstance(ph.get("description"), str) else ""
+        matched = uri_to_post.get(item.local_path) if item.local_path else None
+        if matched is not None:
+            if not matched.caption and desc:
+                matched.caption = desc
+        else:
+            extra_posts.append(
+                Post(
+                    platform="facebook",
+                    post_id=f"fb_photo_{ts or 0}_{item.media_id or idx}",
+                    post_type="album_photo",
+                    created_at=ts_to_dt(ts),
+                    timestamp_unix=ts,
+                    caption=desc,
+                    hashtags=list(dict.fromkeys(_HASHTAG_RE.findall(desc))),
+                    media=[item],
+                    album_name="미분류 사진",
+                    source="official_export",
+                )
+            )
+    return [*posts, *extra_posts]
+
+
+def _merge_fb_videos(export_root: Path, posts: list[Post]) -> list[Post]:
+    vid_path = _first_existing(
+        export_root,
+        (
+            "your_facebook_activity/posts/your_videos.json",
+            "photos_and_videos/your_videos.json",
+        ),
+    )
+    if vid_path is None:
+        return posts
+    data = load_fixed_json(vid_path)
+    raw_list = data.get("videos_v2") if isinstance(data, dict) else data
+    if not isinstance(raw_list, list):
+        return posts
+
+    uri_to_post: dict[str, Post] = {
+        m.local_path: p for p in posts for m in p.media if m.local_path
+    }
+    extra_posts: list[Post] = []
+    for idx, vid in enumerate(raw_list):
+        if not isinstance(vid, dict) or not vid.get("uri"):
+            continue
+        item = media_item_from_meta_entry(vid)
+        if item.media_type == "unknown":
+            item.media_type = "video"
+        ts = safe_int(vid.get("creation_timestamp"))
+        desc = vid.get("description") if isinstance(vid.get("description"), str) else ""
+        matched = uri_to_post.get(item.local_path) if item.local_path else None
+        if matched is not None:
+            if not matched.caption and desc:
+                matched.caption = desc
+        else:
+            extra_posts.append(
+                Post(
+                    platform="facebook",
+                    post_id=f"fb_video_{ts or 0}_{item.media_id or idx}",
+                    post_type="post",
+                    created_at=ts_to_dt(ts),
+                    timestamp_unix=ts,
+                    caption=desc,
+                    hashtags=list(dict.fromkeys(_HASHTAG_RE.findall(desc))),
+                    media=[item],
+                    source="official_export",
+                )
+            )
+    return [*posts, *extra_posts]
+
+
+def _parse_fb_stories(export_root: Path) -> list[Story]:
+    stories_path = _first_existing(
+        export_root,
+        (
+            "your_facebook_activity/stories/archived_stories.json",
+            "stories/archived_stories.json",
+        ),
+    )
+    if stories_path is None:
+        return []
+    data = load_fixed_json(stories_path)
+    raw_list = data.get("archived_stories_v2") if isinstance(data, dict) else data
+    if not isinstance(raw_list, list):
+        return []
+
+    stories: list[Story] = []
+    for idx, entry in enumerate(raw_list):
+        if not isinstance(entry, dict):
+            continue
+        ts = safe_int(entry.get("timestamp"))
+        media_items: list[MediaItem] = []
+        for att in entry.get("attachments", []) if isinstance(entry.get("attachments"), list) else []:
+            if not isinstance(att, dict):
+                continue
+            for adata in att.get("data", []) if isinstance(att.get("data"), list) else []:
+                if isinstance(adata, dict) and isinstance(adata.get("media"), dict) and adata["media"].get("uri"):
+                    media_items.append(media_item_from_meta_entry(adata["media"]))
+        if not media_items:
+            stories.append(
+                Story(
+                    platform="facebook",
+                    story_id=f"fb_story_{ts or 0}_{idx}",
+                    created_at=ts_to_dt(ts),
+                    timestamp_unix=ts,
+                    source="official_export",
+                    media=None,
+                )
+            )
+            continue
+        for m_idx, item in enumerate(media_items):
+            suffix = f"{item.media_id or idx}" if len(media_items) == 1 else f"{item.media_id or idx}_{m_idx}"
+            stories.append(
+                Story(
+                    platform="facebook",
+                    story_id=f"fb_story_{ts or 0}_{suffix}",
+                    created_at=ts_to_dt(ts),
+                    timestamp_unix=ts,
+                    source="official_export",
+                    media=item,
+                )
+            )
+    return stories
+
+
 def _parse_fb_friends(export_root: Path) -> list[Connection]:
     friends_path = _first_existing(
         export_root,
@@ -353,13 +535,21 @@ def _parse_meta_or_e2ee_thread_files(
             text = text_val if isinstance(text_val, str) else None
 
             media_items: list[MediaItem] = []
-            for mkey in ("photos", "videos", "audio_files"):
+            for mkey in ("photos", "videos", "audio_files", "gifs", "files"):
                 for m_entry in raw_m.get(mkey, []) if isinstance(raw_m.get(mkey), list) else []:
                     if isinstance(m_entry, dict) and m_entry.get("uri"):
                         item = media_item_from_meta_entry(m_entry)
                         if mkey == "audio_files" and item.media_type == "unknown":
                             item.media_type = "audio"
+                        elif mkey == "gifs" and item.media_type == "unknown":
+                            item.media_type = "image"
                         media_items.append(item)
+            sticker = raw_m.get("sticker")
+            if isinstance(sticker, dict) and sticker.get("uri"):
+                s_item = media_item_from_meta_entry(sticker)
+                if s_item.media_type == "unknown":
+                    s_item.media_type = "image"
+                media_items.append(s_item)
             for m_entry in raw_m.get("media", []) if isinstance(raw_m.get("media"), list) else []:
                 if isinstance(m_entry, dict) and m_entry.get("uri"):
                     media_items.append(media_item_from_meta_entry(m_entry))
@@ -417,7 +607,7 @@ def _parse_fb_messages(export_root: Path, e2ee_root: Path | None) -> list[Messag
     ]
 
     for msg_root in msg_roots:
-        for bucket in ("inbox", "e2ee_cutover", "archived_threads", "message_requests"):
+        for bucket in ("inbox", "e2ee_cutover", "archived_threads", "message_requests", "filtered_threads"):
             bucket_dir = msg_root / bucket
             if not bucket_dir.exists():
                 continue
@@ -430,7 +620,7 @@ def _parse_fb_messages(export_root: Path, e2ee_root: Path | None) -> list[Messag
                     files,
                     rel_id,
                     force_e2ee=(bucket == "e2ee_cutover"),
-                    force_pending=(bucket == "message_requests"),
+                    force_pending=(bucket in ("message_requests", "filtered_threads")),
                 )
                 if thread is not None:
                     threads.append(thread)
@@ -460,12 +650,15 @@ def parse_fb_official_export(
 ) -> OfficialExportBundle:
     """Parse an extracted Facebook official JSON export and optional E2EE Messenger export."""
     posts = _merge_fb_albums(export_root, _parse_fb_posts(export_root))
+    posts = _merge_fb_uncategorized_photos(export_root, posts)
+    posts = _merge_fb_videos(export_root, posts)
     extra_roots = [e2ee_root] if e2ee_root is not None and e2ee_root.exists() else []
     return OfficialExportBundle(
         platform="facebook",
         root_dir=export_root,
         profile=_parse_fb_profile(export_root),
         posts=posts,
+        stories=_parse_fb_stories(export_root),
         connections=_parse_fb_friends(export_root),
         messages=_parse_fb_messages(export_root, e2ee_root),
         extra_roots=extra_roots,

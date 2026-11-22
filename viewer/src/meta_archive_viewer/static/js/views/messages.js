@@ -162,6 +162,19 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
                   if (isAudioMedia(med)) {
                     return el("audio", { src, controls: true, preload: "metadata" });
                   }
+                  if (med.media_type === "unknown") {
+                    const fname = (med.local_path || med.original_uri || "첨부파일").split("/").pop();
+                    return el(
+                      "a",
+                      {
+                        className: "pill",
+                        href: src,
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                      },
+                      `📎 ${fname}`
+                    );
+                  }
                   return el("img", {
                     src,
                     alt: "message attachment",

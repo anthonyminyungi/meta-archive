@@ -354,3 +354,144 @@ def test_parse_fb_official_and_e2ee_exports(tmp_path: Path) -> None:
     assert by_title["암호화 전환 방"].is_e2ee is True
     assert by_title["종단간 대화방"].is_e2ee is True
     assert by_title["종단간 대화방"].messages[0].text == "정상 UTF-8 E2EE 메시지 🔒"
+
+
+def test_parse_fb_official_extended_sources_and_avif(tmp_path: Path) -> None:
+    fb_root = tmp_path / "fb_ext"
+
+    _write_json(
+        fb_root / "personal_information" / "profile_information" / "profile_information.json",
+        {"profile_v2": {"name": {"full_name": _garble("윤기")}, "username": "dbstnsdl12"}},
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "your_posts__check_ins__photos_and_videos_1.json",
+        [
+            {
+                "timestamp": 1680000000,
+                "attachments": [
+                    {
+                        "data": [
+                            {
+                                "media": {
+                                    "uri": "your_facebook_activity/posts/media/videos/111.mp4",
+                                    "creation_timestamp": 1680000000,
+                                }
+                            }
+                        ]
+                    }
+                ],
+            }
+        ],
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "album" / "5.json",
+        {
+            "name": _garble("프로필 사진"),
+            "cover_photo": {
+                "uri": "your_facebook_activity/posts/media/profile/999.avif",
+                "creation_timestamp": 1700000000,
+            },
+            "photos": [
+                {
+                    "uri": "your_facebook_activity/posts/media/profile/999.avif",
+                    "creation_timestamp": 1700000000,
+                }
+            ],
+        },
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "your_uncategorized_photos.json",
+        {
+            "other_photos_v2": [
+                {
+                    "uri": "your_facebook_activity/posts/media/your_posts/222.avif",
+                    "creation_timestamp": 1600000000,
+                    "description": _garble("미분류 사진 설명"),
+                }
+            ]
+        },
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "your_videos.json",
+        {
+            "videos_v2": [
+                {
+                    "uri": "your_facebook_activity/posts/media/videos/111.mp4",
+                    "creation_timestamp": 1680000000,
+                    "description": _garble("기존 영상 캡션 보강"),
+                },
+                {
+                    "uri": "your_facebook_activity/posts/media/videos/333.mp4",
+                    "creation_timestamp": 1681000000,
+                    "description": _garble("단독 영상"),
+                },
+            ]
+        },
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "stories" / "archived_stories.json",
+        {
+            "archived_stories_v2": [
+                {
+                    "timestamp": 1574009400,
+                    "attachments": [
+                        {
+                            "data": [
+                                {
+                                    "media": {
+                                        "uri": "your_facebook_activity/posts/media/your_posts/444.jpg",
+                                        "creation_timestamp": 1574096017,
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "messages" / "filtered_threads" / "flt1" / "message_1.json",
+        {
+            "title": _garble("필터링된 방"),
+            "participants": [{"name": _garble("윤기")}],
+            "messages": [
+                {
+                    "sender_name": _garble("윤기"),
+                    "timestamp_ms": 1690000000000,
+                    "gifs": [{"uri": "your_facebook_activity/messages/filtered_threads/flt1/gifs/1.gif"}],
+                    "files": [{"uri": "your_facebook_activity/messages/filtered_threads/flt1/files/2.pdf"}],
+                    "sticker": {"uri": "your_facebook_activity/messages/stickers_used/3.png"},
+                }
+            ],
+        },
+    )
+
+    bundle = parse_fb_official_export(fb_root)
+    assert bundle.profile is not None
+    assert bundle.profile.avatar_local_path == "your_facebook_activity/posts/media/profile/999.avif"
+
+    # 1 existing video post (caption enriched) + 1 album avif + 1 uncategorized avif + 1 extra video
+    assert len(bundle.posts) == 4
+    by_uri = {p.media[0].local_path: p for p in bundle.posts if p.media}
+    assert by_uri["your_facebook_activity/posts/media/videos/111.mp4"].caption == "기존 영상 캡션 보강"
+    assert by_uri["your_facebook_activity/posts/media/videos/333.mp4"].caption == "단독 영상"
+    assert by_uri["your_facebook_activity/posts/media/profile/999.avif"].media[0].media_type == "image"
+    uncat = by_uri["your_facebook_activity/posts/media/your_posts/222.avif"]
+    assert uncat.media[0].media_type == "image"
+    assert uncat.album_name == "미분류 사진"
+    assert uncat.caption == "미분류 사진 설명"
+
+    assert len(bundle.stories) == 1
+    assert bundle.stories[0].platform == "facebook"
+    assert bundle.stories[0].media is not None
+    assert bundle.stories[0].media.local_path == "your_facebook_activity/posts/media/your_posts/444.jpg"
+
+    assert len(bundle.messages) == 1
+    flt = bundle.messages[0]
+    assert flt.is_pending is True
+    assert [(m.local_path, m.media_type) for m in flt.messages[0].media] == [
+        ("your_facebook_activity/messages/filtered_threads/flt1/gifs/1.gif", "image"),
+        ("your_facebook_activity/messages/filtered_threads/flt1/files/2.pdf", "unknown"),
+        ("your_facebook_activity/messages/stickers_used/3.png", "image"),
+    ]

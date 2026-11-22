@@ -18,7 +18,7 @@ from PIL import Image
 
 from meta_archive_pipeline.utils.fs import atomic_write_bytes, to_long_path
 
-_IMAGE_EXTS = {".jpg", ".jpeg", ".webp", ".png", ".tif", ".tiff", ".heic"}
+_IMAGE_EXTS = {".jpg", ".jpeg", ".webp", ".png", ".tif", ".tiff", ".heic", ".avif"}
 _CONTAINER_BOXES = {b"moov", b"trak", b"mdia"}
 _EXIF_DT_RE = re.compile(
     r"^(\d{4})[:\-](\d{2})[:\-](\d{2})[T ](\d{2}):(\d{2}):(\d{2})(Z|[+-]\d{2}:?\d{2})?$"

@@ -20,7 +20,7 @@ from meta_archive_pipeline.utils.media import inspect_mp4, verify_image
 
 AuditSeverity = Literal["ERROR", "WARN"]
 
-_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"}
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".avif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
 
 

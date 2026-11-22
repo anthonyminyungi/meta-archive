@@ -21,7 +21,7 @@ from meta_archive_pipeline.schema.paths import normalize_rel_path
 from meta_archive_pipeline.utils.fs import to_long_path
 from meta_archive_pipeline.utils.mojibake import fix_mojibake_tree
 
-_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"}
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".avif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm"}
 _AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".opus"}
 
