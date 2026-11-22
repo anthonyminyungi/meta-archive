@@ -585,3 +585,390 @@ def test_fb_collector_incremental_scroll_checkpoint_on_mid_429_profile_and_album
     ).run_pass_albums()
     assert alb_summary.items_saved == 1
     assert (out_albums / "posts" / "fb_alb_ph_1.json").exists()
+
+
+def test_fb_posts_do_not_duplicate_attached_story_or_include_sponsored_ads() -> None:
+    payload = {
+        "data": {
+            "feed_edges": [
+                {
+                    "node": {
+                        "__typename": "Story",
+                        "post_id": "my_share_1",
+                        "creation_time": 1720000000,
+                        "actors": [{"id": "me_1", "name": "민윤기"}],
+                        "message": {"text": "이 기사 좋네"},
+                        "attached_story": {
+                            "__typename": "Story",
+                            "id": "foreign_orig_999",
+                            "post_id": "foreign_orig_999",
+                            "creation_time": 1719990000,
+                            "permalink_url": "https://www.facebook.com/news/posts/999",
+                            "actors": [{"id": "page_99", "name": "뉴스페이지"}],
+                            "message": {"text": "원본 뉴스 글"},
+                        },
+                    }
+                },
+                {
+                    "node": {
+                        "__typename": "Story",
+                        "post_id": "sponsored_ad_1",
+                        "creation_time": 1720000100,
+                        "sponsored_data": {"ad_id": "ad_12345"},
+                        "message": {"text": "광고 문구"},
+                    }
+                },
+            ]
+        }
+    }
+
+    posts, _ = extract_fb_posts_from_payloads([payload])
+    assert [p.post_id for p in posts] == ["my_share_1"]
+    assert posts[0].shared_post is not None
+    assert posts[0].shared_post.author_name == "뉴스페이지"
+    assert posts[0].shared_post.text == "원본 뉴스 글"
+
+
+def test_fb_friends_filter_non_user_pageitems_and_survive_broken_avatar(tmp_path: Path) -> None:
+    payload = {
+        "data": {
+            "people_you_may_know": {
+                "pageItems": {
+                    "edges": [
+                        {"node": {"id": "pymk_1", "name": "알수도있는사람", "url": "https://www.facebook.com/pymk1"}}
+                    ]
+                }
+            },
+            "pageItems": {
+                "edges": [
+                    {
+                        "node": {
+                            "id": "real_f1",
+                            "title": {"text": "진짜친구1"},
+                            "url": "https://www.facebook.com/realf1",
+                            "image": {"uri": "https://cdn.fb.com/f1.jpg"},
+                            "node": {"__typename": "User", "id": "real_f1"},
+                        }
+                    },
+                    {
+                        "node": {
+                            "id": "real_f2",
+                            "title": {"text": "진짜친구2"},
+                            "url": "https://www.facebook.com/realf2",
+                            "image": {"uri": "https://cdn.fb.com/missing_404.jpg"},
+                            "node": {"__typename": "User", "id": "real_f2"},
+                        }
+                    },
+                    {
+                        "node": {
+                            "id": "liked_page_1",
+                            "title": {"text": "좋아요한 페이지"},
+                            "url": "https://www.facebook.com/pages/somepage",
+                            "node": {"__typename": "Page", "id": "liked_page_1"},
+                        }
+                    },
+                    {
+                        "node": {
+                            "id": "group_1",
+                            "title": {"text": "가입한 그룹"},
+                            "url": "https://www.facebook.com/groups/devgroup",
+                            "node": {"__typename": "Group", "id": "group_1"},
+                        }
+                    },
+                ]
+            },
+        }
+    }
+
+    friends, _ = extract_fb_friends_from_payloads([payload])
+    assert [f.full_name for f in friends] == ["진짜친구1", "진짜친구2"]
+
+    routes = {
+        "https://www.facebook.com/me/friends": (
+            "<html></html>",
+            [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(payload))],
+        )
+    }
+    out_dir = tmp_path / "fb_friends_resilient"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = FbCollector(
+        _FakeFbPage(routes),
+        FbCollectConfig(output_dir=out_dir, collect_pass="friends", cooldown=cooldown, max_scrolls=2),
+        request_context=_FakeRequestContext({"https://cdn.fb.com/f1.jpg": _jpeg_bytes()}),
+    ).run_pass_friends()
+
+    assert summary.items_saved == 2
+    saved = json.loads((out_dir / "friends.json").read_text(encoding="utf-8"))
+    assert [c["full_name"] for c in saved] == ["진짜친구1", "진짜친구2"]
+    assert saved[0]["avatar_local_path"] == "media/facebook/avatars/real_f1.jpg"
+    assert saved[1]["avatar_local_path"] is None
+
+
+def test_fb_incremental_batches_separate_files_profile_owner_priority_and_switch_cap(
+    tmp_path: Path,
+) -> None:
+    from meta_archive_pipeline.collect.fb_collector import extract_fb_profile_from_payloads
+
+    # 1. Profile extraction must prefer profile_owner even if a friend's Story appears first
+    profile_payloads = [
+        {
+            "data": {
+                "node": {
+                    "__typename": "Story",
+                    "post_id": "wall_post_1",
+                    "actors": [{"id": "999", "name": "내담벼락에글쓴친구", "url": "https://www.facebook.com/friend_wall"}],
+                }
+            }
+        },
+        {
+            "data": {
+                "profile_owner": {
+                    "id": "100001",
+                    "name": "민윤기",
+                    "url": "https://www.facebook.com/dbstnsdl12",
+                    "profilePicLarge": {"uri": "https://cdn.fb.com/me.jpg"},
+                }
+            }
+        },
+    ]
+    prof, av = extract_fb_profile_from_payloads(profile_payloads)
+    assert prof is not None and prof.full_name == "민윤기" and prof.username == "dbstnsdl12"
+    assert av == "https://cdn.fb.com/me.jpg"
+
+    # 2. switch_to_all_comments must cap iterations even if button stays visible forever
+    class _StuckSortPage(_FakeFbPage):
+        def get_by_role(self, role: str, name: str) -> _FakeLocator:
+            loc = super().get_by_role(role, name)
+            if name in ("가장 관련성 높은 댓글", "모든 댓글"):
+                self.visible_counts[name] = 999
+            return loc
+
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    stuck_page = _StuckSortPage({})
+    switched = switch_to_all_comments(stuck_page, cooldown, max_switches=3)
+    assert switched == 3
+
+    # 3. Incremental scroll must write separate batch_0001.json and batch_0002.json (O(N), not O(N^2))
+    #    and preserve original caption/media when a later scroll delivers only comment delta
+    story_batch1 = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "post_id": "p_split_1",
+                "creation_time": 1730000000,
+                "message": {"text": "원본 캡션 보존 필수"},
+                "attachments": [{"media": {"image": {"uri": "https://cdn.fb.com/split1.jpg"}}}],
+            }
+        }
+    }
+    story_batch2_delta = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "post_id": "p_split_1",
+                "feedback": {
+                    "display_comments": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "id": "c_later_1",
+                                    "created_time": 1730000100,
+                                    "author": {"name": "친구B"},
+                                    "body": {"text": "두번째 배치 댓글"},
+                                }
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+    }
+
+    class _TwoBatchPage(_FakeFbPage):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "https://www.facebook.com/me": (
+                        "<html></html>",
+                        [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(story_batch1))],
+                    )
+                }
+            )
+            self.scrolls = 0
+
+        def evaluate(self, script: str):
+            if "scrollTo" in script:
+                self.scrolls += 1
+                if self.scrolls == 1:
+                    for fn in self._handlers.get("response", []):
+                        fn(_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(story_batch2_delta)))
+                return None
+            return 1000 + min(self.scrolls, 1) * 500
+
+    out_split = tmp_path / "fb_split"
+    summary = FbCollector(
+        _TwoBatchPage(),
+        FbCollectConfig(output_dir=out_split, collect_pass="posts", cooldown=cooldown, max_scrolls=5, max_stagnant_scrolls=2),
+        request_context=_FakeRequestContext({"https://cdn.fb.com/split1.jpg": _jpeg_bytes()}),
+    ).run_pass_posts()
+
+    assert summary.items_saved == 1
+    assert (out_split / "raw" / "posts" / "batch_0001.json").exists()
+    assert (out_split / "raw" / "posts" / "batch_0002.json").exists()
+    # batch_0001 must NOT be overwritten with batch_0002's payload
+    b1 = json.loads((out_split / "raw" / "posts" / "batch_0001.json").read_text(encoding="utf-8"))
+    b2 = json.loads((out_split / "raw" / "posts" / "batch_0002.json").read_text(encoding="utf-8"))
+    assert len(b1) == 1 and len(b2) == 1
+    saved_post = json.loads((out_split / "posts" / "p_split_1.json").read_text(encoding="utf-8"))
+    assert saved_post["caption"] == "원본 캡션 보존 필수"
+    assert len(saved_post["media"]) == 1
+    assert [c["text"] for c in saved_post["comments"]] == ["두번째 배치 댓글"]
+
+
+def test_2026_comet_no_uzpf_ghost_duplicates_ufi_feedback_nested_attached_story_and_profile_header() -> None:
+    from meta_archive_pipeline.collect.fb_collector import extract_fb_profile_from_payloads
+
+    comet_2026_payloads = [
+        {
+            "data": {
+                "primaryActions": [
+                    {
+                        "client_handler": {
+                            "profile_action": {
+                                "profile_owner": {"id": "100003736202459", "name": "민윤기"}
+                            }
+                        }
+                    }
+                ],
+                "user": {
+                    "profile_header_renderer": {
+                        "user": {
+                            "id": "100003736202459",
+                            "name": "민윤기",
+                            "url": "https://www.facebook.com/dbstnsdl12",
+                            "profilePicLarge": {"uri": "https://cdn.fb.com/me200.jpg"},
+                        }
+                    },
+                    "timeline_list_feed_units": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "__typename": "Story",
+                                    "id": "UzpfSTEwMDAwMzczNjIwMjQ1OTozMzYxNTcxMjU3MzEwNzE1",
+                                    "post_id": "3361571257310715",
+                                    "creation_time": 1738604126,
+                                    "actors": [{"id": "100003736202459", "name": "민윤기", "url": "https://www.facebook.com/dbstnsdl12"}],
+                                    "attached_story": {
+                                        "id": "Uzpf_shallow",
+                                        "permalink_url": "https://www.facebook.com/groups/550561588856217/posts/1792598711319159/",
+                                    },
+                                    "comet_sections": {
+                                        "context_layout": {
+                                            "story": {
+                                                "id": "UzpfSTEwMDAwMzczNjIwMjQ1OTozMzYxNTcxMjU3MzEwNzE1",
+                                                "actors": [{"id": "100003736202459", "name": "민윤기"}],
+                                                "comet_sections": {"actor_photo": {"story": {"id": "Uzpf_inner"}}},
+                                            }
+                                        },
+                                        "content": {
+                                            "story": {
+                                                "id": "UzpfSTEwMDAwMzczNjIwMjQ1OTozMzYxNTcxMjU3MzEwNzE1",
+                                                "post_id": "3361571257310715",
+                                                "attached_story": {
+                                                    "actors": [{"name": "임진호"}],
+                                                    "comet_sections": {
+                                                        "attached_story": {
+                                                            "story": {
+                                                                "attached_story": {
+                                                                    "comet_sections": {
+                                                                        "attached_story_layout": {
+                                                                            "story": {
+                                                                                "message": {
+                                                                                    "text": "계속 프로그래밍을 해도 될까?"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                },
+                                            }
+                                        },
+                                        "feedback": {
+                                            "story": {
+                                                "id": "UzpfSTEwMDAwMzczNjIwMjQ1OTozMzYxNTcxMjU3MzEwNzE1",
+                                                "story_ufi_container": {
+                                                    "story": {
+                                                        "post_id": "3361571257310715",
+                                                        "feedback_context": {
+                                                            "feedback_target_with_context": {
+                                                                "comet_ufi_summary_and_actions_renderer": {
+                                                                    "feedback": {
+                                                                        "top_reactions": {
+                                                                            "edges": [
+                                                                                {
+                                                                                    "reaction_count": 7,
+                                                                                    "node": {"reaction_type": "LIKE"},
+                                                                                }
+                                                                            ]
+                                                                        },
+                                                                        "adaptive_ufi_action_renderers": [
+                                                                            {
+                                                                                "feedback": {
+                                                                                    "reaction_count": {"count": 7}
+                                                                                }
+                                                                            }
+                                                                        ],
+                                                                    }
+                                                                },
+                                                                "comment_rendering_instance": {
+                                                                    "comments": {
+                                                                        "edges": [
+                                                                            {
+                                                                                "node": {
+                                                                                    "id": "c_2026_1",
+                                                                                    "created_time": 1738605000,
+                                                                                    "author": {"name": "친구C"},
+                                                                                    "body": {"text": "좋은 글이네요"},
+                                                                                }
+                                                                            }
+                                                                        ]
+                                                                    }
+                                                                },
+                                                            }
+                                                        },
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    },
+                                }
+                            }
+                        ]
+                    },
+                },
+            }
+        }
+    ]
+
+    posts, _ = extract_fb_posts_from_payloads(comet_2026_payloads)
+    assert [p.post_id for p in posts] == ["3361571257310715"]
+    p = posts[0]
+    assert p.reactions.total == 7
+    assert p.reactions.by_type == {"LIKE": 7}
+    assert [c.text for c in p.comments] == ["좋은 글이네요"]
+    assert p.shared_post is not None
+    assert p.shared_post.url == "https://www.facebook.com/groups/550561588856217/posts/1792598711319159/"
+    assert p.shared_post.author_name == "임진호"
+    assert p.shared_post.text == "계속 프로그래밍을 해도 될까?"
+
+    prof, av = extract_fb_profile_from_payloads(comet_2026_payloads)
+    assert prof is not None
+    assert prof.user_id == "100003736202459"
+    assert prof.full_name == "민윤기"
+    assert prof.username == "dbstnsdl12"
+    assert av == "https://cdn.fb.com/me200.jpg"
+
+

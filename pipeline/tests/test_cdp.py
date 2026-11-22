@@ -73,6 +73,34 @@ def test_safety_checks_trigger_on_429_login_checkpoint_and_automated() -> None:
     assert exc_auto_ko.value.reason == "automated_behavior"
 
 
+def test_safety_checks_avoid_false_positives_on_normal_posts_and_200_graphql_data() -> None:
+    # HTTP 200 GraphQL data payload whose user post text mentions rate-limit/automated phrases must NOT halt
+    normal_gql = (
+        '{"data":{"node":{"message":{"text":"티켓팅 서버 터져서 잠시 후 다시 시도 하라고 뜨고 '
+        'automated behavior 테스트 글도 씀"}}}}'
+    )
+    check_response_safety("https://www.facebook.com/api/graphql/", 200, normal_gql)
+
+    # HTTP 200 API error JSON (status == "fail" or errors array) MUST still halt
+    with pytest.raises(SafetyStopError) as exc_fail:
+        check_response_safety(
+            "https://www.instagram.com/api/v1/feed/",
+            200,
+            '{"status":"fail","message":"checkpoint_required"}',
+        )
+    assert exc_fail.value.reason == "checkpoint"
+
+    # Long normal timeline body text (> 2000 chars) containing a post saying "잠시 후 다시 시도" must NOT halt
+    long_timeline_text = ("일반 게시글 내용입니다. " * 200) + "사이트가 먹통이라 잠시 후 다시 시도하라고 뜬다ㅋㅋ"
+    check_page_safety("https://www.facebook.com/me", long_timeline_text)
+
+    # Real Meta security overlay modal on top of a long timeline MUST still halt
+    long_timeline_with_modal = ("일반 게시글 내용입니다. " * 200) + "자동화된 행동이 감지되었습니다"
+    with pytest.raises(SafetyStopError) as exc_modal:
+        check_page_safety("https://www.facebook.com/me", long_timeline_with_modal)
+    assert exc_modal.value.reason == "automated_behavior"
+
+
 def test_parse_ndjson_payload_variants() -> None:
     assert parse_ndjson_payload("") == []
     assert parse_ndjson_payload('for (;;);{"data": {"id": 1}}') == [{"data": {"id": 1}}]

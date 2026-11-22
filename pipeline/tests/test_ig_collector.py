@@ -1094,3 +1094,210 @@ def test_shortcode_extraction_skips_carousel_child_codes_and_relay_variables() -
     assert extract_ig_shortcodes_from_payloads(payloads) == ["FOREIGN_POST", "MY_CAROUSEL"]
 
 
+def test_highlights_ignore_friends_home_story_tray() -> None:
+    payload = {
+        "data": {
+            "tray": [
+                # Logged-in Home Feed 24h story of a friend (NOT a highlight!)
+                {
+                    "id": "987654321",
+                    "reel_type": "user_reel",
+                    "user": {"username": "friend_story_user"},
+                    "items": [{"id": "friend_st_1", "display_url": "https://cdn/friend_st.jpg"}],
+                },
+                # Foreign user's highlight
+                {
+                    "id": "highlight:999",
+                    "reel_type": "highlight_reel",
+                    "title": "남의 하이라이트",
+                    "user": {"username": "other_user"},
+                },
+                # Target user's real highlight
+                {
+                    "id": "highlight:777",
+                    "reel_type": "highlight_reel",
+                    "title": "내 하이라이트",
+                    "user": {"username": "yungis_"},
+                },
+            ],
+            "reels_media": [
+                {
+                    "id": "987654321",
+                    "reel_type": "user_reel",
+                    "user": {"username": "friend_story_user"},
+                    "items": [{"id": "friend_st_1", "display_url": "https://cdn/friend_st.jpg"}],
+                },
+                {
+                    "id": "highlight:777",
+                    "reel_type": "highlight_reel",
+                    "user": {"username": "yungis_"},
+                    "items": [{"id": "my_hl_1", "taken_at": 1750000000, "display_url": "https://cdn/my_hl.jpg"}],
+                },
+            ],
+        }
+    }
+    from meta_archive_pipeline.collect.ig_collector import extract_ig_highlight_tray_ids
+
+    assert extract_ig_highlight_tray_ids([payload], owner_username="yungis_") == ["highlight:777"]
+    stories, urls = extract_ig_highlights_from_payloads([payload], owner_username="yungis_")
+    assert [s.story_id for s in stories] == ["my_hl_1"]
+    assert stories[0].highlight_title == "내 하이라이트"
+    assert "friend_st_1" not in urls
+
+
+def test_connections_and_likers_ignore_suggested_users_scroll_dialog_and_survive_broken_avatar(
+    tmp_path: Path,
+) -> None:
+    polluted_users_payload = {
+        "data": {
+            "xdt_api__v1__feed__timeline__connection": {
+                "users": [{"pk": "901", "username": "home_feed_stranger"}]
+            },
+            "suggested_users": {
+                "users": [{"pk": "902", "username": "suggested_stranger"}]
+            },
+            "chaining_results": {
+                "users": [{"pk": "903", "username": "chained_stranger"}]
+            },
+        },
+        "users": [
+            {"pk": "11", "username": "real_follower_1", "full_name": "진짜팔로워1", "profile_pic_url": "https://cdn/good.jpg"},
+            {"pk": "12", "username": "real_follower_2", "full_name": "진짜팔로워2", "profile_pic_url": "https://cdn/broken_404.jpg"},
+            {"pk": "10", "username": "yungis_", "full_name": "본인"},
+        ],
+    }
+
+    likers = extract_ig_likers_from_payloads([polluted_users_payload])
+    assert [u.username for u in likers] == ["real_follower_1", "real_follower_2", "yungis_"]
+
+    conns, _ = extract_ig_connections_from_payloads(
+        [polluted_users_payload], "follower", exclude_username="yungis_"
+    )
+    assert [c.username for c in conns] == ["real_follower_1", "real_follower_2"]
+
+    class _DialogTrackingPage(_FakeIgPage):
+        def __init__(self, routes) -> None:
+            super().__init__(routes)
+            self.dialog_scroll_scripts: list[str] = []
+
+        def evaluate(self, script: str):
+            if "dialog" in script:
+                self.dialog_scroll_scripts.append(script)
+            return 1000
+
+    routes = {
+        "https://www.instagram.com/yungis_/followers/": (
+            "<html></html>",
+            [
+                _FakeResp(
+                    "https://www.instagram.com/api/v1/friendships/10/followers/",
+                    200,
+                    json.dumps(polluted_users_payload),
+                )
+            ],
+        ),
+        "https://www.instagram.com/yungis_/following/": (
+            "<html></html>",
+            [
+                _FakeResp(
+                    "https://www.instagram.com/api/v1/friendships/10/following/",
+                    200,
+                    json.dumps({"users": [{"pk": "21", "username": "real_following_1"}]}),
+                )
+            ],
+        ),
+    }
+
+    out_dir = tmp_path / "ig_conns"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    page = _DialogTrackingPage(routes)
+    # Note: broken_404.jpg is absent from blobs (returns 404) — must NOT abort connections.json!
+    summary = IgCollector(
+        page,
+        IgCollectConfig(username="yungis_", output_dir=out_dir, collect_pass="connections", cooldown=cooldown, max_scrolls=3),
+        request_context=_FakeRequestContext({"https://cdn/good.jpg": _jpeg_bytes()}),
+    ).run_pass_connections()
+
+    assert summary.succeeded == 2
+    assert len(page.dialog_scroll_scripts) >= 1
+    saved = json.loads((out_dir / "connections.json").read_text(encoding="utf-8"))
+    assert [(c["relation"], c["username"]) for c in saved] == [
+        ("follower", "real_follower_1"),
+        ("follower", "real_follower_2"),
+        ("following", "real_following_1"),
+    ]
+    assert saved[0]["avatar_local_path"] == "media/instagram/avatars/real_follower_1.jpg"
+    assert saved[1]["avatar_local_path"] is None
+
+
+def test_index_shortcodes_preserves_existing_entries_and_comment_pane_scrolls(tmp_path: Path) -> None:
+    out_dir = tmp_path / "ig_union"
+    out_dir.mkdir(parents=True)
+    # Pre-existing full index from an earlier run
+    (out_dir / "index_shortcodes.json").write_text(json.dumps(["OLD_SC_1", "OLD_SC_2"]), encoding="utf-8")
+
+    profile_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__profile_timeline": {
+                    "profile_grid_items": [
+                        {"media": {"pk": "1", "code": "NEW_SC_1", "media_type": 1, "user": {"username": "yungis_"}}}
+                    ]
+                }
+            }
+        }
+    )
+    post_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__media__shortcode__web_info": {
+                    "items": [
+                        {
+                            "pk": "1",
+                            "id": "1_10",
+                            "code": "NEW_SC_1",
+                            "taken_at": 1750000000,
+                            "media_type": 1,
+                            "user": {"username": "yungis_"},
+                            "image_versions2": {"candidates": [{"url": "https://cdn/new1.jpg", "width": 100, "height": 100}]},
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    class _CommentScrollPage(_FakeIgPage):
+        def __init__(self, routes) -> None:
+            super().__init__(routes)
+            self.remaining_buttons = {}
+            self.comment_scrolls = 0
+
+        def evaluate(self, script: str):
+            if "scrollTop" in script and ("article" in script or "comment" in script):
+                self.comment_scrolls += 1
+                # Grow once, then stabilize
+                return 1000 if self.comment_scrolls == 1 else 1000
+            return 1000
+
+    routes = {
+        "https://www.instagram.com/yungis_/": (f'<script type="application/json">{profile_ssr}</script>', []),
+        "https://www.instagram.com/yungis_/reels/": ("<html></html>", []),
+        "https://www.instagram.com/p/NEW_SC_1/": (f'<script type="application/json">{post_ssr}</script>', []),
+    }
+
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    page = _CommentScrollPage(routes)
+    summary = IgCollector(
+        page,
+        IgCollectConfig(username="yungis_", output_dir=out_dir, limit=1, cooldown=cooldown),
+        request_context=_FakeRequestContext({"https://cdn/new1.jpg": _jpeg_bytes()}),
+    ).run_pass_core()
+
+    assert summary.succeeded == 1
+    assert page.comment_scrolls >= 1
+    merged_index = json.loads((out_dir / "index_shortcodes.json").read_text(encoding="utf-8"))
+    assert merged_index == ["NEW_SC_1", "OLD_SC_1", "OLD_SC_2"]
+
+
+

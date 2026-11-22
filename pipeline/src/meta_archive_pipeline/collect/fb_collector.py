@@ -136,6 +136,50 @@ def _safe_filename_stem(raw: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("_") or "item"
 
 
+_EXCLUDED_FB_FRIEND_CONTAINERS = frozenset(
+    {
+        "people_you_may_know",
+        "pymk",
+        "friend_requests",
+        "incoming_friend_requests",
+        "outgoing_friend_requests",
+        "suggested_friends",
+        "followers",
+        "following",
+        "liked_pages",
+        "groups",
+    }
+)
+_NON_USER_FB_TYPENAMES = frozenset(
+    {"Page", "Group", "Photo", "Video", "Event", "Application", "Place", "Story", "Media"}
+)
+_NON_USER_FB_URL_SEGMENTS = ("/groups/", "/pages/", "/events/", "/photo", "/videos/", "/watch/")
+_EXCLUDED_FB_STORY_CONTAINERS = frozenset(
+    {
+        "attached_story",
+        "sponsored_data",
+        "comet_feed_unit_sponsored_data",
+        "people_you_may_know",
+        "pymk",
+    }
+)
+
+
+def _walk_filtered_fb_dicts(
+    obj: Any,
+    excluded_keys: frozenset[str],
+) -> Iterator[dict[str, Any]]:
+    if isinstance(obj, dict):
+        yield obj
+        for key, val in obj.items():
+            if key in excluded_keys:
+                continue
+            yield from _walk_filtered_fb_dicts(val, excluded_keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk_filtered_fb_dicts(item, excluded_keys)
+
+
 def extract_fb_friends_from_payloads(
     payloads: Sequence[dict[str, Any]],
 ) -> tuple[list[Connection], dict[str, str]]:
@@ -148,6 +192,13 @@ def extract_fb_friends_from_payloads(
         if not isinstance(inner, dict):
             return
 
+        nested = inner.get("node") if isinstance(inner.get("node"), dict) else None
+        for candidate in (nested, inner):
+            if isinstance(candidate, dict):
+                tname = candidate.get("__typename")
+                if isinstance(tname, str) and tname in _NON_USER_FB_TYPENAMES:
+                    return
+
         uid = str(inner.get("id") or "") or None
         full_name: str | None = None
         if isinstance(inner.get("name"), str) and inner["name"]:
@@ -156,6 +207,8 @@ def extract_fb_friends_from_payloads(
             full_name = inner["title"]["text"]
 
         profile_url = inner.get("url") if isinstance(inner.get("url"), str) else None
+        if profile_url and any(seg in profile_url.lower() for seg in _NON_USER_FB_URL_SEGMENTS):
+            return
         if not full_name:
             return
 
@@ -180,7 +233,7 @@ def extract_fb_friends_from_payloads(
             avatar_urls[key] = avatar_url
 
     for payload in payloads:
-        for d in _walk_dicts(payload):
+        for d in _walk_filtered_fb_dicts(payload, _EXCLUDED_FB_FRIEND_CONTAINERS):
             for container_key in ("all_friends", "pageItems", "friends_list"):
                 container = d.get(container_key)
                 if isinstance(container, dict) and isinstance(container.get("edges"), list):
@@ -515,30 +568,109 @@ def _merge_shared_post_refs(
     )
 
 
-def _find_story_feedback(story: dict[str, Any]) -> dict[str, Any] | None:
+def _find_story_feedbacks(story: dict[str, Any]) -> list[dict[str, Any]]:
+    roots: list[dict[str, Any]] = []
     if isinstance(story.get("feedback"), dict):
-        return story["feedback"]
+        roots.append(story["feedback"])
     comet = story.get("comet_sections")
     if isinstance(comet, dict):
         fb_sec = comet.get("feedback")
         if isinstance(fb_sec, dict):
-            fb_story = fb_sec.get("story")
-            if isinstance(fb_story, dict):
-                if isinstance(fb_story.get("feedback"), dict):
-                    return fb_story["feedback"]
-                fc = fb_story.get("feedback_context")
-                if isinstance(fc, dict):
-                    ft = fc.get("feedback_target_with_context")
-                    if isinstance(ft, dict):
-                        if isinstance(ft.get("ufi_renderer"), dict) and isinstance(
-                            ft["ufi_renderer"].get("feedback"), dict
-                        ):
-                            return ft["ufi_renderer"]["feedback"]
-                        return ft
-    return None
+            roots.append(fb_sec)
+        content_story = (
+            (comet.get("content") or {}).get("story")
+            if isinstance(comet.get("content"), dict)
+            else None
+        )
+        if isinstance(content_story, dict) and isinstance(content_story.get("feedback"), dict):
+            roots.append(content_story["feedback"])
+
+    feedbacks: list[dict[str, Any]] = []
+    comment_list_keys = frozenset({"display_comments", "comments", "replies", "child_comments"})
+    for root in roots:
+        for d in _walk_filtered_fb_dicts(root, comment_list_keys):
+            if any(
+                k in d
+                for k in (
+                    "reaction_count",
+                    "i18n_reaction_count",
+                    "top_reactions",
+                    "display_comments",
+                    "comments",
+                    "comment_rendering_instance",
+                )
+            ):
+                feedbacks.append(d)
+    return feedbacks
+
+
+def _merge_fb_reactions(summaries: Sequence[ReactionSummary]) -> ReactionSummary:
+    total = 0
+    by_type: dict[str, int] = {}
+    for rx in summaries:
+        if rx.total > total:
+            total = rx.total
+        for rtype, cnt in rx.by_type.items():
+            if cnt > by_type.get(rtype, 0):
+                by_type[rtype] = cnt
+    if total == 0 and by_type:
+        total = sum(by_type.values())
+    return ReactionSummary(total=total, by_type=by_type)
+
+
+def _extract_attached_story_ref(
+    d: dict[str, Any],
+    content_story: dict[str, Any],
+) -> SharedPostRef | None:
+    holders: list[dict[str, Any]] = []
+    for cand in (d.get("attached_story"), content_story.get("attached_story")):
+        if isinstance(cand, dict):
+            holders.append(cand)
+    if not holders:
+        return None
+
+    att_url: str | None = None
+    att_author: str | None = None
+    att_text: str | None = None
+    att_title: str | None = None
+
+    for holder in holders:
+        for node in _walk_dicts(holder):
+            if not att_url:
+                for uk in ("permalink_url", "wwwURL", "url"):
+                    raw_u = node.get(uk)
+                    if isinstance(raw_u, str) and raw_u:
+                        cleaned = clean_fb_external_url(raw_u)
+                        if cleaned and any(seg in cleaned for seg in ("/posts/", "/groups/", "/videos/", "/reel/", "/photo", "http")):
+                            att_url = cleaned
+                            break
+            if not att_author:
+                actors = node.get("actors")
+                if isinstance(actors, list) and actors and isinstance(actors[0], dict):
+                    name = actors[0].get("name")
+                    if isinstance(name, str) and name.strip():
+                        att_author = name.strip()
+            if not att_text:
+                msg = node.get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("text"), str) and msg["text"].strip():
+                    att_text = msg["text"]
+            if not att_title and isinstance(node.get("title"), str) and node["title"].strip():
+                att_title = node["title"].strip()
+
+    if not any((att_url, att_author, att_text, att_title)):
+        return None
+    return SharedPostRef(
+        url=att_url,
+        author_name=att_author,
+        text=att_text,
+        title=att_title,
+        domain=extract_domain(att_url),
+    )
 
 
 def _is_top_fb_story(d: dict[str, Any]) -> bool:
+    if d.get("sponsored_data") or d.get("ad_id") or d.get("__typename") in ("SponsoredStory", "PYMKUnit"):
+        return False
     if not (d.get("post_id") or d.get("comet_sections") or d.get("__typename") == "Story"):
         return False
     return bool(d.get("post_id") or d.get("id")) and any(
@@ -554,6 +686,20 @@ def _is_top_fb_story(d: dict[str, Any]) -> bool:
     )
 
 
+def _walk_top_fb_stories(obj: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(obj, dict):
+        if _is_top_fb_story(obj):
+            yield obj
+            return
+        for key, val in obj.items():
+            if key in _EXCLUDED_FB_STORY_CONTAINERS:
+                continue
+            yield from _walk_top_fb_stories(val)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk_top_fb_stories(item)
+
+
 def extract_fb_posts_from_payloads(
     payloads: Sequence[dict[str, Any]],
 ) -> tuple[list[Post], list[FbMediaDownloadCandidate]]:
@@ -562,9 +708,7 @@ def extract_fb_posts_from_payloads(
     candidates_by_post: dict[str, list[FbMediaDownloadCandidate]] = {}
 
     for payload in payloads:
-        for d in _walk_dicts(payload):
-            if not _is_top_fb_story(d):
-                continue
+        for d in _walk_top_fb_stories(payload):
 
             post_id = str(d.get("post_id") or d.get("id") or "")
             if not post_id:
@@ -629,35 +773,14 @@ def extract_fb_posts_from_payloads(
                 d.get("album_name") if isinstance(d.get("album_name"), str) else None
             )
 
-            raw_attached = d.get("attached_story") or content_story.get("attached_story")
-            shared_post: SharedPostRef | None = None
-            if isinstance(raw_attached, dict):
-                att_actors = raw_attached.get("actors") or []
-                att_author = (
-                    att_actors[0].get("name")
-                    if isinstance(att_actors, list) and att_actors and isinstance(att_actors[0], dict)
-                    else None
-                )
-                att_msg = raw_attached.get("message")
-                att_text = (
-                    att_msg.get("text")
-                    if isinstance(att_msg, dict) and isinstance(att_msg.get("text"), str)
-                    else None
-                )
-                att_url = clean_fb_external_url(
-                    raw_attached.get("permalink_url") or raw_attached.get("url")
-                )
-                shared_post = SharedPostRef(
-                    url=att_url,
-                    author_name=att_author,
-                    text=att_text,
-                    title=raw_attached.get("title") if isinstance(raw_attached.get("title"), str) else None,
-                    domain=extract_domain(att_url),
-                )
+            shared_post = _extract_attached_story_ref(d, content_story)
 
-            feedback = _find_story_feedback(d)
-            reactions = _extract_fb_reactions(feedback)
-            comments = _merge_fb_comments(_extract_comments_from_feedback(feedback))
+            feedbacks = _find_story_feedbacks(d)
+            reactions = _merge_fb_reactions([_extract_fb_reactions(fb) for fb in feedbacks])
+            all_fb_comments: list[Comment] = []
+            for fb in feedbacks:
+                all_fb_comments.extend(_extract_comments_from_feedback(fb))
+            comments = _merge_fb_comments(all_fb_comments)
 
             post_candidates: list[FbMediaDownloadCandidate] = []
             attachments = (
@@ -798,10 +921,14 @@ def _click_first_visible(page: Any, labels: Sequence[str], roles: Sequence[str])
     return False
 
 
-def switch_to_all_comments(page: Any, cooldown: CooldownTracker) -> int:
+def switch_to_all_comments(
+    page: Any,
+    cooldown: CooldownTracker,
+    max_switches: int = 10,
+) -> int:
     """Switch Facebook comment filter from 'Most relevant' to 'All comments'."""
     switched = 0
-    while _click_first_visible(page, _RELEVANT_SORT_LABELS, ("button",)):
+    while switched < max_switches and _click_first_visible(page, _RELEVANT_SORT_LABELS, ("button",)):
         cooldown.wait_step()
         if _click_first_visible(
             page,
@@ -846,10 +973,13 @@ def extract_fb_profile_from_payloads(
     full_name: str | None = None
     avatar_url: str | None = None
 
-    def _consume_actor(act: dict[str, Any]) -> None:
+    def _consume_actor(act: dict[str, Any], *, require_matching_id: bool = False) -> None:
         nonlocal user_id, username, full_name, avatar_url
-        if not user_id and act.get("id"):
-            user_id = str(act["id"])
+        act_id = str(act.get("id") or "") or None
+        if require_matching_id and user_id and act_id and act_id != user_id:
+            return
+        if not user_id and act_id:
+            user_id = act_id
         if not full_name and isinstance(act.get("name"), str) and act["name"].strip():
             full_name = act["name"].strip()
         raw_url = act.get("url")
@@ -857,21 +987,36 @@ def extract_fb_profile_from_payloads(
             path = urllib.parse.urlparse(raw_url).path.strip("/")
             if path and "/" not in path and path not in {"me", "profile.php", "people"}:
                 username = path
-        if not avatar_url:
-            for k in ("profilePicLarge", "profile_picture", "profile_pic"):
-                sub = act.get(k)
-                if isinstance(sub, dict) and isinstance(sub.get("uri"), str) and sub["uri"]:
+        for k in ("profilePicLarge", "profile_picture", "profile_pic"):
+            sub = act.get(k)
+            if isinstance(sub, dict) and isinstance(sub.get("uri"), str) and sub["uri"]:
+                if not avatar_url or k == "profilePicLarge":
                     avatar_url = sub["uri"]
-                    break
+                break
 
+    # Pass 1: prefer profile_header_renderer.user (contains url + profilePicLarge) and profile_owner.
     for payload in payloads:
         for d in _walk_dicts(payload):
+            phr = d.get("profile_header_renderer")
+            if isinstance(phr, dict) and isinstance(phr.get("user"), dict):
+                _consume_actor(phr["user"])
             if isinstance(d.get("profile_owner"), dict):
-                _consume_actor(d["profile_owner"])
-            elif d.get("__typename") == "Story" and isinstance(d.get("actors"), list) and d["actors"]:
-                first_act = d["actors"][0]
-                if isinstance(first_act, dict):
-                    _consume_actor(first_act)
+                _consume_actor(d["profile_owner"], require_matching_id=True)
+
+    # Pass 2: enrich missing fields (username / avatar) from viewer.actor or matching Story.actors[0].
+    if not all((user_id, username, full_name, avatar_url)):
+        for payload in payloads:
+            for d in _walk_dicts(payload):
+                viewer = d.get("viewer")
+                if isinstance(viewer, dict) and isinstance(viewer.get("actor"), dict):
+                    _consume_actor(viewer["actor"], require_matching_id=True)
+
+    if not all((user_id, username, full_name, avatar_url)):
+        for payload in payloads:
+            for d in _walk_top_fb_stories(payload):
+                actors = d.get("actors")
+                if isinstance(actors, list) and actors and isinstance(actors[0], dict):
+                    _consume_actor(actors[0], require_matching_id=bool(user_id))
 
     if not any((user_id, username, full_name, avatar_url)):
         return None, None
@@ -1003,16 +1148,19 @@ class FbCollector:
                     if avatar_url:
                         fname = f"{_safe_filename_stem(conn.user_id or str(idx))}.jpg"
                         dest = out / "media" / "avatars" / fname
-                        download_media_via_context(
-                            self.request_context,
-                            avatar_url,
-                            dest,
-                            headers={"Referer": "https://www.facebook.com/"},
-                        )
-                        conn.avatar_local_path = normalize_rel_path(
-                            f"media/facebook/avatars/{fname}"
-                        )
-                        summary.media_saved += 1
+                        try:
+                            download_media_via_context(
+                                self.request_context,
+                                avatar_url,
+                                dest,
+                                headers={"Referer": "https://www.facebook.com/"},
+                            )
+                            conn.avatar_local_path = normalize_rel_path(
+                                f"media/facebook/avatars/{fname}"
+                            )
+                            summary.media_saved += 1
+                        except Exception:
+                            pass
 
             _write_json_atomic(
                 out / "friends.json",
@@ -1062,18 +1210,32 @@ class FbCollector:
             store.ensure_items([post.post_id])
             if store.get_status(post.post_id) == "done":
                 prev = saved_posts_mem.get(post.post_id)
-                if prev is not None and (
-                    len(post.comments) > len(prev.comments)
-                    or post.reactions.total > prev.reactions.total
-                ):
-                    post.media = prev.media
-                    if post.shared_post and prev.shared_post and prev.shared_post.thumbnail_local_path:
-                        post.shared_post.thumbnail_local_path = prev.shared_post.thumbnail_local_path
-                    _write_json_atomic(
-                        out / "posts" / f"{_safe_filename_stem(post.post_id)}.json",
-                        post.model_dump(mode="json"),
+                if prev is not None:
+                    merged_comments = _merge_fb_comments([*prev.comments, *post.comments])
+                    best_rx = (
+                        prev.reactions
+                        if prev.reactions.total >= post.reactions.total
+                        else post.reactions
                     )
-                    saved_posts_mem[post.post_id] = post
+                    if len(merged_comments) > len(prev.comments) or best_rx.total > prev.reactions.total:
+                        updated = prev.model_copy(
+                            update={
+                                "caption": prev.caption or post.caption,
+                                "url": prev.url or post.url,
+                                "created_at": prev.created_at or post.created_at,
+                                "timestamp_unix": prev.timestamp_unix or post.timestamp_unix,
+                                "reactions": best_rx,
+                                "likes": LikesInfo(count=best_rx.total or None),
+                                "comments": merged_comments,
+                                "album_name": prev.album_name or post.album_name,
+                                "shared_post": _merge_shared_post_refs(prev.shared_post, post.shared_post),
+                            }
+                        )
+                        _write_json_atomic(
+                            out / "posts" / f"{_safe_filename_stem(post.post_id)}.json",
+                            updated.model_dump(mode="json"),
+                        )
+                        saved_posts_mem[post.post_id] = updated
                 continue
 
             if self.config.limit is not None and summary.items_saved >= self.config.limit:
@@ -1146,19 +1308,20 @@ class FbCollector:
         self.collector.raise_if_unsafe()
         check_page_safety(str(getattr(self.page, "url", url)), self._safe_body_text())
 
-        payloads: list[dict[str, Any]] = []
+        retained_album_payloads: list[dict[str, Any]] = []
+        step_payloads: list[dict[str, Any]] = []
         html = ""
         try:
             raw_html = self.page.content()
             if isinstance(raw_html, str) and raw_html:
                 html = raw_html
-                payloads.extend(extract_ssr_json_payloads(html))
+                step_payloads.extend(extract_ssr_json_payloads(html))
         except Exception:
             pass
         for resp in self.collector.drain():
-            payloads.extend(resp.payloads)
+            step_payloads.extend(resp.payloads)
 
-        def _expand_step() -> None:
+        def _expand_and_flush(current_batch: list[dict[str, Any]]) -> None:
             switch_to_all_comments(self.page, self.config.cooldown)
             expand_fb_comments(
                 self.page,
@@ -1167,21 +1330,24 @@ class FbCollector:
             )
             self.collector.raise_if_unsafe()
             for r in self.collector.drain():
-                payloads.extend(r.payloads)
-            if payloads:
+                current_batch.extend(r.payloads)
+            if current_batch:
                 _write_json_atomic(
                     out / "raw" / collect_pass / f"batch_{batch_counter[0]:04d}.json",
-                    payloads,
+                    current_batch,
                 )
-            self._persist_discovered_posts(
-                payloads,
-                store,
-                summary,
-                saved_posts_mem,
-                save_profile=(collect_pass == "posts"),
-            )
+                batch_counter[0] += 1
+                if collect_pass == "albums":
+                    retained_album_payloads.extend(current_batch)
+                self._persist_discovered_posts(
+                    current_batch,
+                    store,
+                    summary,
+                    saved_posts_mem,
+                    save_profile=(collect_pass == "posts"),
+                )
 
-        _expand_step()
+        _expand_and_flush(step_payloads)
 
         last_height = -1
         stagnant = 0
@@ -1190,8 +1356,9 @@ class FbCollector:
                 break
             self.collector.raise_if_unsafe()
             check_page_safety(str(getattr(self.page, "url", "")), self._safe_body_text())
+            scroll_batch: list[dict[str, Any]] = []
             for resp in self.collector.drain():
-                payloads.extend(resp.payloads)
+                scroll_batch.extend(resp.payloads)
 
             try:
                 height = self.page.evaluate("() => document.body.scrollHeight")
@@ -1202,9 +1369,9 @@ class FbCollector:
             self.collector.raise_if_unsafe()
             check_page_safety(str(getattr(self.page, "url", "")), self._safe_body_text())
             for resp in self.collector.drain():
-                payloads.extend(resp.payloads)
+                scroll_batch.extend(resp.payloads)
 
-            _expand_step()
+            _expand_and_flush(scroll_batch)
 
             if height == last_height:
                 stagnant += 1
@@ -1214,8 +1381,7 @@ class FbCollector:
                 stagnant = 0
                 last_height = height
 
-        batch_counter[0] += 1
-        return payloads, html
+        return retained_album_payloads, html
 
     def run_pass_posts(self) -> FbCollectSummary:
         """Collect Facebook timeline posts with incremental All-Comments switching and checkpoints."""

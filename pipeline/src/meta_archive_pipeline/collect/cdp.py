@@ -36,6 +36,12 @@ _AUTOMATED_BODY_MARKERS = (
     "please wait a few minutes",
     "잠시 후 다시 시도",
 )
+_STRICT_PAGE_AUTOMATED_MARKERS = (
+    "we suspect automated behavior",
+    "automated behavior on your account",
+    "자동화된 행동",
+)
+_SHORT_PAGE_TEXT_LIMIT = 1500
 _SCRIPT_JSON_RE = re.compile(
     r"<script\b[^>]*\btype\s*=\s*[\"']application/json[\"'][^>]*>(.*?)</script>",
     re.IGNORECASE | re.DOTALL,
@@ -133,6 +139,19 @@ def connect_cdp(
     return browser, context
 
 
+def _response_has_error_envelope(body_text: str) -> bool:
+    parsed = parse_ndjson_payload(body_text)
+    if not parsed:
+        return True
+    return any(
+        d.get("status") == "fail"
+        or d.get("require_login") is True
+        or bool(d.get("errors"))
+        or bool(d.get("error"))
+        for d in parsed
+    )
+
+
 def check_response_safety(url: str, status: int, body_text: str | None = None) -> None:
     """Inspect HTTP status, URL, and response body for Meta blocks or challenges."""
     if status == 429:
@@ -154,7 +173,7 @@ def check_response_safety(url: str, status: int, body_text: str | None = None) -
             detail="Redirected to security checkpoint/challenge",
         )
 
-    if body_text:
+    if body_text and (status >= 400 or _response_has_error_envelope(body_text)):
         low_body = body_text.lower()
         for marker in _CHECKPOINT_BODY_MARKERS:
             if marker in low_body:
@@ -176,7 +195,31 @@ def check_response_safety(url: str, status: int, body_text: str | None = None) -
 
 def check_page_safety(page_url: str, body_text: str = "") -> None:
     """Check current browser page URL and visible text for login/checkpoint/rate-limit states."""
-    check_response_safety(page_url, 200, body_text)
+    check_response_safety(page_url, 200, None)
+    if not body_text:
+        return
+    low_body = body_text.lower()
+    for marker in _CHECKPOINT_BODY_MARKERS:
+        if marker in low_body:
+            raise SafetyStopError(
+                "checkpoint",
+                page_url,
+                status=200,
+                detail=f"Matched checkpoint marker: {marker}",
+            )
+    markers = (
+        _AUTOMATED_BODY_MARKERS
+        if len(body_text.strip()) <= _SHORT_PAGE_TEXT_LIMIT
+        else _STRICT_PAGE_AUTOMATED_MARKERS
+    )
+    for marker in markers:
+        if marker in low_body:
+            raise SafetyStopError(
+                "automated_behavior",
+                page_url,
+                status=200,
+                detail=f"Matched automated behavior marker: {marker}",
+            )
 
 
 def _strip_xssi_prefix(text: str) -> str:

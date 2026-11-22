@@ -923,11 +923,78 @@ def extract_ig_post_from_payloads(
     return post, candidates
 
 
+_EXCLUDED_USER_LIST_CONTAINERS = frozenset(
+    {
+        "xdt_api__v1__feed__timeline__connection",
+        "xdt_api__v1__discover__web__explore_grid__connection",
+        "explore_story",
+        "ad",
+        "injected",
+        "chaining_results",
+        "suggested_users",
+        "suggested_users_list",
+        "suggestions",
+        "ayml_users",
+        "coauthor_producers",
+    }
+)
+_DIALOG_SCROLL_JS = """() => {
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+  for (let i = dialogs.length - 1; i >= 0; i--) {
+    const els = [dialogs[i], ...dialogs[i].querySelectorAll('*')];
+    let best = null;
+    for (const el of els) {
+      if (el.scrollHeight > el.clientHeight + 20) {
+        if (!best || el.scrollHeight > best.scrollHeight) best = el;
+      }
+    }
+    if (best) {
+      const h = best.scrollHeight;
+      best.scrollTop = h;
+      return h;
+    }
+  }
+  const h = document.body.scrollHeight;
+  window.scrollTo(0, h);
+  return h;
+}"""
+_COMMENT_PANE_SCROLL_JS = """() => {
+  const roots = Array.from(document.querySelectorAll('article, main'));
+  let best = null;
+  for (const root of roots) {
+    for (const el of root.querySelectorAll('ul, div')) {
+      if (el.scrollHeight > el.clientHeight + 40 && el.clientHeight >= 150) {
+        if (!best || el.scrollHeight > best.scrollHeight) best = el;
+      }
+    }
+  }
+  if (!best) return 0;
+  const h = best.scrollHeight;
+  best.scrollTop = h;
+  return h;
+}"""
+
+
+def _walk_filtered_dicts(
+    obj: Any,
+    excluded_keys: frozenset[str],
+) -> Iterator[dict[str, Any]]:
+    if isinstance(obj, dict):
+        yield obj
+        for key, val in obj.items():
+            if key in excluded_keys:
+                continue
+            yield from _walk_filtered_dicts(val, excluded_keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk_filtered_dicts(item, excluded_keys)
+
+
 def extract_ig_likers_from_payloads(payloads: Sequence[dict[str, Any]]) -> list[UserRef]:
     """Extract deduplicated users who liked a post from modal /likers/ or GraphQL payloads."""
     seen: dict[str, UserRef] = {}
     for payload in payloads:
-        for d in _walk_dicts(payload):
+        for d in _walk_filtered_dicts(payload, _EXCLUDED_USER_LIST_CONTAINERS):
             user_dicts: list[dict[str, Any]] = []
             if isinstance(d.get("users"), list):
                 user_dicts.extend(u for u in d["users"] if isinstance(u, dict))
@@ -946,13 +1013,16 @@ def extract_ig_likers_from_payloads(payloads: Sequence[dict[str, Any]]) -> list[
 def extract_ig_connections_from_payloads(
     payloads: Sequence[dict[str, Any]],
     relation: Literal["follower", "following"],
+    *,
+    exclude_username: str | None = None,
 ) -> tuple[list[Connection], dict[str, str]]:
     """Extract followers or following Connection entries and avatar URL map."""
+    exclude_norm = exclude_username.strip().lower() if exclude_username else None
     seen: dict[str, Connection] = {}
     avatar_urls: dict[str, str] = {}
 
     for payload in payloads:
-        for d in _walk_dicts(payload):
+        for d in _walk_filtered_dicts(payload, _EXCLUDED_USER_LIST_CONTAINERS):
             user_dicts: list[dict[str, Any]] = []
             if isinstance(d.get("users"), list):
                 user_dicts.extend(u for u in d["users"] if isinstance(u, dict))
@@ -963,6 +1033,8 @@ def extract_ig_connections_from_payloads(
             for raw_user in user_dicts:
                 username = raw_user.get("username")
                 if not isinstance(username, str) or not username:
+                    continue
+                if exclude_norm and username.strip().lower() == exclude_norm:
                     continue
                 uid = str(raw_user.get("id") or raw_user.get("pk") or "") or None
                 full_name = (
@@ -988,17 +1060,49 @@ def extract_ig_connections_from_payloads(
     return list(seen.values()), avatar_urls
 
 
-def extract_ig_highlight_tray_ids(payloads: Sequence[dict[str, Any]]) -> list[str]:
+def _is_highlight_item(
+    item: dict[str, Any],
+    *,
+    from_edge_highlight_reels: bool = False,
+    owner_username: str | None = None,
+) -> bool:
+    hid = str(item.get("id") or "")
+    if not hid:
+        return False
+    if not from_edge_highlight_reels:
+        reel_type = str(item.get("reel_type") or "").lower()
+        if not (hid.startswith("highlight:") or reel_type == "highlight_reel"):
+            return False
+    if owner_username:
+        user_obj = item.get("user") if isinstance(item.get("user"), dict) else item.get("owner")
+        if isinstance(user_obj, dict) and isinstance(user_obj.get("username"), str) and user_obj["username"]:
+            if user_obj["username"].strip().lower() != owner_username.strip().lower():
+                return False
+    return True
+
+
+def extract_ig_highlight_tray_ids(
+    payloads: Sequence[dict[str, Any]],
+    *,
+    owner_username: str | None = None,
+) -> list[str]:
     """Extract ordered unique highlight reel IDs from profile tray payloads."""
     seen: set[str] = set()
     ordered: list[str] = []
     for payload in payloads:
         for d in _walk_dicts(payload):
-            tray_nodes: list[dict[str, Any]] = []
-            tray_nodes.extend(_extract_edge_nodes(d.get("edge_highlight_reels")))
+            tray_entries: list[tuple[dict[str, Any], bool]] = [
+                (item, True) for item in _extract_edge_nodes(d.get("edge_highlight_reels"))
+            ]
             if isinstance(d.get("tray"), list):
-                tray_nodes.extend(t for t in d["tray"] if isinstance(t, dict))
-            for item in tray_nodes:
+                tray_entries.extend((t, False) for t in d["tray"] if isinstance(t, dict))
+            for item, from_edge in tray_entries:
+                if not _is_highlight_item(
+                    item,
+                    from_edge_highlight_reels=from_edge,
+                    owner_username=owner_username,
+                ):
+                    continue
                 hid = str(item.get("id") or "")
                 if hid and hid not in seen:
                     seen.add(hid)
@@ -1008,6 +1112,8 @@ def extract_ig_highlight_tray_ids(payloads: Sequence[dict[str, Any]]) -> list[st
 
 def extract_ig_highlights_from_payloads(
     payloads: Sequence[dict[str, Any]],
+    *,
+    owner_username: str | None = None,
 ) -> tuple[list[Story], dict[str, str]]:
     """Extract Instagram highlight stories and a map of `story_id -> media_url`."""
     highlight_meta: dict[str, tuple[str | None, str | None]] = {}
@@ -1018,15 +1124,20 @@ def extract_ig_highlights_from_payloads(
     # Pass 1: collect all highlight group metadata (title, cover) regardless of JSON key order.
     for payload in payloads:
         for d in _walk_dicts(payload):
-            tray_nodes: list[dict[str, Any]] = []
-            tray_nodes.extend(_extract_edge_nodes(d.get("edge_highlight_reels")))
+            tray_entries: list[tuple[dict[str, Any], bool]] = [
+                (item, True) for item in _extract_edge_nodes(d.get("edge_highlight_reels"))
+            ]
             if isinstance(d.get("tray"), list):
-                tray_nodes.extend(t for t in d["tray"] if isinstance(t, dict))
+                tray_entries.extend((t, False) for t in d["tray"] if isinstance(t, dict))
 
-            for item in tray_nodes:
-                hid = str(item.get("id") or "")
-                if not hid:
+            for item, from_edge in tray_entries:
+                if not _is_highlight_item(
+                    item,
+                    from_edge_highlight_reels=from_edge,
+                    owner_username=owner_username,
+                ):
                     continue
+                hid = str(item.get("id") or "")
                 title = item.get("title") if isinstance(item.get("title"), str) else None
                 cover_url: str | None = None
                 cover_media = item.get("cover_media")
@@ -1055,6 +1166,13 @@ def extract_ig_highlights_from_payloads(
                     continue
                 if hid not in highlight_meta and f"highlight:{hid}" in highlight_meta:
                     hid = f"highlight:{hid}"
+                is_known_meta = hid in highlight_meta
+                if not _is_highlight_item(
+                    group,
+                    from_edge_highlight_reels=is_known_meta,
+                    owner_username=owner_username,
+                ):
+                    continue
                 title = group.get("title") if isinstance(group.get("title"), str) else None
                 meta_title, meta_cover = highlight_meta.get(hid, (None, None))
                 resolved_title = title or meta_title
@@ -1099,9 +1217,14 @@ def expand_ig_comments(
     page: Any,
     cooldown: CooldownTracker,
     max_clicks: int = 30,
+    max_comment_scrolls: int = 8,
 ) -> int:
-    """Click visible Instagram expand/reply buttons with human-like delays."""
+    """Click visible Instagram expand/reply buttons and scroll desktop comment panes."""
     clicks = 0
+    scrolls = 0
+    last_pane_height = -1
+    stagnant_scrolls = 0
+
     while clicks < max_clicks:
         clicked_this_round = False
         for label in _EXPAND_BUTTON_LABELS:
@@ -1128,8 +1251,23 @@ def expand_ig_comments(
             if clicked_this_round:
                 break
 
-        if not clicked_this_round:
+        if clicked_this_round:
+            continue
+
+        if scrolls >= max_comment_scrolls or stagnant_scrolls >= 1:
             break
+        try:
+            pane_height = page.evaluate(_COMMENT_PANE_SCROLL_JS)
+        except Exception:
+            break
+        scrolls += 1
+        if not isinstance(pane_height, (int, float)) or pane_height <= 0:
+            break
+        cooldown.wait_step()
+        if pane_height == last_pane_height:
+            stagnant_scrolls += 1
+            break
+        last_pane_height = int(pane_height)
     return clicks
 
 
@@ -1307,6 +1445,7 @@ class IgCollector:
         *,
         owner_username: str | None = None,
         dom_shortcodes: list[str] | None = None,
+        scroll_target: Literal["window", "dialog"] = "window",
     ) -> list[dict[str, Any]]:
         collected: list[dict[str, Any]] = []
         last_height = -1
@@ -1337,8 +1476,11 @@ class IgCollector:
                     break
 
             try:
-                height = self.page.evaluate("() => document.body.scrollHeight")
-                self.page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                if scroll_target == "dialog":
+                    height = self.page.evaluate(_DIALOG_SCROLL_JS)
+                else:
+                    height = self.page.evaluate("() => document.body.scrollHeight")
+                    self.page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
             except Exception:
                 break
             self.config.cooldown.wait_step()
@@ -1423,15 +1565,18 @@ class IgCollector:
                 if profile is not None:
                     if avatar_url and self.config.download_avatars and self.request_context is not None:
                         avatar_dest = out / "media" / "profile" / f"{self.config.username}.jpg"
-                        download_media_via_context(
-                            self.request_context,
-                            avatar_url,
-                            avatar_dest,
-                            headers={"Referer": "https://www.instagram.com/"},
-                        )
-                        profile.avatar_local_path = normalize_rel_path(
-                            f"media/instagram/profile/{self.config.username}.jpg"
-                        )
+                        try:
+                            download_media_via_context(
+                                self.request_context,
+                                avatar_url,
+                                avatar_dest,
+                                headers={"Referer": "https://www.instagram.com/"},
+                            )
+                            profile.avatar_local_path = normalize_rel_path(
+                                f"media/instagram/profile/{self.config.username}.jpg"
+                            )
+                        except Exception:
+                            pass
                     _write_json_atomic(out / "profile.json", profile.model_dump(mode="json"))
                 if self.config.limit is None or len(shortcodes) < self.config.limit:
                     reels_url = f"https://www.instagram.com/{self.config.username}/reels/"
@@ -1447,7 +1592,19 @@ class IgCollector:
                         raise
                     except Exception:
                         pass
-                _write_json_atomic(out / "index_shortcodes.json", shortcodes)
+                idx_path = out / "index_shortcodes.json"
+                if idx_path.exists():
+                    try:
+                        existing_codes = json.loads(Path(to_long_path(idx_path)).read_text(encoding="utf-8"))
+                        if isinstance(existing_codes, list):
+                            shortcodes = list(
+                                dict.fromkeys(
+                                    [*shortcodes, *(c for c in existing_codes if isinstance(c, str))]
+                                )
+                            )
+                    except Exception:
+                        pass
+                _write_json_atomic(idx_path, shortcodes)
 
             store = CheckpointStore(out / "state_core.json")
             store.ensure_items(shortcodes)
@@ -1511,8 +1668,14 @@ class IgCollector:
                     summary.failed += 1
 
             if profile_payloads:
-                tray_ids = extract_ig_highlight_tray_ids(profile_payloads)
-                stories, media_urls = extract_ig_highlights_from_payloads(profile_payloads)
+                tray_ids = extract_ig_highlight_tray_ids(
+                    profile_payloads,
+                    owner_username=self.config.username,
+                )
+                stories, media_urls = extract_ig_highlights_from_payloads(
+                    profile_payloads,
+                    owner_username=self.config.username,
+                )
                 covered_hids = {s.highlight_id for s in stories if s.highlight_id}
                 extra_hl_payloads: list[dict[str, Any]] = []
                 for hid in tray_ids:
@@ -1531,7 +1694,8 @@ class IgCollector:
                         continue
                 if extra_hl_payloads:
                     stories, media_urls = extract_ig_highlights_from_payloads(
-                        [*profile_payloads, *extra_hl_payloads]
+                        [*profile_payloads, *extra_hl_payloads],
+                        owner_username=self.config.username,
                     )
                 if stories:
                     cover_local_by_hid: dict[str, str] = {}
@@ -1562,15 +1726,18 @@ class IgCollector:
                         if url and story.media and self.request_context is not None:
                             ext = ".mp4" if story.media.media_type == "video" else ".jpg"
                             dest = out / "media" / "highlights" / f"{story.story_id}{ext}"
-                            download_media_via_context(
-                                self.request_context,
-                                url,
-                                dest,
-                                headers={"Referer": "https://www.instagram.com/"},
-                            )
-                            story.media.local_path = normalize_rel_path(
-                                f"media/instagram/highlights/{story.story_id}{ext}"
-                            )
+                            try:
+                                download_media_via_context(
+                                    self.request_context,
+                                    url,
+                                    dest,
+                                    headers={"Referer": "https://www.instagram.com/"},
+                                )
+                                story.media.local_path = normalize_rel_path(
+                                    f"media/instagram/highlights/{story.story_id}{ext}"
+                                )
+                            except Exception:
+                                pass
                     _write_json_atomic(
                         out / "highlights.json",
                         [s.model_dump(mode="json") for s in stories],
@@ -1605,7 +1772,9 @@ class IgCollector:
             summary.processed += 1
             try:
                 payloads = self._visit_and_collect(f"https://www.instagram.com/p/{sc}/liked_by/")
-                payloads.extend(self._scroll_and_collect(min(20, self.config.max_scrolls)))
+                payloads.extend(
+                    self._scroll_and_collect(min(20, self.config.max_scrolls), scroll_target="dialog")
+                )
                 users = extract_ig_likers_from_payloads(payloads)
 
                 expected_count: int | None = None
@@ -1650,24 +1819,28 @@ class IgCollector:
             try:
                 url = f"https://www.instagram.com/{self.config.username}/{suffix}/"
                 payloads = self._visit_and_collect(url)
-                payloads.extend(self._scroll_and_collect(self.config.max_scrolls))
+                payloads.extend(self._scroll_and_collect(self.config.max_scrolls, scroll_target="dialog"))
                 conns, avatar_urls = extract_ig_connections_from_payloads(
                     payloads,
                     relation,  # type: ignore[arg-type]
+                    exclude_username=self.config.username,
                 )
                 if self.config.download_avatars and self.request_context is not None:
                     for conn in conns:
                         if conn.username and conn.username in avatar_urls:
                             dest = out / "media" / "avatars" / f"{conn.username}.jpg"
-                            download_media_via_context(
-                                self.request_context,
-                                avatar_urls[conn.username],
-                                dest,
-                                headers={"Referer": "https://www.instagram.com/"},
-                            )
-                            conn.avatar_local_path = normalize_rel_path(
-                                f"media/instagram/avatars/{conn.username}.jpg"
-                            )
+                            try:
+                                download_media_via_context(
+                                    self.request_context,
+                                    avatar_urls[conn.username],
+                                    dest,
+                                    headers={"Referer": "https://www.instagram.com/"},
+                                )
+                                conn.avatar_local_path = normalize_rel_path(
+                                    f"media/instagram/avatars/{conn.username}.jpg"
+                                )
+                            except Exception:
+                                pass
                 all_connections.extend(conns)
                 summary.succeeded += 1
             except SafetyStopError as exc:
