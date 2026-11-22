@@ -1,7 +1,7 @@
 /** Full-screen media lightbox overlay. */
 
 import { mediaUrl } from "../api.js";
-import { clear, el, isVideoMedia } from "../dom.js";
+import { clear, el, isAudioMedia, isDocumentMedia, isVideoMedia } from "../dom.js";
 
 export function createLightbox(hostEl) {
   function close() {
@@ -51,7 +51,9 @@ export function createLightbox(hostEl) {
 
       let mediaNode = el("div", { className: "empty-box" }, "미디어 파일 경로 없음");
       if (src) {
-        if (isVideoMedia(item)) {
+        if (isAudioMedia(item)) {
+          mediaNode = el("audio", { src, controls: true, autoplay: true, preload: "metadata" });
+        } else if (isVideoMedia(item)) {
           mediaNode = el("video", {
             src,
             controls: true,
@@ -59,6 +61,13 @@ export function createLightbox(hostEl) {
             playsinline: true,
             preload: "metadata",
           });
+        } else if (isDocumentMedia(item)) {
+          const fname = (item.local_path || "첨부파일").split("/").pop();
+          mediaNode = el(
+            "a",
+            { className: "btn", href: src, target: "_blank", rel: "noopener noreferrer" },
+            `📄 첨부 파일 열기 (${fname})`
+          );
         } else {
           mediaNode = el("img", { src, alt: item.media_id || "archived media" });
         }

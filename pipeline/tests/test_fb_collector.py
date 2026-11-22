@@ -438,3 +438,150 @@ def test_fb_external_link_card_extraction_and_thumbnail(tmp_path: Path) -> None:
     assert saved["post_type"] == "shared"
     assert saved["media"] == []
     assert saved["shared_post"]["thumbnail_local_path"] == "media/facebook/links/fb_link_1_thumb.jpg"
+
+
+def test_fb_collector_incremental_scroll_checkpoint_on_mid_429_profile_and_albums(tmp_path: Path) -> None:
+    cfg_default = FbCollectConfig(output_dir=tmp_path / "cfg_check")
+    assert cfg_default.max_stagnant_scrolls >= 5
+
+    blobs = {
+        "https://cdn.fb.com/me_avatar.jpg": _jpeg_bytes((15, 25, 35)),
+        "https://cdn.fb.com/early.jpg": _jpeg_bytes((60, 70, 80)),
+        "https://cdn.fb.com/alb_p1.jpg": _jpeg_bytes((90, 100, 110)),
+    }
+
+    early_story = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "post_id": "p_early",
+                "creation_time": 1710000000,
+                "actors": [
+                    {
+                        "id": "100001",
+                        "name": "윤기",
+                        "url": "https://www.facebook.com/dbstnsdl12",
+                        "profile_picture": {"uri": "https://cdn.fb.com/me_avatar.jpg"},
+                    }
+                ],
+                "message": {"text": "초기 로드 게시물"},
+                "attachments": [{"media": {"image": {"uri": "https://cdn.fb.com/early.jpg"}}}],
+            }
+        }
+    }
+    early_comment_delta = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "post_id": "p_early",
+                "feedback": {
+                    "display_comments": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "id": "c_early_1",
+                                    "created_time": 1710000050,
+                                    "author": {"name": "친구"},
+                                    "body": {"text": "스크롤 중 확장된 댓글"},
+                                }
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+    }
+
+    class _DynamicScrollFbPage(_FakeFbPage):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "https://www.facebook.com/me": (
+                        "<html></html>",
+                        [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(early_story))],
+                    )
+                },
+                visible_counts={"댓글 더 보기": 1},
+            )
+            self.scroll_calls = 0
+
+        def evaluate(self, script: str):
+            if "scrollTo" in script:
+                self.scroll_calls += 1
+                if self.scroll_calls >= 2:
+                    # Simulate mid-scroll 429 AFTER first post was already scrolled & checkpointed!
+                    for fn in self._handlers.get("response", []):
+                        fn(_FakeResp("https://www.facebook.com/api/graphql/", 429, "rate limited"))
+                return None
+            return 1000 + self.scroll_calls * 500
+
+    dyn_page = _DynamicScrollFbPage()
+    orig_click_locator = _FakeLocator.click
+
+    def _emit_comment_on_expand(loc_self: _FakeLocator) -> None:
+        orig_click_locator(loc_self)
+        if loc_self._page is dyn_page and loc_self._label == "댓글 더 보기":
+            for fn in dyn_page._handlers.get("response", []):
+                fn(_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(early_comment_delta)))
+
+    _FakeLocator.click = _emit_comment_on_expand  # type: ignore[method-assign]
+    try:
+        out_posts = tmp_path / "fb_inc_out"
+        cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+        summary = FbCollector(
+            dyn_page,
+            FbCollectConfig(output_dir=out_posts, collect_pass="posts", cooldown=cooldown, max_scrolls=10),
+            request_context=_FakeRequestContext(blobs),
+        ).run_pass_posts()
+    finally:
+        _FakeLocator.click = orig_click_locator  # type: ignore[method-assign]
+
+    assert summary.paused_reason is not None and "rate_limited" in summary.paused_reason
+    # Even though scroll #2 hit 429, p_early MUST already be saved with its expanded comment AND profile.json!
+    assert summary.items_saved == 1
+    assert (out_posts / "profile.json").exists()
+    prof = json.loads((out_posts / "profile.json").read_text(encoding="utf-8"))
+    assert prof["full_name"] == "윤기"
+    assert prof["username"] == "dbstnsdl12"
+    saved_early = json.loads((out_posts / "posts" / "p_early.json").read_text(encoding="utf-8"))
+    assert [c["text"] for c in saved_early["comments"]] == ["스크롤 중 확장된 댓글"]
+    assert CheckpointStore(out_posts / "state_fb.json").get_status("p_early") == "done"
+
+    # Test albums pass traversing discovered album set URLs
+    album_index_html = (
+        '<html><body><a href="https://www.facebook.com/media/set/?set=a.555&amp;type=3">여행 앨범</a></body></html>'
+    )
+    album_story = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "post_id": "fb_alb_ph_1",
+                "creation_time": 1700000000,
+                "attachments": [
+                    {
+                        "media": {
+                            "__typename": "Photo",
+                            "id": "ph_alb_1",
+                            "album": {"name": "여행 앨범"},
+                            "viewer_image": {"uri": "https://cdn.fb.com/alb_p1.jpg"},
+                        }
+                    }
+                ],
+            }
+        }
+    }
+    album_routes = {
+        "https://www.facebook.com/me/photos_albums": (album_index_html, []),
+        "https://www.facebook.com/media/set/?set=a.555&type=3": (
+            "<html></html>",
+            [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(album_story))],
+        ),
+    }
+    out_albums = tmp_path / "fb_alb_out"
+    alb_summary = FbCollector(
+        _FakeFbPage(album_routes),
+        FbCollectConfig(output_dir=out_albums, collect_pass="albums", cooldown=cooldown, max_scrolls=2),
+        request_context=_FakeRequestContext(blobs),
+    ).run_pass_albums()
+    assert alb_summary.items_saved == 1
+    assert (out_albums / "posts" / "fb_alb_ph_1.json").exists()

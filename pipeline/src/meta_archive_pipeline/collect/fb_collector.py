@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import html as html_lib
 import json
 import os
 import re
+import urllib.parse
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,6 +31,7 @@ from meta_archive_pipeline.schema.models import (
     LikesInfo,
     MediaItem,
     Post,
+    Profile,
     ReactionSummary,
     SharedPostRef,
     UserRef,
@@ -85,6 +88,7 @@ class FbCollectConfig:
     download_avatars: bool = True
     cooldown: CooldownTracker = field(default_factory=CooldownTracker)
     max_scrolls: int = 200
+    max_stagnant_scrolls: int = 5
     max_expand_clicks: int = 20
 
 
@@ -827,6 +831,90 @@ def expand_fb_comments(
     return clicks
 
 
+_ALBUM_URL_RE = re.compile(
+    r"(?:https?://(?:www\.|m\.)?facebook\.com)?(/media/set/\?[^\"'\s<>]+)",
+    re.IGNORECASE,
+)
+
+
+def extract_fb_profile_from_payloads(
+    payloads: Sequence[dict[str, Any]],
+) -> tuple[Profile | None, str | None]:
+    """Extract the owner's Facebook Profile and avatar URL from `/me` GraphQL/SSR payloads."""
+    user_id: str | None = None
+    username: str | None = None
+    full_name: str | None = None
+    avatar_url: str | None = None
+
+    def _consume_actor(act: dict[str, Any]) -> None:
+        nonlocal user_id, username, full_name, avatar_url
+        if not user_id and act.get("id"):
+            user_id = str(act["id"])
+        if not full_name and isinstance(act.get("name"), str) and act["name"].strip():
+            full_name = act["name"].strip()
+        raw_url = act.get("url")
+        if not username and isinstance(raw_url, str) and "facebook.com/" in raw_url:
+            path = urllib.parse.urlparse(raw_url).path.strip("/")
+            if path and "/" not in path and path not in {"me", "profile.php", "people"}:
+                username = path
+        if not avatar_url:
+            for k in ("profilePicLarge", "profile_picture", "profile_pic"):
+                sub = act.get(k)
+                if isinstance(sub, dict) and isinstance(sub.get("uri"), str) and sub["uri"]:
+                    avatar_url = sub["uri"]
+                    break
+
+    for payload in payloads:
+        for d in _walk_dicts(payload):
+            if isinstance(d.get("profile_owner"), dict):
+                _consume_actor(d["profile_owner"])
+            elif d.get("__typename") == "Story" and isinstance(d.get("actors"), list) and d["actors"]:
+                first_act = d["actors"][0]
+                if isinstance(first_act, dict):
+                    _consume_actor(first_act)
+
+    if not any((user_id, username, full_name, avatar_url)):
+        return None, None
+    return (
+        Profile(
+            platform="facebook",
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+        ),
+        avatar_url,
+    )
+
+
+def extract_fb_album_urls(payloads: Sequence[dict[str, Any]], html: str = "") -> list[str]:
+    """Extract unique Facebook album set URLs from `/me/photos_albums` payloads and HTML."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def _add(raw: str) -> None:
+        unescaped = html_lib.unescape(raw.strip())
+        m = _ALBUM_URL_RE.search(unescaped)
+        if not m:
+            return
+        full = f"https://www.facebook.com{m.group(1)}"
+        if full not in seen:
+            seen.add(full)
+            ordered.append(full)
+
+    if html:
+        for m in _ALBUM_URL_RE.finditer(html_lib.unescape(html)):
+            _add(m.group(0))
+
+    for payload in payloads:
+        for d in _walk_dicts(payload):
+            for key in ("url", "album_url", "href"):
+                val = d.get(key)
+                if isinstance(val, str) and "/media/set/" in val:
+                    _add(val)
+
+    return ordered
+
+
 class FbCollector:
     """Orchestrates Playwright CDP Facebook passes with All-Comments switching and checkpoints."""
 
@@ -887,7 +975,7 @@ class FbCollector:
 
             if height == last_height:
                 stagnant += 1
-                if stagnant >= 2:
+                if stagnant >= self.config.max_stagnant_scrolls:
                     break
             else:
                 stagnant = 0
@@ -909,8 +997,6 @@ class FbCollector:
                 conns = conns[: self.config.limit]
 
             if self.config.download_avatars and self.request_context is not None:
-                from meta_archive_pipeline.utils.media import download_media_via_context
-
                 for idx, conn in enumerate(conns, start=1):
                     key = conn.user_id or conn.profile_url or conn.full_name or ""
                     avatar_url = avatar_urls.get(key)
@@ -937,11 +1023,142 @@ class FbCollector:
             summary.paused_reason = str(exc)
         return summary
 
-    def _run_timeline_or_albums(self, collect_pass: Literal["posts", "albums"], url: str) -> FbCollectSummary:
-        summary = FbCollectSummary(collect_pass=collect_pass)
+    def _persist_discovered_posts(
+        self,
+        payloads: Sequence[dict[str, Any]],
+        store: CheckpointStore,
+        summary: FbCollectSummary,
+        saved_posts_mem: dict[str, Post],
+        *,
+        save_profile: bool = False,
+    ) -> None:
         out = self.config.output_dir
+
+        if save_profile and not (out / "profile.json").exists():
+            prof, avatar_url = extract_fb_profile_from_payloads(payloads)
+            if prof is not None:
+                if avatar_url and self.config.download_avatars and self.request_context is not None:
+                    avatar_dest = out / "media" / "profile" / "avatar.jpg"
+                    try:
+                        download_media_via_context(
+                            self.request_context,
+                            avatar_url,
+                            avatar_dest,
+                            headers={"Referer": "https://www.facebook.com/"},
+                        )
+                        prof.avatar_local_path = normalize_rel_path(
+                            "media/facebook/profile/avatar.jpg"
+                        )
+                    except Exception:
+                        pass
+                _write_json_atomic(out / "profile.json", prof.model_dump(mode="json"))
+
+        posts, candidates = extract_fb_posts_from_payloads(payloads)
+        cand_by_post: dict[str, list[FbMediaDownloadCandidate]] = {}
+        for cand in candidates:
+            cand_by_post.setdefault(cand.post_id, []).append(cand)
+
+        for post in posts:
+            store.ensure_items([post.post_id])
+            if store.get_status(post.post_id) == "done":
+                prev = saved_posts_mem.get(post.post_id)
+                if prev is not None and (
+                    len(post.comments) > len(prev.comments)
+                    or post.reactions.total > prev.reactions.total
+                ):
+                    post.media = prev.media
+                    if post.shared_post and prev.shared_post and prev.shared_post.thumbnail_local_path:
+                        post.shared_post.thumbnail_local_path = prev.shared_post.thumbnail_local_path
+                    _write_json_atomic(
+                        out / "posts" / f"{_safe_filename_stem(post.post_id)}.json",
+                        post.model_dump(mode="json"),
+                    )
+                    saved_posts_mem[post.post_id] = post
+                continue
+
+            if self.config.limit is not None and summary.items_saved >= self.config.limit:
+                break
+
+            store.set_status(post.post_id, "fetched")
+            post_cands = cand_by_post.get(post.post_id, [])
+            regular_cands = [c for c in post_cands if not c.is_link_thumbnail]
+            thumb_cands = [c for c in post_cands if c.is_link_thumbnail and c.progressive_url]
+            if self.request_context is not None and regular_cands:
+                saved_media = download_post_media(
+                    self.request_context,
+                    _safe_filename_stem(post.post_id),
+                    regular_cands,
+                    out / "media" / "posts",
+                    created_timestamp=post.timestamp_unix,
+                    rel_dir="media/facebook/posts",
+                )
+                post.media = saved_media
+                summary.media_saved += len(saved_media)
+            if (
+                self.request_context is not None
+                and post.shared_post is not None
+                and thumb_cands
+                and thumb_cands[0].progressive_url
+            ):
+                stem = _safe_filename_stem(post.post_id)
+                thumb_dest = out / "media" / "links" / f"{stem}_thumb.jpg"
+                try:
+                    download_media_via_context(
+                        self.request_context,
+                        thumb_cands[0].progressive_url,
+                        thumb_dest,
+                        headers={"Referer": "https://www.facebook.com/"},
+                    )
+                    if verify_image(thumb_dest).ok:
+                        post.shared_post.thumbnail_local_path = normalize_rel_path(
+                            f"media/facebook/links/{stem}_thumb.jpg"
+                        )
+                        summary.media_saved += 1
+                    elif thumb_dest.exists():
+                        thumb_dest.unlink()
+                except Exception:
+                    if thumb_dest.exists():
+                        thumb_dest.unlink()
+            store.set_status(post.post_id, "media_saved")
+
+            _write_json_atomic(
+                out / "posts" / f"{_safe_filename_stem(post.post_id)}.json",
+                post.model_dump(mode="json"),
+            )
+            store.set_status(post.post_id, "done")
+            saved_posts_mem[post.post_id] = post
+            summary.items_saved += 1
+            self.config.cooldown.record_item_completed()
+
+    def _scroll_and_persist_url(
+        self,
+        collect_pass: Literal["posts", "albums"],
+        url: str,
+        store: CheckpointStore,
+        summary: FbCollectSummary,
+        saved_posts_mem: dict[str, Post],
+        batch_counter: list[int],
+    ) -> tuple[list[dict[str, Any]], str]:
+        out = self.config.output_dir
+        self.collector.drain()
+        self.page.goto(url, wait_until="domcontentloaded")
+        self.config.cooldown.wait_step()
+        self.collector.raise_if_unsafe()
+        check_page_safety(str(getattr(self.page, "url", url)), self._safe_body_text())
+
+        payloads: list[dict[str, Any]] = []
+        html = ""
         try:
-            payloads = self._visit_and_scroll(url)
+            raw_html = self.page.content()
+            if isinstance(raw_html, str) and raw_html:
+                html = raw_html
+                payloads.extend(extract_ssr_json_payloads(html))
+        except Exception:
+            pass
+        for resp in self.collector.drain():
+            payloads.extend(resp.payloads)
+
+        def _expand_step() -> None:
             switch_to_all_comments(self.page, self.config.cooldown)
             expand_fb_comments(
                 self.page,
@@ -949,86 +1166,104 @@ class FbCollector:
                 max_clicks=self.config.max_expand_clicks,
             )
             self.collector.raise_if_unsafe()
+            for r in self.collector.drain():
+                payloads.extend(r.payloads)
+            if payloads:
+                _write_json_atomic(
+                    out / "raw" / collect_pass / f"batch_{batch_counter[0]:04d}.json",
+                    payloads,
+                )
+            self._persist_discovered_posts(
+                payloads,
+                store,
+                summary,
+                saved_posts_mem,
+                save_profile=(collect_pass == "posts"),
+            )
+
+        _expand_step()
+
+        last_height = -1
+        stagnant = 0
+        for _ in range(self.config.max_scrolls):
+            if self.config.limit is not None and summary.items_saved >= self.config.limit:
+                break
+            self.collector.raise_if_unsafe()
+            check_page_safety(str(getattr(self.page, "url", "")), self._safe_body_text())
             for resp in self.collector.drain():
                 payloads.extend(resp.payloads)
 
-            _write_json_atomic(out / "raw" / collect_pass / "batch_0001.json", payloads)
-            posts, candidates = extract_fb_posts_from_payloads(payloads)
-            if self.config.limit is not None:
-                posts = posts[: self.config.limit]
-                kept_ids = {p.post_id for p in posts}
-                candidates = [c for c in candidates if c.post_id in kept_ids]
+            try:
+                height = self.page.evaluate("() => document.body.scrollHeight")
+                self.page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                break
+            self.config.cooldown.wait_step()
+            self.collector.raise_if_unsafe()
+            check_page_safety(str(getattr(self.page, "url", "")), self._safe_body_text())
+            for resp in self.collector.drain():
+                payloads.extend(resp.payloads)
 
-            cand_by_post: dict[str, list[FbMediaDownloadCandidate]] = {}
-            for cand in candidates:
-                cand_by_post.setdefault(cand.post_id, []).append(cand)
+            _expand_step()
 
-            store = CheckpointStore(out / "state_fb.json")
-            store.ensure_items([p.post_id for p in posts])
+            if height == last_height:
+                stagnant += 1
+                if stagnant >= self.config.max_stagnant_scrolls:
+                    break
+            else:
+                stagnant = 0
+                last_height = height
 
-            for post in posts:
-                if store.get_status(post.post_id) == "done":
-                    continue
-                store.set_status(post.post_id, "fetched")
-                post_cands = cand_by_post.get(post.post_id, [])
-                regular_cands = [c for c in post_cands if not c.is_link_thumbnail]
-                thumb_cands = [c for c in post_cands if c.is_link_thumbnail and c.progressive_url]
-                if self.request_context is not None and regular_cands:
-                    saved_media = download_post_media(
-                        self.request_context,
-                        _safe_filename_stem(post.post_id),
-                        regular_cands,
-                        out / "media" / "posts",
-                        created_timestamp=post.timestamp_unix,
-                        rel_dir="media/facebook/posts",
-                    )
-                    post.media = saved_media
-                    summary.media_saved += len(saved_media)
-                if (
-                    self.request_context is not None
-                    and post.shared_post is not None
-                    and thumb_cands
-                    and thumb_cands[0].progressive_url
-                ):
-                    stem = _safe_filename_stem(post.post_id)
-                    thumb_dest = out / "media" / "links" / f"{stem}_thumb.jpg"
-                    try:
-                        download_media_via_context(
-                            self.request_context,
-                            thumb_cands[0].progressive_url,
-                            thumb_dest,
-                            headers={"Referer": "https://www.facebook.com/"},
-                        )
-                        if verify_image(thumb_dest).ok:
-                            post.shared_post.thumbnail_local_path = normalize_rel_path(
-                                f"media/facebook/links/{stem}_thumb.jpg"
-                            )
-                            summary.media_saved += 1
-                        elif thumb_dest.exists():
-                            thumb_dest.unlink()
-                    except Exception:
-                        if thumb_dest.exists():
-                            thumb_dest.unlink()
-                store.set_status(post.post_id, "media_saved")
+        batch_counter[0] += 1
+        return payloads, html
 
-                _write_json_atomic(
-                    out / "posts" / f"{_safe_filename_stem(post.post_id)}.json",
-                    post.model_dump(mode="json"),
-                )
-                store.set_status(post.post_id, "done")
-                summary.items_saved += 1
-                self.config.cooldown.record_item_completed()
+    def run_pass_posts(self) -> FbCollectSummary:
+        """Collect Facebook timeline posts with incremental All-Comments switching and checkpoints."""
+        summary = FbCollectSummary(collect_pass="posts")
+        store = CheckpointStore(self.config.output_dir / "state_fb.json")
+        try:
+            self._scroll_and_persist_url(
+                "posts",
+                "https://www.facebook.com/me",
+                store,
+                summary,
+                {},
+                [1],
+            )
         except SafetyStopError as exc:
             summary.paused_reason = str(exc)
         return summary
 
-    def run_pass_posts(self) -> FbCollectSummary:
-        """Collect Facebook timeline posts with All-Comments switching and media download."""
-        return self._run_timeline_or_albums("posts", "https://www.facebook.com/me")
-
     def run_pass_albums(self) -> FbCollectSummary:
-        """Collect Facebook photo albums."""
-        return self._run_timeline_or_albums("albums", "https://www.facebook.com/me/photos_albums")
+        """Collect Facebook photo albums index and each discovered album page."""
+        summary = FbCollectSummary(collect_pass="albums")
+        store = CheckpointStore(self.config.output_dir / "state_fb.json")
+        saved_mem: dict[str, Post] = {}
+        batch_counter = [1]
+        try:
+            payloads, html = self._scroll_and_persist_url(
+                "albums",
+                "https://www.facebook.com/me/photos_albums",
+                store,
+                summary,
+                saved_mem,
+                batch_counter,
+            )
+            album_urls = extract_fb_album_urls(payloads, html)
+            for alb_url in album_urls:
+                if self.config.limit is not None and summary.items_saved >= self.config.limit:
+                    break
+                self._scroll_and_persist_url(
+                    "albums",
+                    alb_url,
+                    store,
+                    summary,
+                    saved_mem,
+                    batch_counter,
+                )
+        except SafetyStopError as exc:
+            summary.paused_reason = str(exc)
+        return summary
 
 
 def collect_facebook(config: FbCollectConfig) -> FbCollectSummary:

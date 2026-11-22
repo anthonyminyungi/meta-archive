@@ -24,25 +24,41 @@ mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/quicktime", ".mov")
 
 
+def _sniff_magic_mime(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(16)
+    except OSError:
+        return None
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith(b"%PDF-"):
+        return "application/pdf"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"heic", b"heix", b"mif1"):
+            return "image/heic"
+        return "video/mp4"
+    return None
+
+
 def _guess_media_mime(path: Path) -> str:
-    """Return MIME type, sniffing actual magic bytes for `.avif` files (Meta exports JPEGs as `.avif`)."""
-    if path.suffix.lower() == ".avif":
-        try:
-            with path.open("rb") as handle:
-                head = handle.read(12)
-            if head.startswith(b"\xff\xd8\xff"):
-                return "image/jpeg"
-            if head.startswith(b"\x89PNG\r\n\x1a\n"):
-                return "image/png"
-            if head.startswith((b"GIF87a", b"GIF89a")):
-                return "image/gif"
-            if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-                return "image/webp"
-        except OSError:
-            pass
-        return "image/avif"
+    """Return MIME type, sniffing actual magic bytes for `.avif` and extensionless/unknown files."""
+    ext = path.suffix.lower()
+    if ext == ".avif":
+        return _sniff_magic_mime(path) or "image/avif"
     mime, _ = mimetypes.guess_type(path.name)
-    return mime or "application/octet-stream"
+    if not mime or mime == "application/octet-stream":
+        return _sniff_magic_mime(path) or "application/octet-stream"
+    return mime
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
@@ -195,12 +211,32 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
     def api_stories(
         platform: str = "instagram",
         highlight_id: str | None = None,
+        story_id: str | None = None,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=500),
     ) -> dict[str, Any]:
         return reader.list_stories(
             platform=platform,
             highlight_id=highlight_id,
+            story_id=story_id,
+            offset=offset,
+            limit=limit,
+        )
+
+    @fastapi_app.get("/api/activities")
+    def api_activities(
+        platform: str | None = None,
+        kind: str | None = None,
+        q: str | None = None,
+        activity_id: str | None = None,
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        return reader.list_activities(
+            platform=platform,
+            kind=kind,
+            q=q,
+            activity_id=activity_id,
             offset=offset,
             limit=limit,
         )
@@ -243,8 +279,18 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
         thread_id: str,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=500),
+        tail: bool = False,
+        before_seq: int | None = None,
+        around_ts: int | None = None,
     ) -> dict[str, Any]:
-        data = reader.get_thread_messages(thread_id, offset=offset, limit=limit)
+        data = reader.get_thread_messages(
+            thread_id,
+            offset=offset,
+            limit=limit,
+            tail=tail,
+            before_seq=before_seq,
+            around_ts=around_ts,
+        )
         if data is None:
             raise HTTPException(status_code=404, detail="Thread not found")
         return data

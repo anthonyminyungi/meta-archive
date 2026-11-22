@@ -43,8 +43,12 @@ export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson }) {
             el("span", { className: "pill pill-accent" }, post.platform.toUpperCase()),
             post.post_type ? el("span", { className: "pill" }, post.post_type) : null,
             post.is_archived ? el("span", { className: "pill pill-warn" }, "보관됨") : null,
+            post.group_name ? el("span", { className: "pill" }, `그룹: ${post.group_name}`) : null,
             post.album_name ? el("span", { className: "pill" }, `앨범: ${post.album_name}`) : null
           ),
+          post.activity_title
+            ? el("div", { style: "font-size:0.84rem;color:var(--text-muted);margin-top:2px;" }, post.activity_title)
+            : null,
           el("small", { style: "color:var(--text-muted);" }, formatDate(post.created_at, post.timestamp_unix))
         ),
         el("button", { type: "button", className: "btn", onClick: close }, "닫기")

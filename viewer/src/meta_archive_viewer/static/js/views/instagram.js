@@ -1,7 +1,7 @@
 /** Instagram archive view: profile header, connections modal, highlights/stories, 3-col grid & feed toggle. */
 
 import { api, mediaUrl } from "../api.js";
-import { avatarEl, clear, el, formatDate, isVideoMedia, personButton } from "../dom.js";
+import { avatarEl, clear, el, formatDate, isVideoMedia, personButton, safeExternalHref } from "../dom.js";
 import { renderCarousel } from "../components/carousel.js";
 
 export async function renderInstagramView(container, ctx) {
@@ -11,6 +11,7 @@ export async function renderInstagramView(container, ctx) {
   const state = {
     viewMode: "grid", // grid | feed
     archived: null, // null | true | false
+    postType: null, // null | "tagged"
     offset: 0,
     limit: 30,
     total: 0,
@@ -127,6 +128,7 @@ export async function renderInstagramView(container, ctx) {
               s.likes_count > 0 ? el("span", { className: "pill" }, `♥ ${s.likes_count}`) : null
             ),
             mediaEl,
+            s.caption ? el("div", { className: "post-caption" }, s.caption) : null,
             s.stickers && s.stickers.length > 0
               ? el("div", { className: "post-meta-row" }, s.stickers.map((st) => el("span", { className: "pill" }, st)))
               : null
@@ -134,6 +136,71 @@ export async function renderInstagramView(container, ctx) {
         );
       }
       body.appendChild(list);
+    });
+  }
+
+  function openActivitiesModal() {
+    ctx.modal.openCustom("Instagram 내 활동 (내 댓글 · 저장됨 · 리포스트)", async (body) => {
+      let kind = "";
+      let q = "";
+      clear(body);
+      const kindSelect = el(
+        "select",
+        { className: "select", "aria-label": "활동 종류" },
+        el("option", { value: "" }, "전체 활동"),
+        el("option", { value: "own_comment" }, "내가 쓴 댓글"),
+        el("option", { value: "saved_item" }, "저장한 게시물"),
+        el("option", { value: "repost" }, "리포스트")
+      );
+      const qInput = el("input", { type: "search", className: "input", placeholder: "댓글·저장 내용 또는 계정 검색..." });
+      const listEl = el("div", { className: "feed-list", style: "margin-top:12px;" });
+      body.append(el("div", { className: "search-bar" }, kindSelect, qInput), listEl);
+
+      async function reload() {
+        clear(listEl);
+        listEl.appendChild(el("div", { className: "loading-box" }, "불러오는 중..."));
+        const res = await api.activities({
+          platform: "instagram",
+          kind: kind || undefined,
+          q: q || undefined,
+          limit: 200,
+        });
+        clear(listEl);
+        if (res.items.length === 0) {
+          listEl.appendChild(el("div", { className: "empty-box" }, "해당하는 활동 내역이 없습니다."));
+          return;
+        }
+        for (const a of res.items) {
+          const href = safeExternalHref(a.url);
+          listEl.appendChild(
+            el(
+              "div",
+              { className: "card" },
+              el(
+                "div",
+                { className: "post-meta-row", style: "margin-top:0;margin-bottom:6px;" },
+                el("span", { className: "pill pill-accent" }, a.kind),
+                el("span", { className: "pill" }, formatDate(a.created_at, a.timestamp_unix)),
+                a.target_author ? el("span", { className: "pill" }, `@${a.target_author}`) : null
+              ),
+              a.text ? el("div", { className: "post-caption" }, a.text) : null,
+              href ? el("a", { href, target: "_blank", rel: "noopener noreferrer" }, a.url) : null
+            )
+          );
+        }
+      }
+
+      let timer = null;
+      kindSelect.addEventListener("change", () => {
+        kind = kindSelect.value;
+        reload();
+      });
+      qInput.addEventListener("input", () => {
+        q = qInput.value;
+        clearTimeout(timer);
+        timer = setTimeout(reload, 180);
+      });
+      await reload();
     });
   }
 
@@ -170,7 +237,14 @@ export async function renderInstagramView(container, ctx) {
             "button",
             { type: "button", className: "btn-link", onClick: () => openConnectionsModal("following") },
             `팔로잉 ${(profile && profile.counts && profile.counts.following) ?? "목록"}`
-          )
+          ),
+          (igStats.activities || 0) > 0
+            ? el(
+                "button",
+                { type: "button", className: "btn-link", onClick: openActivitiesModal },
+                `내 댓글·저장됨 (${igStats.activities})`
+              )
+            : null
         ),
         profile && profile.bio ? el("p", { className: "profile-bio" }, profile.bio) : null
       )
@@ -222,7 +296,8 @@ export async function renderInstagramView(container, ctx) {
     { className: "select", "aria-label": "보관 상태 필터" },
     el("option", { value: "all" }, "전체 게시물"),
     el("option", { value: "active" }, "활성 게시물"),
-    el("option", { value: "archived" }, "보관됨 (Archived)")
+    el("option", { value: "archived" }, "보관됨 (Archived)"),
+    el("option", { value: "tagged" }, "태그된 게시물 (Tagged)")
   );
   const gridBtn = el("button", { type: "button", className: "btn btn-primary" }, "3열 그리드");
   const feedBtn = el("button", { type: "button", className: "btn" }, "피드 보기");
@@ -348,6 +423,7 @@ export async function renderInstagramView(container, ctx) {
       offset: state.offset,
       limit: state.limit,
       archived: state.archived,
+      post_type: state.postType || undefined,
     });
     state.total = res.total;
     state.items.push(...res.items);
@@ -358,6 +434,7 @@ export async function renderInstagramView(container, ctx) {
 
   filterSelect.addEventListener("change", () => {
     const val = filterSelect.value;
+    state.postType = val === "tagged" ? "tagged" : null;
     state.archived = val === "archived" ? true : val === "active" ? false : null;
     fetchPage(true);
   });

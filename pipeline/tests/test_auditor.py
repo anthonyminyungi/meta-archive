@@ -216,3 +216,120 @@ def test_auditor_warnings_timeline_gaps_and_cross_check(tmp_path: Path) -> None:
     md = report.format_markdown()
     assert "PASS" in md
     assert "3중 교차 대조" in md
+
+
+def _audio_only_mp4() -> bytes:
+    def box(t: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I4s", 8 + len(payload), t) + payload
+
+    def hdlr(h: bytes) -> bytes:
+        return box(b"hdlr", b"\x00\x00\x00\x00\x00\x00\x00\x00" + h)
+
+    return (
+        box(b"ftyp", b"isom\x00\x00\x02\x00isom")
+        + box(b"moov", box(b"trak", box(b"mdia", hdlr(b"soun"))))
+        + box(b"mdat", b"\x00" * 16)
+    )
+
+
+def test_auditor_full_root_orphan_mp4_voice_audio_fb_e2ee_warn_and_tagged_posts(tmp_path: Path) -> None:
+    fb_root = tmp_path / "fb_official"
+
+    # Audio-only .mp4 voice clip in Messenger
+    voice_mp4 = fb_root / "your_facebook_activity" / "messages" / "inbox" / "r1" / "audio" / "voice.mp4"
+    voice_mp4.parent.mkdir(parents=True, exist_ok=True)
+    voice_mp4.write_bytes(_audio_only_mp4())
+
+    # Unreferenced orphan file outside `<root>/media/` (e.g. `files/orphan_doc.pdf`)
+    orphan_pdf = fb_root / "files" / "orphan_doc.pdf"
+    orphan_pdf.parent.mkdir(parents=True, exist_ok=True)
+    orphan_pdf.write_bytes(b"%PDF-1.4\norphan")
+
+    _write_json(
+        fb_root / "your_facebook_activity" / "messages" / "inbox" / "r1" / "message_1.json",
+        {
+            "title": "친구",
+            "participants": [{"name": "친구"}],
+            "messages": [
+                {
+                    "sender_name": "친구",
+                    "timestamp_ms": 1700000000000,
+                    "audio_files": [
+                        {"uri": "your_facebook_activity/messages/inbox/r1/audio/voice.mp4"}
+                    ],
+                }
+            ],
+        },
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "messages" / "secret_conversations.json",
+        {
+            "secret_conversations_v2": {
+                "armadillo_devices": [{"device_model": "SM-S928N", "last_active_time": 1750000000}]
+            }
+        },
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "your_posts_1.json",
+        [{"timestamp": 1750000000, "data": [{"post": "최근 글"}]}],
+    )
+    _make_jpeg(fb_root / "your_facebook_activity" / "posts" / "media" / "uncat.jpg")
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "your_uncategorized_photos.json",
+        {"other_photos_v2": [{"uri": "your_facebook_activity/posts/media/uncat.jpg", "creation_timestamp": 1740000000}]},
+    )
+
+    # IG collected directory with 1 own post + 1 tagged post -> live profile count=1 must NOT mismatch!
+    ig_col = tmp_path / "ig_collected"
+    _make_jpeg(ig_col / "media" / "posts" / "SC1_01.jpg")
+    _make_jpeg(ig_col / "media" / "tagged" / "SCTAG_01.jpg")
+    _write_json(
+        ig_col / "profile.json",
+        {"platform": "instagram", "username": "yungis_", "counts": {"posts": 1}},
+    )
+    _write_json(
+        ig_col / "posts" / "SC1.json",
+        {
+            "platform": "instagram",
+            "post_id": "1",
+            "shortcode": "SC1",
+            "post_type": "post",
+            "timestamp_unix": 1700000000,
+            "media": [{"media_type": "image", "local_path": "media/instagram/posts/SC1_01.jpg"}],
+            "source": "playwright",
+        },
+    )
+    _write_json(
+        ig_col / "tagged_posts" / "SCTAG.json",
+        {
+            "platform": "instagram",
+            "post_id": "2",
+            "shortcode": "SCTAG",
+            "post_type": "tagged",
+            "timestamp_unix": 1700000500,
+            "media": [{"media_type": "image", "local_path": "media/instagram/tagged/SCTAG_01.jpg"}],
+            "source": "playwright",
+        },
+    )
+
+    report = audit_directories(fb_official=fb_root, ig_collected=ig_col)
+    assert report.passed_gate is True
+    warn_codes = {w.code for w in report.warnings}
+    assert "VIDEO_NO_AUDIO" not in warn_codes
+    assert "FB_E2EE_CUTOFF_SUSPECTED" in warn_codes
+    assert "ORPHAN_MEDIA" in warn_codes
+    orphan_paths = [w.path for w in report.warnings if w.code == "ORPHAN_MEDIA"]
+    assert "files/orphan_doc.pdf" in orphan_paths
+
+    # IG live_profile_posts=1 vs own playwright_posts=1 -> no COUNT_MISMATCH for instagram!
+    mismatch_platforms = {w.details.get("platform") for w in report.warnings if w.code == "COUNT_MISMATCH"}
+    assert "instagram" not in mismatch_platforms
+
+    fb_cc = next(c for c in report.cross_checks if c.platform == "facebook")
+    assert fb_cc.official_timeline_posts == 1
+    assert fb_cc.official_nontimeline_posts == 1
+
+    # Explicitly passed non-existent directory must fail gate with MISSING_SOURCE_DIR!
+    missing_rep = audit_directories(ig_official=tmp_path / "does_not_exist")
+    assert missing_rep.passed_gate is False
+    assert any(e.code == "MISSING_SOURCE_DIR" for e in missing_rep.errors)

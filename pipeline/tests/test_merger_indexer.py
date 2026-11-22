@@ -225,3 +225,98 @@ def test_indexer_readonly_hybrid_korean_search_and_manifest(tmp_path: Path) -> N
     assert checked_after == file_count
     assert len(failures_after) == 1
     assert "jeju.jpg" in failures_after[0]
+
+
+def test_indexer_activities_story_caption_group_posts_and_message_shares(tmp_path: Path) -> None:
+    from meta_archive_pipeline.schema.models import ActivityItem
+
+    src_root = tmp_path / "src2"
+    src_root.mkdir(parents=True, exist_ok=True)
+    ts = 1715000000
+
+    bundle = OfficialExportBundle(
+        platform="facebook",
+        root_dir=src_root,
+        posts=[
+            Post(
+                platform="facebook",
+                post_id="fb_grp_1",
+                post_type="group_post",
+                group_name="알고리즘연구회",
+                activity_title="윤기님이 알고리즘연구회 그룹에 게시물을 남겼습니다.",
+                timestamp_unix=ts,
+                caption="세미나 발표 요약",
+            )
+        ],
+        stories=[
+            Story(
+                platform="instagram",
+                story_id="ig_st_cap",
+                timestamp_unix=ts + 10,
+                caption="한강 야경 러닝 완주",
+            )
+        ],
+        messages=[
+            MessageThread(
+                platform="instagram",
+                thread_id="inbox/grp_run",
+                title="러닝크루",
+                avatar_local_path=None,
+                messages=[
+                    Message(
+                        sender="윤기",
+                        timestamp_unix=ts + 20,
+                        timestamp_ms=(ts + 20) * 1000,
+                        shared_link="https://www.instagram.com/reel/RUN1/",
+                        share_text="마라톤 코스 추천 릴스",
+                        share_owner="runner_kr",
+                        is_missed_call=True,
+                    )
+                ],
+            )
+        ],
+        activities=[
+            ActivityItem(
+                activity_id="act_saved_1",
+                platform="instagram",
+                kind="saved_item",
+                timestamp_unix=ts + 30,
+                text="성수동 베이커리 투어 정리",
+                target_author="bread_lover",
+                url="https://www.instagram.com/p/BREAD1/",
+            )
+        ],
+    )
+
+    archive_dir = tmp_path / "archive2"
+    merged = merge_all(official_bundles=[bundle])
+    materialize_archive(merged, archive_dir, source_roots=[src_root])
+    idx_res = build_sqlite_index(archive_dir)
+    assert idx_res.counts["activities"] == 1
+
+    conn = open_readonly_db(ArchivePaths(archive_dir).db_path)
+    try:
+        act_row = conn.execute("SELECT kind, text, target_author FROM activities").fetchone()
+        assert dict(act_row) == {
+            "kind": "saved_item",
+            "text": "성수동 베이커리 투어 정리",
+            "target_author": "bread_lover",
+        }
+        p_row = conn.execute("SELECT group_name, activity_title FROM posts WHERE post_id = 'fb_grp_1'").fetchone()
+        assert p_row["group_name"] == "알고리즘연구회"
+
+        s_row = conn.execute("SELECT caption FROM stories WHERE story_id = 'ig_st_cap'").fetchone()
+        assert s_row["caption"] == "한강 야경 러닝 완주"
+
+        m_row = conn.execute("SELECT share_text, share_owner, is_missed_call FROM messages").fetchone()
+        assert m_row["share_text"] == "마라톤 코스 추천 릴스"
+        assert m_row["share_owner"] == "runner_kr"
+        assert m_row["is_missed_call"] == 1
+
+        # Search hits across new fields: group_name, story.caption, msg.share_text, activity
+        assert any(r["entity_id"] == "fb_grp_1" for r in search_archive(conn, "알고리즘연구회"))
+        assert any(r["entity_type"] == "story" for r in search_archive(conn, "한강 야경"))
+        assert any(r["entity_type"] == "message" for r in search_archive(conn, "마라톤 코스"))
+        assert any(r["entity_type"] == "activity" for r in search_archive(conn, "베이커리"))
+    finally:
+        conn.close()

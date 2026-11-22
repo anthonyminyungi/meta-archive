@@ -527,3 +527,168 @@ def test_ig_collector_pass_likes_truncated_flag(tmp_path: Path) -> None:
     assert likes_saved["count"] == 150
     assert likes_saved["is_truncated"] is True
     assert [u["username"] for u in likes_saved["users"]] == ["liker1"]
+
+
+def test_ig_collector_reels_tab_union_highlight_routes_and_tagged_pass(tmp_path: Path) -> None:
+    blobs = {
+        "https://cdn.example.com/feed1.jpg": _jpeg_bytes((10, 20, 30)),
+        "https://cdn.example.com/reel1.mp4": _synthetic_mp4(include_audio=True),
+        "https://cdn.example.com/hl_cov.jpg": _jpeg_bytes((40, 50, 60)),
+        "https://cdn.example.com/hl_st1.jpg": _jpeg_bytes((70, 80, 90)),
+        "https://cdn.example.com/tag1.jpg": _jpeg_bytes((110, 120, 130)),
+    }
+
+    profile_ssr = json.dumps(
+        {
+            "data": {
+                "user": {
+                    "id": "10",
+                    "username": "yungis_",
+                    "edge_owner_to_timeline_media": {
+                        "count": 1,
+                        "edges": [{"node": {"shortcode": "SC_FEED_1"}}],
+                    },
+                },
+                "highlights": {
+                    "edge_highlight_reels": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "id": "highlight:777",
+                                    "title": "봄여행",
+                                    "cover_media": {
+                                        "cropped_image_version": {"url": "https://cdn.example.com/hl_cov.jpg"}
+                                    },
+                                }
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+    )
+    reels_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__clips__user__connection_v2": {
+                    "edges": [
+                        {"node": {"media": {"pk": "202", "code": "SC_REEL_HIDDEN", "media_type": 2}}}
+                    ]
+                }
+            }
+        }
+    )
+    hl_route_ssr = json.dumps(
+        {
+            "data": {
+                "reels_media": [
+                    {
+                        "id": "highlight:777",
+                        "items": [
+                            {
+                                "id": "hl_st_1",
+                                "taken_at_timestamp": 1715000000,
+                                "display_url": "https://cdn.example.com/hl_st1.jpg",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    )
+    feed1_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_shortcode_media": {
+                    "id": "101",
+                    "shortcode": "SC_FEED_1",
+                    "taken_at_timestamp": 1700000000,
+                    "display_url": "https://cdn.example.com/feed1.jpg",
+                }
+            }
+        }
+    )
+    reel1_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_shortcode_media": {
+                    "id": "202",
+                    "shortcode": "SC_REEL_HIDDEN",
+                    "taken_at_timestamp": 1705000000,
+                    "is_video": True,
+                    "product_type": "clips",
+                    "video_url": "https://cdn.example.com/reel1.mp4",
+                }
+            }
+        }
+    )
+    tagged_ssr = json.dumps(
+        {
+            "data": {
+                "user": {
+                    "edge_user_to_photos_of_you": {
+                        "edges": [{"node": {"shortcode": "SC_TAG_1"}}]
+                    }
+                }
+            }
+        }
+    )
+    tag1_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_shortcode_media": {
+                    "id": "303",
+                    "shortcode": "SC_TAG_1",
+                    "taken_at_timestamp": 1708000000,
+                    "owner": {"id": "99", "username": "friend_u"},
+                    "display_url": "https://cdn.example.com/tag1.jpg",
+                    "edge_media_to_caption": {"edges": [{"node": {"text": "윤기 태그 글"}}]},
+                }
+            }
+        }
+    )
+
+    routes = {
+        "https://www.instagram.com/yungis_/": (f'<script type="application/json">{profile_ssr}</script>', []),
+        "https://www.instagram.com/yungis_/reels/": (f'<script type="application/json">{reels_ssr}</script>', []),
+        "https://www.instagram.com/stories/highlights/777/": (
+            f'<script type="application/json">{hl_route_ssr}</script>',
+            [],
+        ),
+        "https://www.instagram.com/p/SC_FEED_1/": (f'<script type="application/json">{feed1_ssr}</script>', []),
+        "https://www.instagram.com/p/SC_REEL_HIDDEN/": (f'<script type="application/json">{reel1_ssr}</script>', []),
+        "https://www.instagram.com/yungis_/tagged/": (f'<script type="application/json">{tagged_ssr}</script>', []),
+        "https://www.instagram.com/p/SC_TAG_1/": (f'<script type="application/json">{tag1_ssr}</script>', []),
+    }
+
+    out_dir = tmp_path / "ig_full"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    req_ctx = _FakeRequestContext(blobs)
+
+    core_summary = IgCollector(
+        _FakeIgPage(routes),
+        IgCollectConfig(username="yungis_", output_dir=out_dir, cooldown=cooldown),
+        request_context=req_ctx,
+    ).run_pass_core()
+    assert core_summary.succeeded == 2
+    assert (out_dir / "posts" / "SC_FEED_1.json").exists()
+    assert (out_dir / "posts" / "SC_REEL_HIDDEN.json").exists()
+
+    hl_saved = json.loads((out_dir / "highlights.json").read_text(encoding="utf-8"))
+    assert len(hl_saved) == 1
+    assert hl_saved[0]["highlight_title"] == "봄여행"
+    assert hl_saved[0]["highlight_cover"] == "media/instagram/highlights/cover_highlight_777.jpg"
+    assert (out_dir / "media" / "highlights" / "cover_highlight_777.jpg").exists()
+    assert (out_dir / "media" / "highlights" / "hl_st_1.jpg").exists()
+
+    tag_summary = IgCollector(
+        _FakeIgPage(routes),
+        IgCollectConfig(username="yungis_", output_dir=out_dir, collect_pass="tagged", cooldown=cooldown),
+        request_context=req_ctx,
+    ).run_pass_tagged()
+    assert tag_summary.succeeded == 1
+    assert (out_dir / "tagged_posts" / "SC_TAG_1.json").exists()
+    tag_post = json.loads((out_dir / "tagged_posts" / "SC_TAG_1.json").read_text(encoding="utf-8"))
+    assert tag_post["post_type"] == "tagged"
+    assert tag_post["media"][0]["local_path"] == "media/instagram/tagged/SC_TAG_1_01.jpg"
+    assert (out_dir / "media" / "tagged" / "SC_TAG_1_01.jpg").exists()

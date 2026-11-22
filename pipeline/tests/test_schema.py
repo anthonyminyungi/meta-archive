@@ -10,6 +10,7 @@ import pytest
 
 from meta_archive_pipeline.schema import (
     ARCHIVE_SCHEMA_VERSION,
+    ActivityItem,
     ArchivePaths,
     Comment,
     Connection,
@@ -71,6 +72,7 @@ def test_archive_paths_layout(tmp_path: Path) -> None:
     assert paths.stories_json == paths.root / "data" / "stories.json"
     assert paths.connections_json == paths.root / "data" / "connections.json"
     assert paths.messages_json == paths.root / "data" / "messages.json"
+    assert paths.activities_json == paths.root / "data" / "activities.json"
     assert (
         paths.media_rel_path("instagram", "posts", r"2024\photo.jpg")
         == "media/instagram/posts/2024/photo.jpg"
@@ -171,6 +173,7 @@ def test_models_json_round_trip() -> None:
         platform="instagram",
         thread_id="inbox_1",
         title="단톡방",
+        avatar_local_path=r"\media\instagram\messages\group.jpg",
         participants=[UserRef(username="yungis_"), UserRef(username="bob")],
         is_e2ee=False,
         is_pending=False,
@@ -181,8 +184,44 @@ def test_models_json_round_trip() -> None:
                 timestamp_ms=int(now.timestamp() * 1000),
                 text="안녕!",
                 reactions=[MessageReaction(actor="yungis_", reaction="❤️")],
+                shared_link="https://www.instagram.com/reel/XYZ/",
+                share_text="공유 캡션",
+                share_owner="creator_ig",
+                is_missed_call=True,
                 call_duration=42,
             )
         ],
     )
+    assert thread.avatar_local_path == "media/instagram/messages/group.jpg"
     assert MessageThread.model_validate_json(thread.model_dump_json()) == thread
+
+    group_post = Post(
+        platform="facebook",
+        post_id="fb_grp_1",
+        post_type="group_post",
+        group_name="알고리즘 스터디",
+        activity_title="윤기님이 알고리즘 스터디 그룹에 게시물을 남겼습니다.",
+        media=[MediaItem(media_type="unknown", local_path="files/doc.pdf", taken_at_unix=1700000000)],
+    )
+    assert group_post.media[0].taken_at_unix == 1700000000
+    assert Post.model_validate_json(group_post.model_dump_json()) == group_post
+
+    story_with_caption = Story(
+        platform="instagram",
+        story_id="st_cap",
+        caption="오늘의 하늘",
+    )
+    assert Story.model_validate_json(story_with_caption.model_dump_json()) == story_with_caption
+
+    act = ActivityItem(
+        activity_id="fb_cmt_1",
+        platform="facebook",
+        kind="own_comment",
+        timestamp_unix=1700000000,
+        text="축하드려요!",
+        title="윤기님이 홍길동님의 게시물에 댓글을 남겼습니다.",
+        target_author="홍길동",
+        media=[MediaItem(media_type="image", local_path=r"media\facebook\stickers\1.png")],
+    )
+    assert act.media[0].local_path == "media/facebook/stickers/1.png"
+    assert ActivityItem.model_validate_json(act.model_dump_json()) == act

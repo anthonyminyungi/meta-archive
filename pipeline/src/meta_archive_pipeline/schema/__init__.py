@@ -1,6 +1,8 @@
 """Canonical schema models and archive path helpers."""
 
 from meta_archive_pipeline.schema.models import (
+    ActivityItem,
+    ActivityKind,
     Comment,
     Connection,
     LikesInfo,
@@ -26,6 +28,8 @@ from meta_archive_pipeline.schema.paths import (
 
 __all__ = [
     "ARCHIVE_SCHEMA_VERSION",
+    "ActivityItem",
+    "ActivityKind",
     "ArchivePaths",
     "Comment",
     "Connection",

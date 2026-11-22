@@ -92,6 +92,20 @@ class ArchiveReader:
     def __init__(self, archive_dir: Path) -> None:
         self.archive_dir = Path(archive_dir)
         self.db_path = self.archive_dir / "archive.sqlite"
+        self._col_cache: dict[str, set[str]] = {}
+        self._table_cache: set[str] | None = None
+
+    def _has_table(self, conn: sqlite3.Connection, table: str) -> bool:
+        if self._table_cache is None:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            self._table_cache = {r["name"] for r in rows}
+        return table in self._table_cache
+
+    def _table_cols(self, conn: sqlite3.Connection, table: str) -> set[str]:
+        if table not in self._col_cache:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            self._col_cache[table] = {r["name"] for r in rows}
+        return self._col_cache[table]
 
     @contextlib.contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -148,7 +162,10 @@ class ArchiveReader:
             )
             totals: dict[str, int] = {}
             by_platform: dict[str, dict[str, int]] = {"instagram": {}, "facebook": {}}
-            for tbl in tables:
+            for tbl in (*tables, "activities"):
+                if not self._has_table(conn, tbl):
+                    totals[tbl] = 0
+                    continue
                 totals[tbl] = int(conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0])
                 for row in conn.execute(
                     f"SELECT platform, COUNT(*) AS cnt FROM {tbl} GROUP BY platform"
@@ -237,6 +254,7 @@ class ArchiveReader:
 
     @staticmethod
     def _serialize_post_row(row: sqlite3.Row) -> dict[str, Any]:
+        keys = row.keys()
         return {
             "post_id": row["post_id"],
             "platform": row["platform"],
@@ -248,6 +266,7 @@ class ArchiveReader:
             "created_at": row["created_at"],
             "timestamp_unix": row["timestamp_unix"],
             "caption": row["caption"] or "",
+            "activity_title": row["activity_title"] if "activity_title" in keys else None,
             "hashtags": _loads_json(row["hashtags_json"], []),
             "location": (
                 {
@@ -264,6 +283,7 @@ class ArchiveReader:
             "reactions_total": row["reactions_total"] or 0,
             "reactions": _loads_json(row["reactions_json"], {}),
             "album_name": row["album_name"],
+            "group_name": row["group_name"] if "group_name" in keys else None,
             "shared_post": _loads_json(row["shared_post_json"], None),
             "audience": row["audience"],
             "is_archived": bool(row["is_archived"]),
@@ -297,7 +317,7 @@ class ArchiveReader:
             clauses.append("COALESCE(is_archived, 0) = ?")
             params.append(1 if archived else 0)
         if post_type == "original":
-            clauses.append("COALESCE(post_type, 'post') != 'shared'")
+            clauses.append("COALESCE(post_type, 'post') NOT IN ('shared', 'group_post')")
         elif post_type:
             clauses.append("post_type = ?")
             params.append(post_type)
@@ -309,6 +329,10 @@ class ArchiveReader:
 
         with self._connect() as conn:
             self._read_schema_meta(conn)
+            pcols = self._table_cols(conn, "posts")
+            extra_pcols = "".join(
+                f", {c}" for c in ("activity_title", "group_name") if c in pcols
+            )
             total = int(conn.execute(f"SELECT COUNT(*) FROM posts {where}", params).fetchone()[0])
             rows = conn.execute(
                 f"""
@@ -317,7 +341,7 @@ class ArchiveReader:
                        caption, hashtags_json, location_name, location_lat, location_lng,
                        tagged_users_json, likes_count, likes_is_truncated,
                        reactions_total, reactions_json, album_name, shared_post_json,
-                       audience, is_archived, is_collab, source
+                       audience, is_archived, is_collab, source{extra_pcols}
                 FROM posts
                 {where}
                 ORDER BY COALESCE(timestamp_unix, 0) DESC, post_id DESC
@@ -354,14 +378,18 @@ class ArchiveReader:
     def get_post_detail(self, post_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             self._read_schema_meta(conn)
+            pcols = self._table_cols(conn, "posts")
+            extra_pcols = "".join(
+                f", {c}" for c in ("activity_title", "group_name") if c in pcols
+            )
             row = conn.execute(
-                """
+                f"""
                 SELECT post_id, platform, shortcode, url, post_type,
                        author_username, author_name, created_at, timestamp_unix,
                        caption, hashtags_json, location_name, location_lat, location_lng,
                        tagged_users_json, likes_count, likes_is_truncated,
                        reactions_total, reactions_json, album_name, shared_post_json,
-                       audience, is_archived, is_collab, source
+                       audience, is_archived, is_collab, source{extra_pcols}
                 FROM posts
                 WHERE post_id = ?
                 """,
@@ -455,6 +483,7 @@ class ArchiveReader:
         self,
         platform: str = "instagram",
         highlight_id: str | None = None,
+        story_id: str | None = None,
         offset: int = 0,
         limit: int = 100,
     ) -> dict[str, Any]:
@@ -463,16 +492,21 @@ class ArchiveReader:
         if highlight_id:
             clauses.append("highlight_id = ?")
             params.append(highlight_id)
+        if story_id:
+            clauses.append("story_id = ?")
+            params.append(story_id)
         where = f"WHERE {' AND '.join(clauses)}"
 
         with self._connect() as conn:
             self._read_schema_meta(conn)
+            scols = self._table_cols(conn, "stories")
+            cap_col = ", caption" if "caption" in scols else ""
             total = int(conn.execute(f"SELECT COUNT(*) FROM stories {where}", params).fetchone()[0])
             rows = conn.execute(
                 f"""
                 SELECT story_id, platform, created_at, timestamp_unix, source,
                        highlight_id, highlight_title, highlight_cover,
-                       location_name, stickers_json, likes_count
+                       location_name, stickers_json, likes_count{cap_col}
                 FROM stories
                 {where}
                 ORDER BY COALESCE(timestamp_unix, 0) DESC, story_id DESC
@@ -485,6 +519,7 @@ class ArchiveReader:
             media_map = self._fetch_media_map(conn, "story", story_ids)
             items = []
             for row in rows:
+                rkeys = row.keys()
                 media_list = media_map.get(row["story_id"], [])
                 items.append(
                     {
@@ -492,6 +527,7 @@ class ArchiveReader:
                         "platform": row["platform"],
                         "created_at": row["created_at"],
                         "timestamp_unix": row["timestamp_unix"],
+                        "caption": (row["caption"] or "") if "caption" in rkeys else "",
                         "source": row["source"],
                         "highlight_id": row["highlight_id"],
                         "highlight_title": row["highlight_title"],
@@ -625,13 +661,15 @@ class ArchiveReader:
 
         with self._connect() as conn:
             self._read_schema_meta(conn)
+            tcols = self._table_cols(conn, "message_threads")
+            av_col = ", avatar_local_path" if "avatar_local_path" in tcols else ""
             total = int(
                 conn.execute(f"SELECT COUNT(*) FROM message_threads {where}", params).fetchone()[0]
             )
             rows = conn.execute(
                 f"""
                 SELECT thread_id, platform, title, participants_json,
-                       is_e2ee, is_pending, message_count, last_timestamp_unix
+                       is_e2ee, is_pending, message_count, last_timestamp_unix{av_col}
                 FROM message_threads
                 {where}
                 ORDER BY COALESCE(last_timestamp_unix, 0) DESC, thread_id ASC
@@ -639,19 +677,22 @@ class ArchiveReader:
                 """,
                 [*params, limit, offset],
             ).fetchall()
-            items = [
-                {
-                    "thread_id": row["thread_id"],
-                    "platform": row["platform"],
-                    "title": row["title"] or row["thread_id"],
-                    "participants": _loads_json(row["participants_json"], []),
-                    "is_e2ee": bool(row["is_e2ee"]),
-                    "is_pending": bool(row["is_pending"]),
-                    "message_count": row["message_count"] or 0,
-                    "last_timestamp_unix": row["last_timestamp_unix"],
-                }
-                for row in rows
-            ]
+            items = []
+            for row in rows:
+                rkeys = row.keys()
+                items.append(
+                    {
+                        "thread_id": row["thread_id"],
+                        "platform": row["platform"],
+                        "title": row["title"] or row["thread_id"],
+                        "avatar_local_path": row["avatar_local_path"] if "avatar_local_path" in rkeys else None,
+                        "participants": _loads_json(row["participants_json"], []),
+                        "is_e2ee": bool(row["is_e2ee"]),
+                        "is_pending": bool(row["is_pending"]),
+                        "message_count": row["message_count"] or 0,
+                        "last_timestamp_unix": row["last_timestamp_unix"],
+                    }
+                )
             return {"total": total, "offset": offset, "limit": limit, "items": items}
 
     def get_thread_messages(
@@ -659,13 +700,18 @@ class ArchiveReader:
         thread_id: str,
         offset: int = 0,
         limit: int = 100,
+        tail: bool = False,
+        before_seq: int | None = None,
+        around_ts: int | None = None,
     ) -> dict[str, Any] | None:
         with self._connect() as conn:
             self._read_schema_meta(conn)
+            tcols = self._table_cols(conn, "message_threads")
+            av_col = ", avatar_local_path" if "avatar_local_path" in tcols else ""
             trow = conn.execute(
-                """
+                f"""
                 SELECT thread_id, platform, title, participants_json,
-                       is_e2ee, is_pending, message_count, last_timestamp_unix
+                       is_e2ee, is_pending, message_count, last_timestamp_unix{av_col}
                 FROM message_threads
                 WHERE thread_id = ?
                 """,
@@ -680,24 +726,62 @@ class ArchiveReader:
                     (thread_id,),
                 ).fetchone()[0]
             )
-            rows = conn.execute(
-                """
-                SELECT id, thread_id, message_id, platform, seq, sender,
-                       timestamp_unix, timestamp_ms, created_at, text,
-                       reactions_json, reply_to_id, shared_link, is_unsent, call_duration
-                FROM messages
-                WHERE thread_id = ?
-                ORDER BY COALESCE(timestamp_ms, timestamp_unix * 1000, 0) ASC, seq ASC, id ASC
-                LIMIT ? OFFSET ?
-                """,
-                (thread_id, limit, offset),
-            ).fetchall()
+            mcols = self._table_cols(conn, "messages")
+            extra_mcols = "".join(
+                f", {c}" for c in ("share_text", "share_owner", "is_missed_call") if c in mcols
+            )
+
+            eff_offset = offset
+            if before_seq is not None:
+                desc_rows = conn.execute(
+                    f"""
+                    SELECT id, thread_id, message_id, platform, seq, sender,
+                           timestamp_unix, timestamp_ms, created_at, text,
+                           reactions_json, reply_to_id, shared_link, is_unsent, call_duration{extra_mcols}
+                    FROM messages
+                    WHERE thread_id = ? AND seq < ?
+                    ORDER BY seq DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (thread_id, before_seq, limit),
+                ).fetchall()
+                rows = list(reversed(desc_rows))
+                eff_offset = int(rows[0]["seq"]) if rows else 0
+            else:
+                if around_ts is not None and total > 0:
+                    near_row = conn.execute(
+                        """
+                        SELECT seq FROM messages
+                        WHERE thread_id = ?
+                        ORDER BY ABS(COALESCE(timestamp_unix, 0) - ?) ASC, seq ASC
+                        LIMIT 1
+                        """,
+                        (thread_id, around_ts),
+                    ).fetchone()
+                    if near_row is not None:
+                        eff_offset = max(0, int(near_row["seq"]) - limit // 2)
+                elif tail:
+                    eff_offset = max(0, total - limit)
+
+                rows = conn.execute(
+                    f"""
+                    SELECT id, thread_id, message_id, platform, seq, sender,
+                           timestamp_unix, timestamp_ms, created_at, text,
+                           reactions_json, reply_to_id, shared_link, is_unsent, call_duration{extra_mcols}
+                    FROM messages
+                    WHERE thread_id = ?
+                    ORDER BY COALESCE(timestamp_ms, timestamp_unix * 1000, 0) ASC, seq ASC, id ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (thread_id, limit, eff_offset),
+                ).fetchall()
 
             owner_ids = [f"{thread_id}#{row['seq']}" for row in rows]
             media_map = self._fetch_media_map(conn, "message", owner_ids)
 
             items = []
             for row in rows:
+                rkeys = row.keys()
                 owner_key = f"{thread_id}#{row['seq']}"
                 items.append(
                     {
@@ -714,17 +798,24 @@ class ArchiveReader:
                         "reactions": _loads_json(row["reactions_json"], []),
                         "reply_to_id": row["reply_to_id"],
                         "shared_link": row["shared_link"],
+                        "share_text": row["share_text"] if "share_text" in rkeys else None,
+                        "share_owner": row["share_owner"] if "share_owner" in rkeys else None,
                         "is_unsent": bool(row["is_unsent"]),
+                        "is_missed_call": bool(row["is_missed_call"]) if "is_missed_call" in rkeys else False,
                         "call_duration": row["call_duration"],
                         "media": media_map.get(owner_key, []),
                     }
                 )
 
+            tkeys = trow.keys()
+            has_older = bool(items and int(items[0]["seq"]) > 0)
+            has_newer = bool(items and (int(items[-1]["seq"]) + 1) < total)
             return {
                 "thread": {
                     "thread_id": trow["thread_id"],
                     "platform": trow["platform"],
                     "title": trow["title"] or trow["thread_id"],
+                    "avatar_local_path": trow["avatar_local_path"] if "avatar_local_path" in tkeys else None,
                     "participants": _loads_json(trow["participants_json"], []),
                     "is_e2ee": bool(trow["is_e2ee"]),
                     "is_pending": bool(trow["is_pending"]),
@@ -732,10 +823,82 @@ class ArchiveReader:
                     "last_timestamp_unix": trow["last_timestamp_unix"],
                 },
                 "total": total,
-                "offset": offset,
+                "offset": eff_offset,
                 "limit": limit,
+                "has_older": has_older,
+                "has_newer": has_newer,
                 "items": items,
             }
+
+    def list_activities(
+        self,
+        platform: str | None = None,
+        kind: str | None = None,
+        q: str | None = None,
+        activity_id: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            self._read_schema_meta(conn)
+            if not self._has_table(conn, "activities"):
+                return {"total": 0, "offset": offset, "limit": limit, "items": []}
+
+            clauses: list[str] = []
+            params: list[Any] = []
+            if platform:
+                clauses.append("platform = ?")
+                params.append(platform)
+            if kind:
+                clauses.append("kind = ?")
+                params.append(kind)
+            if activity_id:
+                clauses.append("activity_id = ?")
+                params.append(activity_id)
+            if q and q.strip():
+                needle = q.strip()
+                clauses.append(
+                    "(instr(lower(COALESCE(text, '')), lower(?)) > 0 "
+                    "OR instr(lower(COALESCE(title, '')), lower(?)) > 0 "
+                    "OR instr(lower(COALESCE(target_author, '')), lower(?)) > 0 "
+                    "OR instr(lower(COALESCE(group_name, '')), lower(?)) > 0)"
+                )
+                params.extend([needle, needle, needle, needle])
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+            total = int(conn.execute(f"SELECT COUNT(*) FROM activities {where}", params).fetchone()[0])
+            rows = conn.execute(
+                f"""
+                SELECT activity_id, platform, kind, created_at, timestamp_unix,
+                       text, title, target_author, group_name, url, source
+                FROM activities
+                {where}
+                ORDER BY COALESCE(timestamp_unix, 0) DESC, activity_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+
+            act_ids = [r["activity_id"] for r in rows]
+            media_map = self._fetch_media_map(conn, "activity", act_ids)
+            items = [
+                {
+                    "activity_id": r["activity_id"],
+                    "platform": r["platform"],
+                    "kind": r["kind"],
+                    "created_at": r["created_at"],
+                    "timestamp_unix": r["timestamp_unix"],
+                    "text": r["text"] or "",
+                    "title": r["title"],
+                    "target_author": r["target_author"],
+                    "group_name": r["group_name"],
+                    "url": r["url"],
+                    "source": r["source"],
+                    "media": media_map.get(r["activity_id"], []),
+                }
+                for r in rows
+            ]
+            return {"total": total, "offset": offset, "limit": limit, "items": items}
 
     def search(
         self,

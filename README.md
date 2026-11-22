@@ -126,18 +126,17 @@ uv --directory pipeline run meta-archive collect-fb --pass albums
 ```powershell
 uv --directory pipeline run meta-archive verify `
   --ig-official "C:\Users\dbstn\Downloads\instagram-yungis_-2026-11-20-9mAaRn8x" `
-  --fb-official "workspace_data\official-raw\facebook" `
-  --fb-e2ee "workspace_data\official-raw\fb-e2ee" `
+  --fb-official "C:\Users\dbstn\Downloads\facebook-dbstnsdl12-2026-11-22-EdI3t4uN" `
   --ig-collected "workspace_data\collected\instagram" `
   --fb-collected "workspace_data\collected\facebook" `
   --report-out "workspace_data\verify_report.md"
 ```
 
-*(Instagram만 먼저 검증할 때는 `--ig-official`과 `--ig-collected`만 넘기는 등 가진 입력 경로만 선택적으로 지정할 수 있습니다. `.json` 확장자로 지정하면 JSON 리포트도 저장 가능합니다.)*
+*(메신저 보안 저장소 암호화 대화가 있는 경우에만 `--fb-e2ee`를 추가합니다. 가진 입력 경로만 선택적으로 지정할 수 있으며, `.json` 확장자로 지정하면 JSON 리포트도 저장 가능합니다.)*
 
 ### 6. 최종 표준 아카이브 빌드 (`build`)
 
-Mojibake 복구 → 다단계 `dHash`/캡션/시간 매칭 병합 → 원본 미디어 무손실 복사 + `.xmp` 타임존 사이드카 + `mtime` 동기화 → 읽기 전용 `archive.sqlite` (`FTS5 trigram` + `PRAGMA journal_mode=DELETE` + `VACUUM`) → `manifest.sha256` 생성 및 자체 검증까지 한 번에 수행합니다.
+Mojibake 복구 → 다단계 `dHash`/캡션/시간 매칭 병합 → 원본 미디어 무손실 복사(위장 `.avif`→`.jpg` 및 무확장자 매직바이트 확장자 정규화 포함) + `.xmp` 타임존 사이드카 + `mtime` 동기화 → 내 댓글·저장 항목(`data/activities.json`) 및 읽기 전용 `archive.sqlite` (`FTS5 trigram` + `PRAGMA journal_mode=DELETE` + `VACUUM`) → `manifest.sha256` 생성 및 자체 검증까지 한 번에 수행합니다.
 
 ```powershell
 uv --directory pipeline run meta-archive build `

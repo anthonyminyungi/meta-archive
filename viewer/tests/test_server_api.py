@@ -941,3 +941,163 @@ def test_avif_media_mime_sniffs_disguised_jpeg_and_true_avif(
     r_avif = client.get("/media/facebook/posts/real.avif")
     assert r_avif.status_code == 200
     assert r_avif.headers["content-type"] == "image/avif"
+
+
+def test_extensionless_magic_mime_activities_tail_messages_group_posts_and_js_fixes(
+    tmp_path: Path,
+) -> None:
+    from meta_archive_viewer.app import _guess_media_mime
+
+    # 1. Pure magic-byte MIME sniffing for extensionless files (`<no_ext>`)
+    noext_jpg = tmp_path / "noext_photo"
+    noext_jpg.write_bytes(b"\xff\xd8\xff\xe0" + b"J" * 16)
+    assert _guess_media_mime(noext_jpg) == "image/jpeg"
+
+    noext_png = tmp_path / "noext_png"
+    noext_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"P" * 16)
+    assert _guess_media_mime(noext_png) == "image/png"
+
+    noext_pdf = tmp_path / "204712957226567"
+    noext_pdf.write_bytes(b"%PDF-1.3\nhello")
+    assert _guess_media_mime(noext_pdf) == "application/pdf"
+
+    noext_mp4 = tmp_path / "noext_clip"
+    noext_mp4.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 16)
+    assert _guess_media_mime(noext_mp4) == "video/mp4"
+
+    # 2. Build upgraded schema archive with activities, group_post, story caption, and 5 messages
+    arch = tmp_path / "arch_v2"
+    (arch / "media" / "facebook" / "stickers").mkdir(parents=True, exist_ok=True)
+    (arch / "media" / "facebook" / "stickers" / "st1.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"S" * 16)
+
+    db_path = arch / "archive.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_SCHEMA_DDL)
+    conn.execute("ALTER TABLE posts ADD COLUMN activity_title TEXT")
+    conn.execute("ALTER TABLE posts ADD COLUMN group_name TEXT")
+    conn.execute("ALTER TABLE stories ADD COLUMN caption TEXT")
+    conn.execute("ALTER TABLE message_threads ADD COLUMN avatar_local_path TEXT")
+    conn.execute("ALTER TABLE messages ADD COLUMN share_text TEXT")
+    conn.execute("ALTER TABLE messages ADD COLUMN share_owner TEXT")
+    conn.execute("ALTER TABLE messages ADD COLUMN is_missed_call INTEGER")
+    conn.executescript(
+        """
+        CREATE TABLE activities (
+            activity_id TEXT PRIMARY KEY,
+            platform TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            created_at TEXT,
+            timestamp_unix INTEGER,
+            text TEXT,
+            title TEXT,
+            target_author TEXT,
+            group_name TEXT,
+            url TEXT,
+            source TEXT,
+            raw_json TEXT
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')")
+    conn.execute(
+        """
+        INSERT INTO posts (post_id, platform, post_type, timestamp_unix, caption, activity_title, group_name, is_archived)
+        VALUES ('fb:grp_1', 'facebook', 'group_post', 1700000000, '학회 공지', '윤기님이 학회에 글을 남겼습니다.', '컴공학회', 0)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO stories (story_id, platform, timestamp_unix, caption, source)
+        VALUES ('fb_st_1', 'facebook', 1700000100, '보관 스토리 캡션', 'official_export')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO message_threads (thread_id, platform, title, avatar_local_path, is_e2ee, is_pending, message_count, last_timestamp_unix)
+        VALUES ('ig/grp_1', 'instagram', '단톡방', 'media/instagram/avatars/grp.jpg', 0, 0, 5, 1700000500)
+        """
+    )
+    for seq in range(5):
+        ts = 1700000100 + seq * 100
+        conn.execute(
+            """
+            INSERT INTO messages (
+                thread_id, message_id, platform, seq, sender, timestamp_unix, timestamp_ms,
+                text, reactions_json, share_text, share_owner, is_unsent, is_missed_call
+            ) VALUES (?, ?, 'instagram', ?, '윤기', ?, ?, ?, '[]', ?, ?, 0, ?)
+            """,
+            (
+                "ig/grp_1",
+                f"m_{seq}",
+                seq,
+                ts,
+                ts * 1000,
+                f"메시지 {seq}",
+                "공유 릴스 설명" if seq == 4 else None,
+                "creator_x" if seq == 4 else None,
+                1 if seq == 4 else 0,
+            ),
+        )
+    conn.execute(
+        """
+        INSERT INTO activities (activity_id, platform, kind, timestamp_unix, text, title, target_author, group_name, url, source)
+        VALUES ('fb_cmt_1', 'facebook', 'own_comment', 1700000900, '멋진 글이네요!', '윤기님이 댓글을 남겼습니다.', '김철수', NULL, NULL, 'official_export')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO media (owner_type, owner_id, platform, seq, media_type, local_path, is_carousel_cover)
+        VALUES ('activity', 'fb_cmt_1', 'facebook', 0, 'image', 'media/facebook/stickers/st1.png', 0)
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with TestClient(create_app(arch)) as client:
+        ov = client.get("/api/overview").json()
+        assert ov["totals"]["activities"] == 1
+
+        # Group post filter & metadata
+        grp_res = client.get("/api/posts", params={"platform": "facebook", "post_type": "group_post"}).json()
+        assert grp_res["total"] == 1
+        assert grp_res["items"][0]["group_name"] == "컴공학회"
+        assert grp_res["items"][0]["activity_title"] == "윤기님이 학회에 글을 남겼습니다."
+
+        orig_res = client.get("/api/posts", params={"platform": "facebook", "post_type": "original"}).json()
+        assert orig_res["total"] == 0
+
+        # Story by story_id + caption
+        st_res = client.get("/api/stories", params={"platform": "facebook", "story_id": "fb_st_1"}).json()
+        assert st_res["total"] == 1
+        assert st_res["items"][0]["caption"] == "보관 스토리 캡션"
+
+        # Tail pagination & before_seq & around_ts on messages
+        tail_res = client.get("/api/threads/ig/grp_1/messages", params={"tail": "true", "limit": 2}).json()
+        assert tail_res["thread"]["avatar_local_path"] == "media/instagram/avatars/grp.jpg"
+        assert [m["seq"] for m in tail_res["items"]] == [3, 4]
+        assert tail_res["has_older"] is True
+        assert tail_res["items"][1]["share_text"] == "공유 릴스 설명"
+        assert tail_res["items"][1]["share_owner"] == "creator_x"
+        assert tail_res["items"][1]["is_missed_call"] is True
+
+        older_res = client.get("/api/threads/ig/grp_1/messages", params={"before_seq": 3, "limit": 2}).json()
+        assert [m["seq"] for m in older_res["items"]] == [1, 2]
+        assert older_res["has_older"] is True
+
+        around_res = client.get(
+            "/api/threads/ig/grp_1/messages", params={"around_ts": 1700000300, "limit": 3}
+        ).json()
+        assert 2 in [m["seq"] for m in around_res["items"]]
+
+        # Activities endpoint
+        act_res = client.get("/api/activities", params={"platform": "facebook", "kind": "own_comment"}).json()
+        assert act_res["total"] == 1
+        assert act_res["items"][0]["text"] == "멋진 글이네요!"
+        assert act_res["items"][0]["media"][0]["local_path"] == "media/facebook/stickers/st1.png"
+
+    # 3. Frontend JS regression guards
+    js_dir = Path(__file__).resolve().parents[1] / "src" / "meta_archive_viewer" / "static" / "js"
+    messages_js = (js_dir / "views" / "messages.js").read_text(encoding="utf-8")
+    assert "r.reaction" in messages_js
+    dom_js = (js_dir / "dom.js").read_text(encoding="utf-8")
+    assert 'media.media_type === "audio"' in dom_js

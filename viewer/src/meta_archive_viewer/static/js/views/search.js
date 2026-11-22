@@ -1,7 +1,7 @@
 /** Hybrid Korean Search view (1-2 char INSTR fallback + 3+ char FTS5 trigram). */
 
-import { api } from "../api.js";
-import { clear, el, formatDate } from "../dom.js";
+import { api, mediaUrl } from "../api.js";
+import { clear, el, formatDate, isVideoMedia, safeExternalHref } from "../dom.js";
 
 const TYPE_LABELS = {
   post: "게시물",
@@ -9,6 +9,7 @@ const TYPE_LABELS = {
   message: "메시지",
   story: "스토리",
   connection: "인물",
+  activity: "내 활동",
 };
 
 export async function renderSearchView(container, ctx, initialQuery = "") {
@@ -35,6 +36,7 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
     el("option", { value: "comment" }, "댓글"),
     el("option", { value: "message" }, "메시지"),
     el("option", { value: "story" }, "스토리"),
+    el("option", { value: "activity" }, "내 활동 (댓글·저장)"),
     el("option", { value: "connection" }, "인물")
   );
   const submitBtn = el("button", { type: "submit", className: "btn btn-primary" }, "검색");
@@ -94,7 +96,64 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
             if (item.entity_type === "post" || item.entity_type === "comment") {
               ctx.openPost(item.entity_id);
             } else if (item.entity_type === "message") {
-              ctx.navigateThread(item.entity_id);
+              ctx.navigateThread(item.entity_id, item.timestamp_unix);
+            } else if (item.entity_type === "story") {
+              ctx.modal.openCustom(`스토리 — ${item.platform}`, async (body) => {
+                const stRes = await api.stories({ platform: item.platform, story_id: item.entity_id, limit: 1 });
+                clear(body);
+                const s = stRes.items && stRes.items[0];
+                if (!s) {
+                  body.appendChild(el("div", { className: "empty-box" }, "스토리를 찾을 수 없습니다."));
+                  return;
+                }
+                const src = s.media ? mediaUrl(s.media.local_path) : null;
+                body.appendChild(
+                  el(
+                    "div",
+                    { className: "card" },
+                    el(
+                      "div",
+                      { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
+                      el("span", { className: "pill pill-accent" }, formatDate(s.created_at, s.timestamp_unix)),
+                      s.highlight_title ? el("span", { className: "pill" }, s.highlight_title) : null
+                    ),
+                    src
+                      ? isVideoMedia(s.media)
+                        ? el("video", { src, controls: true, playsinline: true, style: "max-width:100%;max-height:460px;border-radius:8px;" })
+                        : el("img", { src, alt: "story", style: "max-width:100%;max-height:460px;border-radius:8px;" })
+                      : null,
+                    s.caption ? el("div", { className: "post-caption" }, s.caption) : null
+                  )
+                );
+              });
+            } else if (item.entity_type === "activity") {
+              ctx.modal.openCustom("내 활동 상세", async (body) => {
+                const actRes = await api.activities({ activity_id: item.entity_id, limit: 1 });
+                clear(body);
+                const a = actRes.items && actRes.items[0];
+                if (!a) {
+                  body.appendChild(el("div", { className: "empty-box" }, "활동 내역을 찾을 수 없습니다."));
+                  return;
+                }
+                const href = safeExternalHref(a.url);
+                body.appendChild(
+                  el(
+                    "div",
+                    { className: "card" },
+                    el(
+                      "div",
+                      { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
+                      el("span", { className: "pill pill-accent" }, a.kind),
+                      el("span", { className: "pill" }, formatDate(a.created_at, a.timestamp_unix)),
+                      a.target_author ? el("span", { className: "pill" }, `대상: ${a.target_author}`) : null,
+                      a.group_name ? el("span", { className: "pill" }, `그룹: ${a.group_name}`) : null
+                    ),
+                    a.title ? el("div", { style: "font-size:0.86rem;color:var(--text-muted);margin-bottom:6px;" }, a.title) : null,
+                    a.text ? el("div", { className: "post-caption" }, a.text) : null,
+                    href ? el("a", { href, target: "_blank", rel: "noopener noreferrer" }, a.url) : null
+                  )
+                );
+              });
             } else if (item.entity_type === "connection") {
               ctx.openPerson(item.entity_id || item.author);
             }

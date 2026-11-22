@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
+import subprocess
 import tempfile
 import urllib.parse
 from collections.abc import Sequence
@@ -19,6 +21,7 @@ from PIL import Image
 from meta_archive_pipeline.official import OfficialExportBundle
 from meta_archive_pipeline.official.fb_parser import clean_fb_external_url
 from meta_archive_pipeline.schema.models import (
+    ActivityItem,
     Connection,
     LikesInfo,
     Location,
@@ -35,6 +38,7 @@ from meta_archive_pipeline.schema.paths import ArchivePaths, normalize_rel_path
 from meta_archive_pipeline.utils.fs import atomic_write_bytes, sha256_file, to_long_path
 from meta_archive_pipeline.utils.media import (
     inspect_mp4,
+    resolve_ffmpeg,
     set_file_mtime,
     write_xmp_sidecar,
 )
@@ -61,6 +65,7 @@ class MergeResult:
     stories: list[Story] = field(default_factory=list)
     connections: list[Connection] = field(default_factory=list)
     messages: list[MessageThread] = field(default_factory=list)
+    activities: list[ActivityItem] = field(default_factory=list)
     ambiguous_matches: list[AmbiguousMatch] = field(default_factory=list)
 
 
@@ -77,6 +82,7 @@ class ArchiveBuildSummary:
     media_copied: int
     xmp_written: int
     ambiguous_count: int
+    activities_count: int = 0
 
 
 def compute_dhash(path: Path) -> int | None:
@@ -134,15 +140,53 @@ def _non_cover_media(post: Post) -> list[MediaItem]:
     return non_cover if non_cover else list(post.media)
 
 
+def compute_video_dhash(path: Path) -> int | None:
+    """Extract first video frame via ffmpeg and compute 64-bit dHash when possible."""
+    long_path = to_long_path(path)
+    if not os.path.exists(long_path):
+        return None
+    exe = resolve_ffmpeg()
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, "-v", "error", "-i", long_path, "-vframes", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        with Image.open(io.BytesIO(proc.stdout)) as img:
+            gray = img.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
+            getter = getattr(gray, "get_flattened_data", None) or gray.getdata
+            pixels = list(getter())
+        bits = 0
+        for row in range(8):
+            offset = row * 9
+            for col in range(8):
+                bits = (bits << 1) | (1 if pixels[offset + col] > pixels[offset + col + 1] else 0)
+        return bits
+    except Exception:
+        return None
+
+
 def _post_dhashes(post: Post, roots: Sequence[Path]) -> list[int]:
     hashes: list[int] = []
     for m in _non_cover_media(post):
-        if m.media_type in ("image", "unknown") and m.local_path:
-            resolved = _resolve_source_file(m.local_path, roots)
-            if resolved is not None:
-                h = compute_dhash(resolved)
-                if h is not None:
-                    hashes.append(h)
+        if not m.local_path:
+            continue
+        resolved = _resolve_source_file(m.local_path, roots)
+        if resolved is None:
+            continue
+        if m.media_type in ("image", "unknown"):
+            h = compute_dhash(resolved)
+            if h is not None:
+                hashes.append(h)
+        elif m.media_type == "video":
+            vh = compute_video_dhash(resolved)
+            if vh is not None:
+                hashes.append(vh)
     return hashes
 
 
@@ -237,6 +281,8 @@ def _merge_media_lists(
         if off_match is not None:
             if not chosen.taken_at_exif and off_match.taken_at_exif:
                 chosen.taken_at_exif = off_match.taken_at_exif
+            if chosen.taken_at_unix is None and off_match.taken_at_unix is not None:
+                chosen.taken_at_unix = off_match.taken_at_unix
             if chosen.gps_lat is None and off_match.gps_lat is not None:
                 chosen.gps_lat = off_match.gps_lat
             if chosen.gps_lng is None and off_match.gps_lng is not None:
@@ -253,6 +299,9 @@ def _merge_media_lists(
                     chosen = off_match.model_copy(
                         update={
                             "taken_at_exif": chosen.taken_at_exif or off_match.taken_at_exif,
+                            "taken_at_unix": chosen.taken_at_unix
+                            if chosen.taken_at_unix is not None
+                            else off_match.taken_at_unix,
                             "gps_lat": chosen.gps_lat if chosen.gps_lat is not None else off_match.gps_lat,
                             "gps_lng": chosen.gps_lng if chosen.gps_lng is not None else off_match.gps_lng,
                         }
@@ -280,7 +329,9 @@ def _merge_two_posts(
     merged_media = _merge_media_lists(off.media, pw.media, official_roots, playwright_roots)
     merged_shared = _merge_shared_post(off.shared_post, pw.shared_post)
     post_type = pw.post_type
-    if off.post_type == "album_photo" and post_type == "post":
+    if off.post_type == "group_post":
+        post_type = "group_post"
+    elif off.post_type == "album_photo" and post_type == "post":
         post_type = "album_photo"
     elif off.post_type == "carousel" and len(merged_media) > 1:
         post_type = "carousel"
@@ -297,6 +348,7 @@ def _merge_two_posts(
         created_at=pw.created_at or off.created_at,
         timestamp_unix=pw.timestamp_unix or off.timestamp_unix,
         caption=pw.caption or off.caption,
+        activity_title=pw.activity_title or off.activity_title,
         hashtags=hashtags,
         location=_merge_location(off.location, pw.location),
         tagged_users=pw.tagged_users or off.tagged_users,
@@ -305,6 +357,7 @@ def _merge_two_posts(
         reactions=pw.reactions if pw.reactions.total > 0 else off.reactions,
         comments=pw.comments or off.comments,
         album_name=pw.album_name or off.album_name,
+        group_name=pw.group_name or off.group_name,
         shared_post=merged_shared,
         audience=pw.audience or off.audience,
         is_archived=off.is_archived or pw.is_archived,
@@ -345,10 +398,24 @@ def _score_post_pair(
     if dhash_dist is not None and dhash_dist <= 10:
         score += 4.0
 
-    off_cnt = len(_non_cover_media(off))
-    pw_cnt = len(_non_cover_media(pw))
+    off_nc = _non_cover_media(off)
+    pw_nc = _non_cover_media(pw)
+    off_cnt = len(off_nc)
+    pw_cnt = len(pw_nc)
     if off_cnt > 0 and off_cnt == pw_cnt:
         score += 1.0
+
+    if (
+        off_cnt == 1
+        and pw_cnt == 1
+        and off_nc[0].media_type == "video"
+        and pw_nc[0].media_type == "video"
+        and not off_cap
+        and not pw_cap
+        and ts_delta is not None
+        and ts_delta <= 300
+    ):
+        score += 2.0
 
     off_url_key = _normalize_url_key(off.shared_post.url if off.shared_post else None)
     pw_url_key = _normalize_url_key(pw.shared_post.url if pw.shared_post else None)
@@ -415,7 +482,11 @@ def merge_posts(
 
         # Stage 2: Multi-stage heuristic + dHash scoring on remaining unmatched posts
         rem_off = [(oi, off_list[oi]) for oi in range(len(off_list)) if oi not in used_off]
-        rem_pw = [(pi, pw_list[pi]) for pi in range(len(pw_list)) if pi not in used_pw]
+        rem_pw = [
+            (pi, pw_list[pi])
+            for pi in range(len(pw_list))
+            if pi not in used_pw and pw_list[pi].post_type != "tagged"
+        ]
 
         off_hash_map = {oi: _post_dhashes(p, official_roots) for oi, p in rem_off}
         pw_hash_map = {pi: _post_dhashes(p, playwright_roots) for pi, p in rem_pw}
@@ -534,6 +605,9 @@ def merge_stories(
                     update={
                         "local_path": off.media.local_path or pw.media.local_path,
                         "taken_at_exif": off.media.taken_at_exif or pw.media.taken_at_exif,
+                        "taken_at_unix": off.media.taken_at_unix
+                        if off.media.taken_at_unix is not None
+                        else pw.media.taken_at_unix,
                         "gps_lat": off.media.gps_lat if off.media.gps_lat is not None else pw.media.gps_lat,
                         "gps_lng": off.media.gps_lng if off.media.gps_lng is not None else pw.media.gps_lng,
                     }
@@ -544,6 +618,7 @@ def merge_stories(
                     story_id=off.story_id,
                     created_at=off.created_at or pw.created_at,
                     timestamp_unix=off.timestamp_unix or pw.timestamp_unix,
+                    caption=off.caption or pw.caption,
                     source="merged",
                     highlight_id=pw.highlight_id or off.highlight_id,
                     highlight_title=pw.highlight_title or off.highlight_title,
@@ -606,23 +681,24 @@ def merge_connections(
         if key not in ig_pw_used:
             merged.append(pw)
 
-    # Facebook: unique 1:1 full_name heuristic join; duplicate names flagged, never force-merged
+    # Facebook: unique 1:1 (relation, full_name) heuristic join; duplicate names flagged, never force-merged
     fb_off = [c for c in official_conns if c.platform == "facebook"]
     fb_pw = [c for c in playwright_conns if c.platform == "facebook"]
 
     def _norm_name(c: Connection) -> str:
         return " ".join((c.full_name or "").split()).lower()
 
-    off_by_name: dict[str, list[Connection]] = {}
-    pw_by_name: dict[str, list[Connection]] = {}
+    off_by_rel_name: dict[tuple[str, str], list[Connection]] = {}
+    pw_by_rel_name: dict[tuple[str, str], list[Connection]] = {}
     for c in fb_off:
-        off_by_name.setdefault(_norm_name(c), []).append(c)
+        off_by_rel_name.setdefault((c.relation, _norm_name(c)), []).append(c)
     for c in fb_pw:
-        pw_by_name.setdefault(_norm_name(c), []).append(c)
+        pw_by_rel_name.setdefault((c.relation, _norm_name(c)), []).append(c)
 
-    for name_key in sorted(set(off_by_name) | set(pw_by_name)):
-        off_group = off_by_name.get(name_key, [])
-        pw_group = pw_by_name.get(name_key, [])
+    for rel_name_key in sorted(set(off_by_rel_name) | set(pw_by_rel_name)):
+        _rel, name_key = rel_name_key
+        off_group = off_by_rel_name.get(rel_name_key, [])
+        pw_group = pw_by_rel_name.get(rel_name_key, [])
         if name_key and len(off_group) == 1 and len(pw_group) == 1:
             o, p = off_group[0], pw_group[0]
             merged.append(
@@ -706,6 +782,11 @@ def merge_all(
     off_stories = [s for b in official_bundles for s in b.stories]
     off_conns = [c for b in official_bundles for c in b.connections]
     messages = [t for b in official_bundles for t in b.messages]
+    activities = sorted(
+        [a for b in official_bundles for a in b.activities],
+        key=lambda a: a.timestamp_unix if a.timestamp_unix is not None else 0,
+        reverse=True,
+    )
 
     profiles = merge_profiles(off_profiles, collected_profiles)
     posts, post_amb = merge_posts(
@@ -728,8 +809,48 @@ def merge_all(
         stories=stories,
         connections=connections,
         messages=messages,
+        activities=activities,
         ambiguous_matches=[*post_amb, *conn_amb],
     )
+
+
+def _sniff_normalized_ext(src_file: Path, current_ext: str) -> str:
+    """Losslessly normalize disguised `.avif` (JPEG bytes) and extensionless files using magic bytes."""
+    low = current_ext.lower()
+    if low and low != ".avif":
+        return current_ext
+
+    try:
+        with open(to_long_path(src_file), "rb") as handle:
+            header = handle.read(16)
+    except OSError:
+        return current_ext
+
+    magic = ""
+    if header.startswith(b"\xff\xd8\xff"):
+        magic = ".jpg"
+    elif header.startswith(b"\x89PNG\r\n\x1a\n"):
+        magic = ".png"
+    elif header.startswith((b"GIF87a", b"GIF89a")):
+        magic = ".gif"
+    elif len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        magic = ".webp"
+    elif header.startswith(b"%PDF-"):
+        magic = ".pdf"
+    elif len(header) >= 12 and header[4:8] == b"ftyp":
+        brand = header[8:12]
+        if brand in (b"avif", b"avis"):
+            magic = ".avif"
+        elif brand in (b"heic", b"heix", b"mif1"):
+            magic = ".heic"
+        else:
+            magic = ".mp4"
+
+    if low == ".avif":
+        return ".jpg" if magic == ".jpg" else current_ext
+    if not low and magic:
+        return magic
+    return current_ext
 
 
 def _copy_file_lossless(src: Path, dest: Path, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
@@ -816,11 +937,31 @@ def materialize_archive(
             dest_rel, sha, sz = copied_cache[src_key]
             return dest_rel, sha, sz, paths.root.joinpath(*dest_rel.split("/"))
 
-        dest_rel = _canonical_media_rel(platform, category, src_rel)
+        eff_cat = "stickers" if "stickers_used/" in normalize_rel_path(src_rel) else category
+        dest_rel = _canonical_media_rel(platform, eff_cat, src_rel)
+        dest_p = Path(dest_rel)
+        norm_ext = _sniff_normalized_ext(src_file, dest_p.suffix)
+        if norm_ext != dest_p.suffix:
+            dest_rel = normalize_rel_path(dest_p.with_suffix(norm_ext).as_posix())
+            dest_p = Path(dest_rel)
+
         dest_file = paths.root.joinpath(*dest_rel.split("/"))
         if os.path.exists(to_long_path(dest_file)):
-            sha = sha256_file(dest_file)
-            sz = os.path.getsize(to_long_path(dest_file))
+            src_sha = sha256_file(src_file)
+            dest_sha = sha256_file(dest_file)
+            if src_sha == dest_sha:
+                sha = dest_sha
+                sz = os.path.getsize(to_long_path(dest_file))
+            else:
+                disamb = dest_p.with_name(f"{dest_p.stem}_{src_sha[:8]}{dest_p.suffix}")
+                dest_rel = normalize_rel_path(disamb.as_posix())
+                dest_file = paths.root.joinpath(*dest_rel.split("/"))
+                if os.path.exists(to_long_path(dest_file)):
+                    sha = sha256_file(dest_file)
+                    sz = os.path.getsize(to_long_path(dest_file))
+                else:
+                    sha, sz = _copy_file_lossless(src_file, dest_file)
+                    media_copied += 1
         else:
             sha, sz = _copy_file_lossless(src_file, dest_file)
             media_copied += 1
@@ -839,16 +980,24 @@ def materialize_archive(
         description: str | None = None,
         write_xmp: bool = True,
     ) -> None:
-        dest_rel, sha, sz, dest_file = _materialize_media_file(item.local_path, platform, category)
+        is_sticker = bool(item.local_path and "stickers_used/" in item.local_path)
+        eff_cat = "stickers" if is_sticker else category
+        eff_write_xmp = False if is_sticker else write_xmp
+
+        dest_rel, sha, sz, dest_file = _materialize_media_file(item.local_path, platform, eff_cat)
         if dest_rel:
             item.local_path = dest_rel
+            if item.media_type == "unknown":
+                d_ext = Path(dest_rel).suffix.lower()
+                if d_ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic"}:
+                    item.media_type = "image"
         if sha is not None:
             item.sha256 = sha
         if sz is not None:
             item.byte_size = sz
         if dest_file is not None:
-            eff_ts = ts_unix
-            if write_xmp and (eff_ts is not None or item.taken_at_exif):
+            eff_ts = item.taken_at_unix if item.taken_at_unix is not None else ts_unix
+            if eff_write_xmp and (eff_ts is not None or item.taken_at_exif):
                 nonlocal xmp_written
                 sidecar = write_xmp_sidecar(
                     dest_file,
@@ -864,7 +1013,7 @@ def materialize_archive(
                         sidecar.relative_to(paths.root).as_posix()
                     )
                     xmp_written += 1
-            if eff_ts is not None:
+            if eff_ts is not None and not is_sticker:
                 set_file_mtime(dest_file, eff_ts)
 
     for profile in merge_result.profiles:
@@ -910,7 +1059,7 @@ def materialize_archive(
                 ts_unix=story.timestamp_unix,
                 lat=s_lat,
                 lng=s_lng,
-                description=story.highlight_title,
+                description=story.caption or story.highlight_title or None,
                 write_xmp=True,
             )
 
@@ -922,6 +1071,11 @@ def materialize_archive(
             conn.avatar_local_path = dest_rel
 
     for thread in merge_result.messages:
+        if thread.avatar_local_path:
+            dest_rel, _, _, _ = _materialize_media_file(
+                thread.avatar_local_path, thread.platform, "avatars"
+            )
+            thread.avatar_local_path = dest_rel
         for msg in thread.messages:
             for m in msg.media:
                 _process_media_item(
@@ -932,6 +1086,17 @@ def materialize_archive(
                     write_xmp=True,
                 )
 
+    for act in merge_result.activities:
+        for m in act.media:
+            _process_media_item(
+                m,
+                act.platform,
+                "activities",
+                ts_unix=act.timestamp_unix,
+                description=act.text or None,
+                write_xmp=True,
+            )
+
     def _dump_json(path: Path, data: Any) -> None:
         atomic_write_bytes(path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
 
@@ -940,6 +1105,7 @@ def materialize_archive(
     _dump_json(paths.stories_json, [s.model_dump(mode="json") for s in merge_result.stories])
     _dump_json(paths.connections_json, [c.model_dump(mode="json") for c in merge_result.connections])
     _dump_json(paths.messages_json, [t.model_dump(mode="json") for t in merge_result.messages])
+    _dump_json(paths.activities_json, [a.model_dump(mode="json") for a in merge_result.activities])
     _dump_json(
         paths.ambiguous_matches_path,
         [
@@ -965,4 +1131,5 @@ def materialize_archive(
         media_copied=media_copied,
         xmp_written=xmp_written,
         ambiguous_count=len(merge_result.ambiguous_matches),
+        activities_count=len(merge_result.activities),
     )

@@ -58,6 +58,7 @@ class MediaItem(BaseModel):
     has_audio: bool | None = None
     is_audio_muted: bool | None = None
     taken_at_exif: str | None = None
+    taken_at_unix: int | None = None
     gps_lat: float | None = None
     gps_lng: float | None = None
     sha256: str | None = None
@@ -147,17 +148,21 @@ class SharedPostRef(BaseModel):
 
 
 class Post(BaseModel):
-    """Unified Instagram/Facebook feed post, carousel, reel, or album photo."""
+    """Unified Instagram/Facebook feed post, carousel, reel, album photo, group post, or tagged post."""
 
     platform: Platform
     post_id: str
     shortcode: str | None = None
     url: str | None = None
-    post_type: Literal["post", "carousel", "reel", "album_photo", "shared", "other"] = "post"
+    post_type: Literal[
+        "post", "carousel", "reel", "album_photo", "shared", "group_post", "tagged", "other"
+    ] = "post"
     author: UserRef = Field(default_factory=UserRef)
     created_at: datetime | None = None
     timestamp_unix: int | None = None
     caption: str = ""
+    activity_title: str | None = None
+    group_name: str | None = None
     hashtags: list[str] = Field(default_factory=list)
     location: Location | None = None
     tagged_users: list[UserRef] = Field(default_factory=list)
@@ -180,6 +185,7 @@ class Story(BaseModel):
     story_id: str
     created_at: datetime | None = None
     timestamp_unix: int | None = None
+    caption: str = ""
     source: Literal["highlight_web", "official_export", "merged"] = "official_export"
     highlight_id: str | None = None
     highlight_title: str | None = None
@@ -235,7 +241,10 @@ class Message(BaseModel):
     reactions: list[MessageReaction] = Field(default_factory=list)
     reply_to_id: str | None = None
     shared_link: str | None = None
+    share_text: str | None = None
+    share_owner: str | None = None
     is_unsent: bool = False
+    is_missed_call: bool = False
     call_duration: int | None = None
 
 
@@ -245,7 +254,33 @@ class MessageThread(BaseModel):
     platform: Platform
     thread_id: str
     title: str | None = None
+    avatar_local_path: str | None = None
     participants: list[UserRef] = Field(default_factory=list)
     is_e2ee: bool = False
     is_pending: bool = False
     messages: list[Message] = Field(default_factory=list)
+
+    @field_validator("avatar_local_path")
+    @classmethod
+    def _validate_avatar_path(cls, value: str | None) -> str | None:
+        return _normalize_optional_rel_path(value)
+
+
+ActivityKind = Literal["own_comment", "group_comment", "saved_item", "repost"]
+
+
+class ActivityItem(BaseModel):
+    """User's own comment on external/group posts, saved item/bookmark, or repost."""
+
+    activity_id: str
+    platform: Platform
+    kind: ActivityKind
+    created_at: datetime | None = None
+    timestamp_unix: int | None = None
+    text: str = ""
+    title: str | None = None
+    target_author: str | None = None
+    group_name: str | None = None
+    url: str | None = None
+    media: list[MediaItem] = Field(default_factory=list)
+    source: Literal["official_export", "playwright", "merged"] = "official_export"

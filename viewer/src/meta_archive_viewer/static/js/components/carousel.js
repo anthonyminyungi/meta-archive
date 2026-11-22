@@ -1,7 +1,7 @@
 /** Multi-media carousel component supporting photos, audio/video playback, and lightbox zoom. */
 
 import { mediaUrl } from "../api.js";
-import { clear, el, isVideoMedia } from "../dom.js";
+import { clear, el, isAudioMedia, isDocumentMedia, isVideoMedia } from "../dom.js";
 
 export function renderCarousel(mediaList, onOpenLightbox) {
   const playable = (mediaList || []).filter((m) => m && m.local_path && !m.is_carousel_cover);
@@ -18,7 +18,9 @@ export function renderCarousel(mediaList, onOpenLightbox) {
     const current = items[index];
     const src = mediaUrl(current.local_path);
     if (src) {
-      if (isVideoMedia(current)) {
+      if (isAudioMedia(current)) {
+        stage.appendChild(el("audio", { src, controls: true, preload: "metadata" }));
+      } else if (isVideoMedia(current)) {
         const video = el("video", {
           src,
           controls: true,
@@ -26,6 +28,24 @@ export function renderCarousel(mediaList, onOpenLightbox) {
           preload: "metadata",
         });
         stage.appendChild(video);
+      } else if (isDocumentMedia(current)) {
+        const fname = (current.local_path || "첨부파일").split("/").pop();
+        stage.appendChild(
+          el(
+            "div",
+            { style: "padding:24px;text-align:center;" },
+            el(
+              "a",
+              {
+                className: "btn",
+                href: src,
+                target: "_blank",
+                rel: "noopener noreferrer",
+              },
+              `📄 첨부 파일 열기 (${fname})`
+            )
+          )
+        );
       } else {
         const img = el("img", {
           src,

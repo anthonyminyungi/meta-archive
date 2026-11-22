@@ -775,6 +775,24 @@ def extract_ig_connections_from_payloads(
     return list(seen.values()), avatar_urls
 
 
+def extract_ig_highlight_tray_ids(payloads: Sequence[dict[str, Any]]) -> list[str]:
+    """Extract ordered unique highlight reel IDs from profile tray payloads."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for payload in payloads:
+        for d in _walk_dicts(payload):
+            tray_nodes: list[dict[str, Any]] = []
+            tray_nodes.extend(_extract_edge_nodes(d.get("edge_highlight_reels")))
+            if isinstance(d.get("tray"), list):
+                tray_nodes.extend(t for t in d["tray"] if isinstance(t, dict))
+            for item in tray_nodes:
+                hid = str(item.get("id") or "")
+                if hid and hid not in seen:
+                    seen.add(hid)
+                    ordered.append(hid)
+    return ordered
+
+
 def extract_ig_highlights_from_payloads(
     payloads: Sequence[dict[str, Any]],
 ) -> tuple[list[Story], dict[str, str]]:
@@ -822,6 +840,8 @@ def extract_ig_highlights_from_payloads(
                 hid = str(group.get("id") or "")
                 if not hid:
                     continue
+                if hid not in highlight_meta and f"highlight:{hid}" in highlight_meta:
+                    hid = f"highlight:{hid}"
                 title = group.get("title") if isinstance(group.get("title"), str) else None
                 meta_title, meta_cover = highlight_meta.get(hid, (None, None))
                 resolved_title = title or meta_title
@@ -1120,6 +1140,21 @@ class IgCollector:
                         )
                     _write_json_atomic(out / "profile.json", profile.model_dump(mode="json"))
                 shortcodes = extract_ig_shortcodes_from_payloads(profile_payloads)
+                if self.config.limit is None or len(shortcodes) < self.config.limit:
+                    reels_url = f"https://www.instagram.com/{self.config.username}/reels/"
+                    rem = (self.config.limit - len(shortcodes)) if self.config.limit is not None else None
+                    try:
+                        reel_payloads = self._visit_and_collect(reels_url)
+                        reel_payloads.extend(
+                            self._scroll_and_collect(self.config.max_scrolls, stop_count=rem)
+                        )
+                        shortcodes = list(
+                            dict.fromkeys([*shortcodes, *extract_ig_shortcodes_from_payloads(reel_payloads)])
+                        )
+                    except SafetyStopError:
+                        raise
+                    except Exception:
+                        pass
                 _write_json_atomic(out / "index_shortcodes.json", shortcodes)
 
             store = CheckpointStore(out / "state_core.json")
@@ -1178,9 +1213,53 @@ class IgCollector:
                     summary.failed += 1
 
             if profile_payloads:
+                tray_ids = extract_ig_highlight_tray_ids(profile_payloads)
                 stories, media_urls = extract_ig_highlights_from_payloads(profile_payloads)
+                covered_hids = {s.highlight_id for s in stories if s.highlight_id}
+                extra_hl_payloads: list[dict[str, Any]] = []
+                for hid in tray_ids:
+                    if hid in covered_hids:
+                        continue
+                    num_id = hid.split(":", 1)[1] if ":" in hid else hid
+                    try:
+                        extra_hl_payloads.extend(
+                            self._visit_and_collect(
+                                f"https://www.instagram.com/stories/highlights/{num_id}/"
+                            )
+                        )
+                    except SafetyStopError:
+                        raise
+                    except Exception:
+                        continue
+                if extra_hl_payloads:
+                    stories, media_urls = extract_ig_highlights_from_payloads(
+                        [*profile_payloads, *extra_hl_payloads]
+                    )
                 if stories:
+                    cover_local_by_hid: dict[str, str] = {}
+                    if self.request_context is not None:
+                        for hid in dict.fromkeys(s.highlight_id for s in stories if s.highlight_id):
+                            cov_url = media_urls.get(f"cover:{hid}")
+                            if not cov_url:
+                                continue
+                            safe_hid = re.sub(r"[^A-Za-z0-9_-]", "_", hid)
+                            cov_dest = out / "media" / "highlights" / f"cover_{safe_hid}.jpg"
+                            try:
+                                download_media_via_context(
+                                    self.request_context,
+                                    cov_url,
+                                    cov_dest,
+                                    headers={"Referer": "https://www.instagram.com/"},
+                                )
+                                cover_local_by_hid[hid] = normalize_rel_path(
+                                    f"media/instagram/highlights/cover_{safe_hid}.jpg"
+                                )
+                            except Exception:
+                                pass
+
                     for story in stories:
+                        if story.highlight_id and story.highlight_id in cover_local_by_hid:
+                            story.highlight_cover = cover_local_by_hid[story.highlight_id]
                         url = media_urls.get(story.story_id)
                         if url and story.media and self.request_context is not None:
                             ext = ".mp4" if story.media.media_type == "video" else ".jpg"
@@ -1325,8 +1404,83 @@ class IgCollector:
         return summary
 
     def run_pass_tagged(self) -> IgCollectSummary:
-        """Pass 3 (optional): collect tagged posts index."""
-        return self._run_index_pass("tagged", "tagged")
+        """Pass 3 (optional): collect tagged posts index, full post details, comments, and media."""
+        summary = IgCollectSummary(collect_pass="tagged")
+        out = self.config.output_dir
+        try:
+            if self.config.shortcodes:
+                shortcodes = list(dict.fromkeys(self.config.shortcodes))
+            else:
+                url = f"https://www.instagram.com/{self.config.username}/tagged/"
+                payloads = self._visit_and_collect(url)
+                payloads.extend(
+                    self._scroll_and_collect(self.config.max_scrolls, stop_count=self.config.limit)
+                )
+                shortcodes = extract_ig_shortcodes_from_payloads(payloads)
+                if self.config.limit is not None:
+                    shortcodes = shortcodes[: self.config.limit]
+                _write_json_atomic(out / "tagged_index.json", shortcodes)
+
+            store = CheckpointStore(out / "state_tagged.json")
+            store.ensure_items(shortcodes)
+            summary.skipped_done = len(store.ids_by_status("done"))
+
+            todo = store.pending_ids()
+            if self.config.limit is not None:
+                todo = todo[: self.config.limit]
+
+            for sc in todo:
+                summary.processed += 1
+                try:
+                    post_payloads = self._visit_and_collect(f"https://www.instagram.com/p/{sc}/")
+                    expand_ig_comments(
+                        self.page,
+                        self.config.cooldown,
+                        max_clicks=self.config.max_expand_clicks,
+                    )
+                    self.collector.raise_if_unsafe()
+                    for resp in self.collector.drain():
+                        post_payloads.extend(resp.payloads)
+
+                    _write_json_atomic(out / "raw" / "tagged_posts" / f"{sc}.json", post_payloads)
+                    store.set_status(sc, "fetched")
+
+                    post, candidates = extract_ig_post_from_payloads(sc, post_payloads)
+                    if post is None:
+                        raise RuntimeError(f"Could not extract tagged post payload for shortcode {sc}")
+                    post.post_type = "tagged"
+
+                    if self.request_context is not None and candidates:
+                        saved_media = download_post_media(
+                            self.request_context,
+                            sc,
+                            candidates,
+                            out / "media" / "tagged",
+                            created_timestamp=post.timestamp_unix,
+                            rel_dir="media/instagram/tagged",
+                        )
+                        post.media = saved_media
+                    store.set_status(sc, "media_saved")
+
+                    _write_json_atomic(
+                        out / "tagged_posts" / f"{sc}.json",
+                        post.model_dump(mode="json"),
+                    )
+                    store.set_status(sc, "done")
+                    summary.succeeded += 1
+                    self.config.cooldown.record_item_completed()
+                except SafetyStopError as exc:
+                    store.set_status(sc, "failed", error=str(exc))
+                    summary.failed += 1
+                    summary.paused_reason = str(exc)
+                    return summary
+                except Exception as exc:
+                    store.set_status(sc, "failed", error=str(exc))
+                    summary.failed += 1
+        except SafetyStopError as exc:
+            summary.paused_reason = str(exc)
+
+        return summary
 
     def run_pass_saved(self) -> IgCollectSummary:
         """Pass 3 (optional): collect saved posts index."""

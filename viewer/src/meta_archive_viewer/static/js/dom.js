@@ -73,6 +73,7 @@ export function formatDuration(seconds) {
 
 export function isVideoMedia(media) {
   if (!media) return false;
+  if (media.media_type === "audio" || media.media_type === "image") return false;
   if (media.media_type === "video") return true;
   const p = (media.local_path || "").toLowerCase();
   return p.endsWith(".mp4") || p.endsWith(".mov") || p.endsWith(".webm");
@@ -82,7 +83,26 @@ export function isAudioMedia(media) {
   if (!media) return false;
   if (media.media_type === "audio") return true;
   const p = (media.local_path || "").toLowerCase();
-  return p.endsWith(".m4a") || p.endsWith(".mp3") || p.endsWith(".ogg") || p.endsWith(".wav");
+  return p.endsWith(".m4a") || p.endsWith(".mp3") || p.endsWith(".ogg") || p.endsWith(".wav") || p.endsWith(".opus");
+}
+
+export function isDocumentMedia(media) {
+  if (!media) return false;
+  if (isAudioMedia(media) || isVideoMedia(media) || media.media_type === "image") return false;
+  if (media.media_type === "unknown") return true;
+  const p = (media.local_path || "").toLowerCase();
+  return (
+    p.endsWith(".pdf") ||
+    p.endsWith(".ppt") ||
+    p.endsWith(".pptx") ||
+    p.endsWith(".doc") ||
+    p.endsWith(".docx") ||
+    p.endsWith(".xls") ||
+    p.endsWith(".xlsx") ||
+    p.endsWith(".zip") ||
+    p.endsWith(".hwp") ||
+    p.endsWith(".txt")
+  );
 }
 
 export function avatarEl(localPath, label = "?", large = false) {

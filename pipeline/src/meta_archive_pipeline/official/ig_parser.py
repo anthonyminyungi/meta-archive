@@ -16,6 +16,7 @@ from meta_archive_pipeline.official import (
     ts_to_dt,
 )
 from meta_archive_pipeline.schema.models import (
+    ActivityItem,
     Connection,
     Location,
     MediaItem,
@@ -155,6 +156,54 @@ def _parse_bool_str(val: Any) -> bool | None:
     return None
 
 
+def _unwrap_lv_records(raw_dict: Any) -> list[list[dict[str, Any]]]:
+    """Normalize both flat `[{'label': ...}]` and 2026 wrapped `[{'title': '', 'dict': [...]}]` lists."""
+    if not isinstance(raw_dict, list) or not raw_dict:
+        return []
+    groups: list[list[dict[str, Any]]] = []
+    flat_buf: list[dict[str, Any]] = []
+    for elem in raw_dict:
+        if isinstance(elem, list):
+            if flat_buf:
+                groups.append(flat_buf)
+                flat_buf = []
+            groups.append([x for x in elem if isinstance(x, dict)])
+        elif isinstance(elem, dict):
+            if "label" not in elem and isinstance(elem.get("dict"), list):
+                if flat_buf:
+                    groups.append(flat_buf)
+                    flat_buf = []
+                groups.append([x for x in elem["dict"] if isinstance(x, dict)])
+            else:
+                flat_buf.append(elem)
+    if flat_buf:
+        groups.append(flat_buf)
+    return groups
+
+
+def _extract_metadata_dims(meta_dict_list: Any) -> tuple[float | None, int | None, int | None]:
+    """Extract `(duration_sec, width, height)` from a `label='Metadata'` sub-dict list."""
+    dur: float | None = None
+    w: int | None = None
+    h: int | None = None
+    for group in _unwrap_lv_records(meta_dict_list):
+        for sub in group:
+            lbl = (sub.get("label") or "").strip().lower()
+            if lbl == "duration":
+                dv = safe_float(sub.get("value"))
+                if dv is not None and dv > 0:
+                    dur = dv
+            elif lbl == "width":
+                wv = safe_int(sub.get("value"))
+                if wv and wv > 0:
+                    w = wv
+            elif lbl == "height":
+                hv = safe_int(sub.get("value"))
+                if hv and hv > 0:
+                    h = hv
+    return dur, w, h
+
+
 def _extract_label_dict_fields(lv_list: Any) -> dict[str, Any]:
     """Flatten one level of label_values entries into structured fields."""
     fields: dict[str, Any] = {
@@ -166,6 +215,8 @@ def _extract_label_dict_fields(lv_list: Any) -> dict[str, Any]:
         "is_audio_muted": None,
         "width": None,
         "height": None,
+        "duration_sec": None,
+        "is_reel": False,
         "hashtags": [],
         "place": None,
         "children": [],
@@ -178,37 +229,34 @@ def _extract_label_dict_fields(lv_list: Any) -> dict[str, Any]:
             continue
         title = item.get("title")
         if title == "Media" and isinstance(item.get("dict"), list):
-            # Nested Media dict can hold list of label_value entries for carousel slides
-            child_entries = item["dict"]
-            # Check if child_entries is a list of dicts representing slide properties or a flat list of labels
-            if child_entries and isinstance(child_entries[0], dict) and "label" in child_entries[0]:
-                # Split into slide groups whenever a new "Media" or "Visual reply..." restarts or parse flat/nested
-                fields["children"].append(_extract_label_dict_fields(child_entries))
-            elif child_entries and isinstance(child_entries[0], list):
-                for sub in child_entries:
-                    fields["children"].append(_extract_label_dict_fields(sub))
+            for group in _unwrap_lv_records(item["dict"]):
+                fields["children"].append(_extract_label_dict_fields(group))
             continue
 
         if title == "Place" and isinstance(item.get("dict"), list):
             pname = None
             pdesc = None
-            for sub in item["dict"]:
-                if not isinstance(sub, dict):
-                    continue
-                if sub.get("label") == "Name" and sub.get("value"):
-                    pname = str(sub["value"])
-                elif sub.get("label") == "Description" and sub.get("value"):
-                    pdesc = str(sub["value"])
+            for group in _unwrap_lv_records(item["dict"]):
+                for sub in group:
+                    if sub.get("label") == "Name" and sub.get("value"):
+                        pname = str(sub["value"])
+                    elif sub.get("label") == "Description" and sub.get("value"):
+                        pdesc = str(sub["value"])
             if pname or pdesc:
                 fields["place"] = Location(name=pname, description=pdesc)
             continue
 
         if title == "Hashtags" and isinstance(item.get("dict"), list):
-            for sub in item["dict"]:
-                if isinstance(sub, dict) and sub.get("label") == "Name" and sub.get("value"):
-                    tag = str(sub["value"]).lstrip("#").strip()
-                    if tag:
-                        fields["hashtags"].append(tag)
+            for group in _unwrap_lv_records(item["dict"]):
+                for sub in group:
+                    if sub.get("label") == "Name" and sub.get("value"):
+                        tag = str(sub["value"]).lstrip("#").strip()
+                        if tag:
+                            fields["hashtags"].append(tag)
+            continue
+
+        if title == "Reel metadata" and isinstance(item.get("dict"), list) and item["dict"]:
+            fields["is_reel"] = True
             continue
 
         label = item.get("label")
@@ -240,9 +288,17 @@ def _extract_label_dict_fields(lv_list: Any) -> dict[str, Any]:
             h = safe_int(item.get("value"))
             if h and h > 0:
                 fields["height"] = h
+        elif label == "Metadata" and isinstance(item.get("dict"), list):
+            dur, mw, mh = _extract_metadata_dims(item["dict"])
+            if dur is not None:
+                fields["duration_sec"] = dur
+            if mw and not fields["width"]:
+                fields["width"] = mw
+            if mh and not fields["height"]:
+                fields["height"] = mh
 
         # Some 2026 exports nest multiple slide Media groups inside item["dict"] sequentially
-        if isinstance(item.get("dict"), list) and not title:
+        if isinstance(item.get("dict"), list) and not title and label != "Metadata":
             sub_parsed = _extract_label_dict_fields(item["dict"])
             if sub_parsed["media_uris"]:
                 fields["children"].append(sub_parsed)
@@ -251,7 +307,7 @@ def _extract_label_dict_fields(lv_list: Any) -> dict[str, Any]:
 
 
 def _collect_slide_media_from_nested(lv_list: Any) -> list[dict[str, Any]]:
-    """Split repeated nested Media sub-entries into per-slide media metadata dicts."""
+    """Split nested or wrapped Media sub-entries into per-slide media metadata dicts."""
     if not isinstance(lv_list, list):
         return []
     slides: list[dict[str, Any]] = []
@@ -259,37 +315,48 @@ def _collect_slide_media_from_nested(lv_list: Any) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         if item.get("title") == "Media" and isinstance(item.get("dict"), list):
-            raw_dict = item["dict"]
-            # Check if raw_dict repeats blocks starting with "Visual reply..." or containing "Media"
-            current: dict[str, Any] = {}
-            for sub in raw_dict:
-                if not isinstance(sub, dict):
-                    continue
-                lbl = sub.get("label")
-                if lbl == "Media" and isinstance(sub.get("media"), list):
-                    if "uri" in current:
-                        slides.append(current)
-                        current = {}
-                    for m in sub["media"]:
-                        if isinstance(m, dict) and m.get("uri"):
-                            current["uri"] = m["uri"]
-                            break
-                elif lbl == "Is audio muted":
-                    current["is_audio_muted"] = _parse_bool_str(sub.get("value"))
-                elif lbl == "Original width":
-                    current["width"] = safe_int(sub.get("value"))
-                elif lbl == "Original height":
-                    current["height"] = safe_int(sub.get("value"))
-                elif lbl == "Latitude":
-                    lat_v = safe_float(sub.get("value"))
-                    if lat_v is not None and lat_v != 0.0:
-                        current["lat"] = lat_v
-                elif lbl == "Longitude":
-                    lng_v = safe_float(sub.get("value"))
-                    if lng_v is not None and lng_v != 0.0:
-                        current["lng"] = lng_v
-            if "uri" in current:
-                slides.append(current)
+            for group in _unwrap_lv_records(item["dict"]):
+                current: dict[str, Any] = {}
+                for sub in group:
+                    lbl = sub.get("label")
+                    if lbl == "Media" and isinstance(sub.get("media"), list):
+                        if "uri" in current:
+                            slides.append(current)
+                            current = {}
+                        for m in sub["media"]:
+                            if isinstance(m, dict) and m.get("uri"):
+                                current["uri"] = m["uri"]
+                                break
+                    elif lbl == "Is audio muted":
+                        muted = _parse_bool_str(sub.get("value"))
+                        if muted is not None:
+                            current["is_audio_muted"] = muted
+                    elif lbl == "Original width":
+                        wv = safe_int(sub.get("value"))
+                        if wv and wv > 0:
+                            current["width"] = wv
+                    elif lbl == "Original height":
+                        hv = safe_int(sub.get("value"))
+                        if hv and hv > 0:
+                            current["height"] = hv
+                    elif lbl == "Metadata" and isinstance(sub.get("dict"), list):
+                        dur, mw, mh = _extract_metadata_dims(sub["dict"])
+                        if dur is not None:
+                            current["duration_sec"] = dur
+                        if mw and not current.get("width"):
+                            current["width"] = mw
+                        if mh and not current.get("height"):
+                            current["height"] = mh
+                    elif lbl == "Latitude":
+                        lat_v = safe_float(sub.get("value"))
+                        if lat_v is not None and lat_v != 0.0:
+                            current["lat"] = lat_v
+                    elif lbl == "Longitude":
+                        lng_v = safe_float(sub.get("value"))
+                        if lng_v is not None and lng_v != 0.0:
+                            current["lng"] = lng_v
+                if "uri" in current:
+                    slides.append(current)
     return slides
 
 
@@ -356,6 +423,10 @@ def _merge_posts_json_enrichment(posts: list[Post], posts_json_path: Path) -> li
                     matched_post.location.lat = matched_post.location.lat or loc.lat
                     matched_post.location.lng = matched_post.location.lng or loc.lng
 
+            if parsed["is_reel"] and matched_post.post_type == "post" and len(matched_post.media) == 1:
+                if matched_post.media[0].media_type == "video":
+                    matched_post.post_type = "reel"
+
             existing_paths = {m.local_path for m in matched_post.media if m.local_path}
             for media in matched_post.media:
                 if media.local_path and media.local_path in slide_by_uri:
@@ -366,10 +437,21 @@ def _merge_posts_json_enrichment(posts: list[Post], posts_json_path: Path) -> li
                         media.width = smeta["width"]
                     if media.height is None and smeta.get("height"):
                         media.height = smeta["height"]
+                    if media.duration_sec is None and smeta.get("duration_sec") is not None:
+                        media.duration_sec = smeta["duration_sec"]
                     if media.gps_lat is None and smeta.get("lat") is not None:
                         media.gps_lat = smeta["lat"]
                     if media.gps_lng is None and smeta.get("lng") is not None:
                         media.gps_lng = smeta["lng"]
+                elif len(matched_post.media) == 1:
+                    if media.is_audio_muted is None and parsed["is_audio_muted"] is not None:
+                        media.is_audio_muted = parsed["is_audio_muted"]
+                    if media.width is None and parsed["width"]:
+                        media.width = parsed["width"]
+                    if media.height is None and parsed["height"]:
+                        media.height = parsed["height"]
+                    if media.duration_sec is None and parsed["duration_sec"] is not None:
+                        media.duration_sec = parsed["duration_sec"]
 
             # Add any extra top-level carousel cover URI missing from posts_1.json slides
             for cover_uri in top_uris:
@@ -378,6 +460,8 @@ def _merge_posts_json_enrichment(posts: list[Post], posts_json_path: Path) -> li
                     cover_item.is_carousel_cover = True
                     cover_item.width = cover_item.width or parsed["width"]
                     cover_item.height = cover_item.height or parsed["height"]
+                    if cover_item.duration_sec is None:
+                        cover_item.duration_sec = parsed["duration_sec"]
                     if cover_item.is_audio_muted is None:
                         cover_item.is_audio_muted = parsed["is_audio_muted"]
                     matched_post.media.insert(0, cover_item)
@@ -399,10 +483,12 @@ def _merge_posts_json_enrichment(posts: list[Post], posts_json_path: Path) -> li
                     mi.is_audio_muted = smeta.get("is_audio_muted")
                     mi.width = smeta.get("width")
                     mi.height = smeta.get("height")
+                    mi.duration_sec = smeta.get("duration_sec")
                 elif u_idx == 0:
                     mi.is_audio_muted = parsed["is_audio_muted"]
                     mi.width = parsed["width"]
                     mi.height = parsed["height"]
+                    mi.duration_sec = parsed["duration_sec"]
                 media_items.append(mi)
 
             first_id = media_items[0].media_id if media_items and media_items[0].media_id else str(idx)
@@ -438,6 +524,7 @@ def _parse_ig_stories(export_root: Path, warnings: list[str]) -> list[Story]:
         if not isinstance(entry, dict):
             continue
         ts = safe_int(entry.get("creation_timestamp"))
+        caption = entry.get("title") if isinstance(entry.get("title"), str) else ""
         raw_uri = entry.get("uri") if isinstance(entry.get("uri"), str) else ""
         if not raw_uri.strip():
             warnings.append(f"stories.json entry #{idx} has empty URI (timestamp={ts})")
@@ -453,6 +540,7 @@ def _parse_ig_stories(export_root: Path, warnings: list[str]) -> list[Story]:
                 story_id=sid,
                 created_at=ts_to_dt(ts),
                 timestamp_unix=ts,
+                caption=caption,
                 source="official_export",
                 media=media,
             )
@@ -543,6 +631,7 @@ def _parse_ig_messages(export_root: Path) -> list[MessageThread]:
         rel_dir = thread_dir.relative_to(msg_root).as_posix()
         is_pending = rel_dir.startswith("message_requests/")
         title: str | None = None
+        avatar_local_path: str | None = None
         participants: dict[str, UserRef] = {}
         messages: list[Message] = []
 
@@ -552,6 +641,8 @@ def _parse_ig_messages(export_root: Path) -> list[MessageThread]:
                 continue
             if not title and isinstance(data.get("title"), str):
                 title = data["title"]
+            if not avatar_local_path and isinstance(data.get("image"), dict):
+                avatar_local_path = normalize_uri_if_local(data["image"].get("uri"))
             if data.get("is_pending") is True:
                 is_pending = True
             for p in data.get("participants", []) if isinstance(data.get("participants"), list) else []:
@@ -572,8 +663,12 @@ def _parse_ig_messages(export_root: Path) -> list[MessageThread]:
                     for m_entry in raw_m.get(mkey, []) if isinstance(raw_m.get(mkey), list) else []:
                         if isinstance(m_entry, dict) and m_entry.get("uri"):
                             item = media_item_from_meta_entry(m_entry)
-                            if mkey == "audio_files" and item.media_type == "unknown":
+                            if mkey == "audio_files":
                                 item.media_type = "audio"
+                            elif mkey == "photos" and item.media_type == "unknown":
+                                item.media_type = "image"
+                            elif mkey == "videos" and item.media_type == "unknown":
+                                item.media_type = "video"
                             media_items.append(item)
 
                 reactions: list[MessageReaction] = []
@@ -584,9 +679,21 @@ def _parse_ig_messages(export_root: Path) -> list[MessageThread]:
                         )
 
                 share_link: str | None = None
+                share_text: str | None = None
+                share_owner: str | None = None
                 share = raw_m.get("share")
-                if isinstance(share, dict) and isinstance(share.get("link"), str):
-                    share_link = share["link"]
+                if isinstance(share, dict):
+                    if isinstance(share.get("link"), str) and share["link"].strip():
+                        share_link = share["link"].strip()
+                    if isinstance(share.get("share_text"), str) and share["share_text"].strip():
+                        share_text = share["share_text"].strip()
+                    owner_cand = (
+                        share.get("original_content_owner")
+                        or share.get("profile_share_username")
+                        or share.get("profile_share_name")
+                    )
+                    if isinstance(owner_cand, str) and owner_cand.strip():
+                        share_owner = owner_cand.strip()
 
                 messages.append(
                     Message(
@@ -598,6 +705,8 @@ def _parse_ig_messages(export_root: Path) -> list[MessageThread]:
                         media=media_items,
                         reactions=reactions,
                         shared_link=share_link,
+                        share_text=share_text,
+                        share_owner=share_owner,
                         is_unsent=bool(raw_m.get("is_unsent")),
                         call_duration=safe_int(raw_m.get("call_duration")),
                     )
@@ -609,6 +718,7 @@ def _parse_ig_messages(export_root: Path) -> list[MessageThread]:
                 platform="instagram",
                 thread_id=rel_dir,
                 title=title,
+                avatar_local_path=avatar_local_path,
                 participants=list(participants.values()),
                 is_e2ee=False,
                 is_pending=is_pending,
@@ -617,6 +727,189 @@ def _parse_ig_messages(export_root: Path) -> list[MessageThread]:
         )
 
     return threads
+
+
+def _normalize_lv_root_items(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict) and "label_values" in data:
+        return [data]
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    return []
+
+
+def _extract_lv_bookmark_fields(lv_list: Any) -> tuple[str | None, str, str | None]:
+    """Extract `(url, caption_or_text, owner)` from an Instagram `label_values` saved/repost item."""
+    url: str | None = None
+    text: str = ""
+    owner: str | None = None
+    if not isinstance(lv_list, list):
+        return None, "", None
+
+    for entry in lv_list:
+        if not isinstance(entry, dict):
+            continue
+        lbl = entry.get("label")
+        ttl = entry.get("title")
+        if lbl == "URL":
+            cand = entry.get("href") or entry.get("value")
+            if isinstance(cand, str) and cand.strip() and not url:
+                url = cand.strip()
+        elif lbl in ("Caption", "Title", "Text") and isinstance(entry.get("value"), str):
+            val = entry["value"].strip()
+            if val and not text:
+                text = val
+        elif ttl == "Owner" and isinstance(entry.get("dict"), list):
+            for group in _unwrap_lv_records(entry["dict"]):
+                uname = None
+                fname = None
+                for sub in group:
+                    if sub.get("label") == "Username" and sub.get("value"):
+                        uname = str(sub["value"]).strip()
+                    elif sub.get("label") == "Name" and sub.get("value"):
+                        fname = str(sub["value"]).strip()
+                if uname or fname:
+                    owner = uname or fname
+                    break
+        elif ttl == "Media" and isinstance(entry.get("dict"), list):
+            for group in _unwrap_lv_records(entry["dict"]):
+                sub_url, sub_text, sub_owner = _extract_lv_bookmark_fields(group)
+                url = url or sub_url
+                if not text and sub_text:
+                    text = sub_text
+                owner = owner or sub_owner
+
+    return url, text, owner
+
+
+def _parse_ig_activities(export_root: Path) -> list[ActivityItem]:
+    activities: list[ActivityItem] = []
+
+    # 1. Own comments on posts and reels
+    cmt_dir = export_root / "your_instagram_activity" / "comments"
+    if cmt_dir.exists():
+        cmt_sources: list[tuple[Path, str]] = [
+            *((p, "post_cmt") for p in sorted(cmt_dir.glob("post_comments_*.json"))),
+            (cmt_dir / "reels_comments.json", "reel_cmt"),
+        ]
+        for cpath, prefix in cmt_sources:
+            if not cpath.exists():
+                continue
+            data = load_fixed_json(cpath)
+            raw_list = (
+                data
+                if isinstance(data, list)
+                else (
+                    data.get("comments_media_comments")
+                    or data.get("comments_reels_comments")
+                    or []
+                )
+                if isinstance(data, dict)
+                else []
+            )
+            if not isinstance(raw_list, list):
+                continue
+            for idx, entry in enumerate(raw_list):
+                if not isinstance(entry, dict):
+                    continue
+                smap = entry.get("string_map_data")
+                if not isinstance(smap, dict):
+                    continue
+                text = ""
+                for k in ("Comment", "댓글"):
+                    if isinstance(smap.get(k), dict) and isinstance(smap[k].get("value"), str):
+                        text = smap[k]["value"]
+                        break
+                owner: str | None = None
+                for k in ("Media Owner", "미디어 소유자"):
+                    if isinstance(smap.get(k), dict) and isinstance(smap[k].get("value"), str):
+                        owner = smap[k]["value"].strip() or None
+                        break
+                ts: int | None = None
+                for k in ("Time", "시간"):
+                    if isinstance(smap.get(k), dict):
+                        ts = safe_int(smap[k].get("timestamp"))
+                        if ts is not None:
+                            break
+                media_items: list[MediaItem] = []
+                for m_entry in entry.get("media_list_data", []) if isinstance(entry.get("media_list_data"), list) else []:
+                    if isinstance(m_entry, dict) and normalize_uri_if_local(m_entry.get("uri")):
+                        media_items.append(media_item_from_meta_entry(m_entry))
+                activities.append(
+                    ActivityItem(
+                        activity_id=f"ig_{prefix}_{ts or 0}_{idx}",
+                        platform="instagram",
+                        kind="own_comment",
+                        created_at=ts_to_dt(ts),
+                        timestamp_unix=ts,
+                        text=text,
+                        target_author=owner,
+                        media=media_items,
+                    )
+                )
+
+    # 2. Saved posts
+    saved_path = export_root / "your_instagram_activity" / "saved" / "saved_posts.json"
+    if saved_path.exists():
+        saved_data = load_fixed_json(saved_path)
+        lv_items = _normalize_lv_root_items(saved_data)
+        if lv_items:
+            for idx, entry in enumerate(lv_items):
+                ts = safe_int(entry.get("timestamp"))
+                url, cap, owner = _extract_lv_bookmark_fields(entry.get("label_values"))
+                activities.append(
+                    ActivityItem(
+                        activity_id=f"ig_saved_{ts or 0}_{idx}",
+                        platform="instagram",
+                        kind="saved_item",
+                        created_at=ts_to_dt(ts),
+                        timestamp_unix=ts,
+                        text=cap,
+                        target_author=owner,
+                        url=url,
+                    )
+                )
+        elif isinstance(saved_data, dict) and isinstance(saved_data.get("saved_saved_media"), list):
+            for idx, entry in enumerate(saved_data["saved_saved_media"]):
+                if not isinstance(entry, dict):
+                    continue
+                owner = entry.get("title") if isinstance(entry.get("title"), str) else None
+                smap = entry.get("string_map_data") if isinstance(entry.get("string_map_data"), dict) else {}
+                saved_on = smap.get("Saved on") if isinstance(smap.get("Saved on"), dict) else {}
+                url = saved_on.get("href") if isinstance(saved_on.get("href"), str) else None
+                ts = safe_int(saved_on.get("timestamp"))
+                activities.append(
+                    ActivityItem(
+                        activity_id=f"ig_saved_{ts or 0}_{idx}",
+                        platform="instagram",
+                        kind="saved_item",
+                        created_at=ts_to_dt(ts),
+                        timestamp_unix=ts,
+                        target_author=owner,
+                        url=url,
+                    )
+                )
+
+    # 3. Reposts
+    repost_path = export_root / "your_instagram_activity" / "media" / "reposts.json"
+    if repost_path.exists():
+        rep_data = load_fixed_json(repost_path)
+        for idx, entry in enumerate(_normalize_lv_root_items(rep_data)):
+            ts = safe_int(entry.get("timestamp"))
+            url, cap, owner = _extract_lv_bookmark_fields(entry.get("label_values"))
+            activities.append(
+                ActivityItem(
+                    activity_id=f"ig_repost_{ts or 0}_{idx}",
+                    platform="instagram",
+                    kind="repost",
+                    created_at=ts_to_dt(ts),
+                    timestamp_unix=ts,
+                    text=cap,
+                    target_author=owner,
+                    url=url,
+                )
+            )
+
+    return activities
 
 
 def parse_ig_official_export(export_root: Path) -> OfficialExportBundle:
@@ -665,5 +958,6 @@ def parse_ig_official_export(export_root: Path) -> OfficialExportBundle:
         stories=_parse_ig_stories(export_root, warnings),
         connections=_parse_ig_connections(export_root),
         messages=_parse_ig_messages(export_root),
+        activities=_parse_ig_activities(export_root),
         warnings=warnings,
     )

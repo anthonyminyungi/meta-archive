@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from meta_archive_pipeline.schema.models import (
+    ActivityItem,
     Connection,
     MediaItem,
     MessageThread,
@@ -37,6 +38,7 @@ class OfficialExportBundle:
     stories: list[Story] = field(default_factory=list)
     connections: list[Connection] = field(default_factory=list)
     messages: list[MessageThread] = field(default_factory=list)
+    activities: list[ActivityItem] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     extra_roots: list[Path] = field(default_factory=list)
 
@@ -96,12 +98,13 @@ def infer_media_type(uri: str) -> Literal["image", "video", "audio", "unknown"]:
 
 def extract_exif_from_meta_metadata(
     meta: Any,
-) -> tuple[str | None, float | None, float | None]:
-    """Extract `(date_time_original, latitude, longitude)` from Meta `media_metadata`."""
+) -> tuple[str | None, int | None, float | None, float | None]:
+    """Extract `(date_time_original, taken_timestamp, latitude, longitude)` from Meta `media_metadata`."""
     if not isinstance(meta, dict):
-        return None, None, None
+        return None, None, None, None
 
     dt_orig: str | None = None
+    taken_ts: int | None = None
     lat: float | None = None
     lng: float | None = None
 
@@ -119,6 +122,10 @@ def extract_exif_from_meta_metadata(
                 cand_dt = entry["date_time_original"].strip()
                 if cand_dt:
                     dt_orig = cand_dt
+            if taken_ts is None:
+                cand_ts = safe_int(entry.get("taken_timestamp"))
+                if cand_ts is not None and cand_ts > 0:
+                    taken_ts = cand_ts
             if lat is None:
                 cand_lat = safe_float(entry.get("latitude"))
                 if cand_lat is not None and cand_lat != 0.0:
@@ -128,7 +135,7 @@ def extract_exif_from_meta_metadata(
                 if cand_lng is not None and cand_lng != 0.0:
                     lng = cand_lng
 
-    return dt_orig, lat, lng
+    return dt_orig, taken_ts, lat, lng
 
 
 def normalize_uri_if_local(uri: Any) -> str | None:
@@ -147,7 +154,7 @@ def media_item_from_meta_entry(entry: dict[str, Any]) -> MediaItem:
     local_path = normalize_uri_if_local(raw_uri)
     stem = Path(raw_uri).stem if raw_uri else ""
     media_id = stem if stem.isdigit() else None
-    dt_orig, lat, lng = extract_exif_from_meta_metadata(entry.get("media_metadata"))
+    dt_orig, taken_ts, lat, lng = extract_exif_from_meta_metadata(entry.get("media_metadata"))
 
     return MediaItem(
         media_id=media_id,
@@ -155,6 +162,7 @@ def media_item_from_meta_entry(entry: dict[str, Any]) -> MediaItem:
         local_path=local_path,
         original_uri=raw_uri or None,
         taken_at_exif=dt_orig,
+        taken_at_unix=taken_ts,
         gps_lat=lat,
         gps_lng=lng,
     )

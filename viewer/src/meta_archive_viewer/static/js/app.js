@@ -22,8 +22,9 @@ const lightbox = createLightbox(lightboxRoot);
 let postModal = null;
 let personDrawer = null;
 
-function navigateThread(threadId) {
-  window.location.hash = `#/messages?thread=${encodeURIComponent(threadId)}`;
+function navigateThread(threadId, ts = null) {
+  const qs = ts ? `thread=${encodeURIComponent(threadId)}&ts=${encodeURIComponent(ts)}` : `thread=${encodeURIComponent(threadId)}`;
+  window.location.hash = `#/messages?${qs}`;
 }
 
 personDrawer = createPersonDrawer(drawerRoot, {
@@ -89,7 +90,7 @@ async function routeNow() {
     if (route === "facebook") {
       await renderFacebookView(mainEl, ctx);
     } else if (route === "messages") {
-      await renderMessagesView(mainEl, ctx, params.get("thread"));
+      await renderMessagesView(mainEl, ctx, params.get("thread"), params.get("ts"));
     } else if (route === "search") {
       await renderSearchView(mainEl, ctx, params.get("q") || "");
     } else {

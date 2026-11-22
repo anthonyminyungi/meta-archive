@@ -15,6 +15,7 @@ from typing import Any
 
 from meta_archive_pipeline import __version__
 from meta_archive_pipeline.schema.models import (
+    ActivityItem,
     Comment,
     Connection,
     MediaItem,
@@ -70,6 +71,7 @@ CREATE TABLE posts (
     created_at TEXT,
     timestamp_unix INTEGER,
     caption TEXT,
+    activity_title TEXT,
     hashtags_json TEXT,
     location_name TEXT,
     location_lat REAL,
@@ -80,6 +82,7 @@ CREATE TABLE posts (
     reactions_total INTEGER,
     reactions_json TEXT,
     album_name TEXT,
+    group_name TEXT,
     shared_post_json TEXT,
     audience TEXT,
     is_archived INTEGER,
@@ -105,6 +108,7 @@ CREATE TABLE media (
     has_audio INTEGER,
     is_audio_muted INTEGER,
     taken_at_exif TEXT,
+    taken_at_unix INTEGER,
     gps_lat REAL,
     gps_lng REAL,
     sha256 TEXT,
@@ -145,6 +149,7 @@ CREATE TABLE stories (
     platform TEXT NOT NULL,
     created_at TEXT,
     timestamp_unix INTEGER,
+    caption TEXT,
     source TEXT,
     highlight_id TEXT,
     highlight_title TEXT,
@@ -173,6 +178,7 @@ CREATE TABLE message_threads (
     thread_id TEXT PRIMARY KEY,
     platform TEXT NOT NULL,
     title TEXT,
+    avatar_local_path TEXT,
     participants_json TEXT,
     is_e2ee INTEGER,
     is_pending INTEGER,
@@ -194,8 +200,26 @@ CREATE TABLE messages (
     reactions_json TEXT,
     reply_to_id TEXT,
     shared_link TEXT,
+    share_text TEXT,
+    share_owner TEXT,
     is_unsent INTEGER,
+    is_missed_call INTEGER,
     call_duration INTEGER
+);
+
+CREATE TABLE activities (
+    activity_id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT,
+    timestamp_unix INTEGER,
+    text TEXT,
+    title TEXT,
+    target_author TEXT,
+    group_name TEXT,
+    url TEXT,
+    source TEXT,
+    raw_json TEXT
 );
 
 CREATE INDEX idx_posts_platform_ts ON posts(platform, timestamp_unix DESC);
@@ -208,6 +232,7 @@ CREATE INDEX idx_stories_platform_ts ON stories(platform, timestamp_unix DESC);
 CREATE INDEX idx_connections_rel ON connections(platform, relation, username);
 CREATE INDEX idx_messages_thread_ts ON messages(thread_id, timestamp_ms);
 CREATE INDEX idx_messages_sender ON messages(sender);
+CREATE INDEX idx_activities_platform_kind_ts ON activities(platform, kind, timestamp_unix DESC);
 
 CREATE VIRTUAL TABLE search_fts USING fts5(
     entity_type UNINDEXED,
@@ -244,9 +269,9 @@ def _insert_media_rows(
             INSERT INTO media (
                 owner_type, owner_id, platform, seq, media_id, media_type,
                 local_path, xmp_path, original_uri, width, height, duration_sec,
-                has_audio, is_audio_muted, taken_at_exif, gps_lat, gps_lng,
+                has_audio, is_audio_muted, taken_at_exif, taken_at_unix, gps_lat, gps_lng,
                 sha256, byte_size, is_carousel_cover
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 owner_type,
@@ -264,6 +289,7 @@ def _insert_media_rows(
                 int(m.has_audio) if m.has_audio is not None else None,
                 int(m.is_audio_muted) if m.is_audio_muted is not None else None,
                 m.taken_at_exif,
+                m.taken_at_unix,
                 m.gps_lat,
                 m.gps_lng,
                 m.sha256,
@@ -346,6 +372,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
     stories = [Story.model_validate(d) for d in _load_json_list(paths.stories_json)]
     connections = [Connection.model_validate(d) for d in _load_json_list(paths.connections_json)]
     threads = [MessageThread.model_validate(d) for d in _load_json_list(paths.messages_json)]
+    activities = [ActivityItem.model_validate(d) for d in _load_json_list(paths.activities_json)]
 
     counts = {
         "profiles": 0,
@@ -357,6 +384,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
         "connections": 0,
         "message_threads": 0,
         "messages": 0,
+        "activities": 0,
     }
 
     tmp_path: str | None = None
@@ -412,11 +440,11 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                 INSERT OR REPLACE INTO posts (
                     post_id, platform, shortcode, url, post_type,
                     author_username, author_name, created_at, timestamp_unix,
-                    caption, hashtags_json, location_name, location_lat, location_lng,
+                    caption, activity_title, hashtags_json, location_name, location_lat, location_lng,
                     tagged_users_json, likes_count, likes_is_truncated,
-                    reactions_total, reactions_json, album_name, shared_post_json,
+                    reactions_total, reactions_json, album_name, group_name, shared_post_json,
                     audience, is_archived, is_collab, source, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     post.post_id,
@@ -429,6 +457,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     post.created_at.isoformat() if post.created_at else None,
                     post.timestamp_unix,
                     post.caption,
+                    post.activity_title,
                     json.dumps(post.hashtags, ensure_ascii=False),
                     loc_name,
                     loc_lat,
@@ -442,6 +471,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     post.reactions.total,
                     post.reactions.model_dump_json(),
                     post.album_name,
+                    post.group_name,
                     post.shared_post.model_dump_json() if post.shared_post else None,
                     post.audience,
                     int(post.is_archived),
@@ -477,7 +507,6 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     post.shared_post.text,
                     post.shared_post.author_name,
                     post.shared_post.domain,
-                    post.shared_post.url,
                 )
                 if post.shared_post
                 else ()
@@ -486,8 +515,10 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                 p
                 for p in (
                     post.caption,
+                    post.activity_title,
                     loc_name,
                     post.album_name,
+                    post.group_name,
                     " ".join(f"#{t}" for t in post.hashtags),
                     *shared_parts,
                 )
@@ -507,16 +538,17 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO stories (
-                    story_id, platform, created_at, timestamp_unix, source,
+                    story_id, platform, created_at, timestamp_unix, caption, source,
                     highlight_id, highlight_title, highlight_cover,
                     location_name, stickers_json, likes_count, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     story.story_id,
                     story.platform,
                     story.created_at.isoformat() if story.created_at else None,
                     story.timestamp_unix,
+                    story.caption,
                     story.source,
                     story.highlight_id,
                     story.highlight_title,
@@ -533,7 +565,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     conn, "story", story.story_id, story.platform, [story.media]
                 )
             story_body = " ".join(
-                p for p in (story.highlight_title, loc_name, *story.stickers) if p
+                p for p in (story.caption, story.highlight_title, loc_name, *story.stickers) if p
             )
             if story_body:
                 conn.execute(
@@ -589,14 +621,15 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO message_threads (
-                    thread_id, platform, title, participants_json,
+                    thread_id, platform, title, avatar_local_path, participants_json,
                     is_e2ee, is_pending, message_count, last_timestamp_unix
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     thread.thread_id,
                     thread.platform,
                     thread.title,
+                    thread.avatar_local_path,
                     json.dumps(
                         [p.model_dump(mode="json") for p in thread.participants],
                         ensure_ascii=False,
@@ -615,8 +648,9 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     INSERT INTO messages (
                         thread_id, message_id, platform, seq, sender,
                         timestamp_unix, timestamp_ms, created_at, text,
-                        reactions_json, reply_to_id, shared_link, is_unsent, call_duration
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        reactions_json, reply_to_id, shared_link, share_text, share_owner,
+                        is_unsent, is_missed_call, call_duration
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         thread.thread_id,
@@ -634,7 +668,10 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                         ),
                         msg.reply_to_id,
                         msg.shared_link,
+                        msg.share_text,
+                        msg.share_owner,
                         int(msg.is_unsent),
+                        int(msg.is_missed_call),
                         msg.call_duration,
                     ),
                 )
@@ -647,7 +684,8 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                         thread.platform,
                         msg.media,
                     )
-                if msg.text or msg.sender:
+                msg_body = " ".join(p for p in (msg.text, msg.share_text, msg.share_owner) if p)
+                if msg_body or msg.sender:
                     conn.execute(
                         """
                         INSERT INTO search_fts (entity_type, entity_id, platform, author, body, timestamp_unix)
@@ -658,10 +696,49 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                             thread.thread_id,
                             thread.platform,
                             msg.sender,
-                            msg.text or "",
+                            msg_body,
                             msg.timestamp_unix or 0,
                         ),
                     )
+
+        for act in activities:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO activities (
+                    activity_id, platform, kind, created_at, timestamp_unix,
+                    text, title, target_author, group_name, url, source, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    act.activity_id,
+                    act.platform,
+                    act.kind,
+                    act.created_at.isoformat() if act.created_at else None,
+                    act.timestamp_unix,
+                    act.text,
+                    act.title,
+                    act.target_author,
+                    act.group_name,
+                    act.url,
+                    act.source,
+                    act.model_dump_json(),
+                ),
+            )
+            counts["activities"] += 1
+            if act.media:
+                counts["media"] += _insert_media_rows(
+                    conn, "activity", act.activity_id, act.platform, act.media
+                )
+            act_author = " ".join(p for p in (act.target_author, act.group_name) if p)
+            act_body = " ".join(p for p in (act.text, act.title, act.group_name) if p)
+            if act_body or act_author:
+                conn.execute(
+                    """
+                    INSERT INTO search_fts (entity_type, entity_id, platform, author, body, timestamp_unix)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("activity", act.activity_id, act.platform, act_author, act_body, act.timestamp_unix or 0),
+                )
 
         # Ensure zero -wal/-shm sidecar files so :ro TrueNAS mounts open cleanly
         conn.commit()

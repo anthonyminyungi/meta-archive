@@ -1,18 +1,31 @@
 /** Unified IG DM + FB Messenger inbox and thread viewer (supports E2EE threads and attached media). */
 
 import { api, mediaUrl } from "../api.js";
-import { clear, el, formatDate, formatDuration, isAudioMedia, isVideoMedia, personButton } from "../dom.js";
+import {
+  avatarEl,
+  clear,
+  el,
+  formatDate,
+  formatDuration,
+  isAudioMedia,
+  isDocumentMedia,
+  isVideoMedia,
+  personButton,
+  safeExternalHref,
+} from "../dom.js";
 
-export async function renderMessagesView(container, ctx, initialThreadId = null) {
+export async function renderMessagesView(container, ctx, initialThreadId = null, initialTs = null) {
   clear(container);
 
   const state = {
     platform: "",
     q: "",
     selectedThreadId: initialThreadId,
-    offset: 0,
+    jumpTs: initialTs ? Number(initialTs) : null,
     limit: 100,
     total: 0,
+    hasOlder: false,
+    hasNewer: false,
     messages: [],
   };
 
@@ -71,15 +84,21 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
           className: `thread-item${t.thread_id === state.selectedThreadId ? " active" : ""}`,
           onClick: () => {
             state.selectedThreadId = t.thread_id;
+            state.jumpTs = null;
             loadThreadsHighlight();
-            loadThreadMessages(t.thread_id, true);
+            loadThreadMessages(t.thread_id, "tail");
           },
           dataset: { threadId: t.thread_id },
         },
         el(
           "div",
           { style: "display:flex;justify-content:space-between;gap:6px;align-items:center;" },
-          el("strong", { style: "font-size:0.93rem;" }, t.title || t.thread_id),
+          el(
+            "div",
+            { style: "display:flex;gap:8px;align-items:center;min-width:0;" },
+            t.avatar_local_path ? avatarEl(t.avatar_local_path, t.title || t.thread_id) : null,
+            el("strong", { style: "font-size:0.93rem;overflow:hidden;text-overflow:ellipsis;" }, t.title || t.thread_id)
+          ),
           el("span", { className: "pill" }, t.platform === "instagram" ? "IG" : "FB")
         ),
         el(
@@ -94,7 +113,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
     }
 
     if (state.selectedThreadId) {
-      await loadThreadMessages(state.selectedThreadId, true);
+      await loadThreadMessages(state.selectedThreadId, state.jumpTs ? "around" : "tail");
     }
   }
 
@@ -104,18 +123,42 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
     }
   }
 
-  async function loadThreadMessages(threadId, reset = true) {
-    if (reset) {
-      state.offset = 0;
+  async function loadThreadMessages(threadId, mode = "tail") {
+    let queryParams = { limit: state.limit };
+    if (mode === "tail") {
       state.messages = [];
       clear(chatPane);
       chatPane.appendChild(el("div", { className: "loading-box" }, "메시지 불러오는 중..."));
+      queryParams.tail = true;
+    } else if (mode === "head") {
+      state.messages = [];
+      clear(chatPane);
+      chatPane.appendChild(el("div", { className: "loading-box" }, "첫 메시지 불러오는 중..."));
+      queryParams.offset = 0;
+    } else if (mode === "around" && state.jumpTs) {
+      state.messages = [];
+      clear(chatPane);
+      chatPane.appendChild(el("div", { className: "loading-box" }, "해당 시점 메시지 불러오는 중..."));
+      queryParams.around_ts = state.jumpTs;
+    } else if (mode === "older" && state.messages.length > 0) {
+      queryParams.before_seq = state.messages[0].seq;
+    } else if (mode === "newer" && state.messages.length > 0) {
+      queryParams.offset = state.messages[state.messages.length - 1].seq + 1;
     }
 
-    const res = await api.threadMessages(threadId, { offset: state.offset, limit: state.limit });
+    const res = await api.threadMessages(threadId, queryParams);
     state.total = res.total;
-    state.messages.push(...res.items);
-    state.offset += res.items.length;
+    if (mode === "older") {
+      state.messages = [...res.items, ...state.messages];
+      state.hasOlder = Boolean(res.has_older);
+    } else if (mode === "newer") {
+      state.messages = [...state.messages, ...res.items];
+      state.hasNewer = Boolean(res.has_newer);
+    } else {
+      state.messages = [...res.items];
+      state.hasOlder = Boolean(res.has_older);
+      state.hasNewer = Boolean(res.has_newer);
+    }
 
     clear(chatPane);
     const t = res.thread;
@@ -128,22 +171,63 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
       { className: "chat-header" },
       el(
         "div",
-        null,
+        { style: "display:flex;gap:10px;align-items:center;" },
+        t.avatar_local_path ? avatarEl(t.avatar_local_path, t.title || t.thread_id) : null,
         el(
           "div",
-          { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;" },
-          el("strong", null, t.title || t.thread_id),
-          el("span", { className: "pill pill-accent" }, t.platform.toUpperCase()),
-          t.is_e2ee ? el("span", { className: "pill pill-warn" }, "종단간 암호화 (E2EE)") : null
-        ),
-        participantNodes.length > 0
-          ? el("div", { className: "post-meta-row", style: "margin-top:4px;" }, participantNodes)
-          : null
+          null,
+          el(
+            "div",
+            { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;" },
+            el("strong", null, t.title || t.thread_id),
+            el("span", { className: "pill pill-accent" }, t.platform.toUpperCase()),
+            t.is_e2ee ? el("span", { className: "pill pill-warn" }, "종단간 암호화 (E2EE)") : null
+          ),
+          participantNodes.length > 0
+            ? el("div", { className: "post-meta-row", style: "margin-top:4px;" }, participantNodes)
+            : null
+        )
       ),
-      el("span", { className: "pill" }, `${state.messages.length} / ${state.total} 메시지`)
+      el(
+        "div",
+        { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap;" },
+        state.total > state.limit
+          ? el(
+              "button",
+              { type: "button", className: "btn", onClick: () => loadThreadMessages(threadId, "head") },
+              "처음부터"
+            )
+          : null,
+        state.total > state.limit
+          ? el(
+              "button",
+              { type: "button", className: "btn", onClick: () => loadThreadMessages(threadId, "tail") },
+              "최신으로"
+            )
+          : null,
+        el("span", { className: "pill" }, `${state.messages.length} / ${state.total} 메시지`)
+      )
     );
 
     const scrollArea = el("div", { className: "chat-scroll" });
+    if (state.hasOlder) {
+      scrollArea.appendChild(
+        el(
+          "div",
+          { className: "load-more-wrap" },
+          el(
+            "button",
+            {
+              type: "button",
+              className: "btn",
+              onClick: () => loadThreadMessages(threadId, "older"),
+            },
+            "⬆ 이전 메시지 더 불러오기"
+          )
+        )
+      );
+    }
+
     if (state.messages.length === 0) {
       scrollArea.appendChild(el("div", { className: "empty-box" }, "메시지가 없습니다."));
     } else {
@@ -156,13 +240,13 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
                 m.media.map((med) => {
                   const src = mediaUrl(med.local_path);
                   if (!src) return el("span", { className: "pill" }, med.original_uri || "미디어 없음");
-                  if (isVideoMedia(med)) {
-                    return el("video", { src, controls: true, playsinline: true, preload: "metadata" });
-                  }
                   if (isAudioMedia(med)) {
                     return el("audio", { src, controls: true, preload: "metadata" });
                   }
-                  if (med.media_type === "unknown") {
+                  if (isVideoMedia(med)) {
+                    return el("video", { src, controls: true, playsinline: true, preload: "metadata" });
+                  }
+                  if (isDocumentMedia(med)) {
                     const fname = (med.local_path || med.original_uri || "첨부파일").split("/").pop();
                     return el(
                       "a",
@@ -191,14 +275,35 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
             ? el(
                 "div",
                 { className: "post-meta-row" },
-                m.reactions.map((r) => el("span", { className: "pill" }, `${r.emoji} ${r.actor}`))
+                m.reactions.map((r) => el("span", { className: "pill" }, `${r.reaction || r.emoji || ""} ${r.actor}`.trim()))
               )
             : null;
+
+        const shareHref = safeExternalHref(m.shared_link);
+        const shareBlock =
+          m.shared_link || m.share_text || m.share_owner
+            ? el(
+                "div",
+                { className: "shared-box", style: "word-break:break-all;margin-top:6px;" },
+                m.share_owner ? el("div", { style: "font-weight:600;font-size:0.82rem;" }, `@${m.share_owner}`) : null,
+                m.share_text ? el("div", { style: "margin:4px 0;white-space:pre-wrap;" }, m.share_text) : null,
+                m.shared_link
+                  ? shareHref
+                    ? el("a", { href: shareHref, target: "_blank", rel: "noopener noreferrer" }, m.shared_link)
+                    : el("div", null, m.shared_link)
+                  : null
+              )
+            : null;
+
+        const isHighlighted = state.jumpTs && m.timestamp_unix && Math.abs(m.timestamp_unix - state.jumpTs) <= 2;
 
         scrollArea.appendChild(
           el(
             "div",
-            { className: "msg-bubble" },
+            {
+              className: "msg-bubble",
+              style: isHighlighted ? "outline:2px solid var(--accent);" : undefined,
+            },
             el(
               "div",
               { className: "msg-head" },
@@ -210,12 +315,13 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
               : m.text
                 ? el("div", { className: "msg-text" }, m.text)
                 : null,
-            m.call_duration !== null && m.call_duration !== undefined
+            m.is_missed_call
+              ? el("div", { className: "pill pill-warn", style: "margin-top:6px;" }, "📵 부재중 통화")
+              : null,
+            m.call_duration !== null && m.call_duration !== undefined && m.call_duration > 0
               ? el("div", { className: "pill", style: "margin-top:6px;" }, `통화 시간 ${formatDuration(m.call_duration)}`)
               : null,
-            m.shared_link
-              ? el("div", { className: "shared-box", style: "word-break:break-all;" }, m.shared_link)
-              : null,
+            shareBlock,
             mediaGrid,
             reactionsRow
           )
@@ -223,7 +329,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
       }
     }
 
-    if (state.messages.length < state.total) {
+    if (state.hasNewer) {
       scrollArea.appendChild(
         el(
           "div",
@@ -233,15 +339,20 @@ export async function renderMessagesView(container, ctx, initialThreadId = null)
             {
               type: "button",
               className: "btn",
-              onClick: () => loadThreadMessages(threadId, false),
+              onClick: () => loadThreadMessages(threadId, "newer"),
             },
-            `이전/다음 메시지 더 불러오기 (${state.messages.length}/${state.total})`
+            "⬇ 다음 메시지 더 불러오기"
           )
         )
       );
     }
 
     chatPane.append(header, scrollArea);
+    if (mode === "tail") {
+      requestAnimationFrame(() => {
+        scrollArea.scrollTop = scrollArea.scrollHeight;
+      });
+    }
   }
 
   let searchTimer = null;

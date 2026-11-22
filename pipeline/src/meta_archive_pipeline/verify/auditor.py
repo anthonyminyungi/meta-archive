@@ -22,6 +22,8 @@ AuditSeverity = Literal["ERROR", "WARN"]
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".avif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
+_NON_MEDIA_SCAN_EXTS = {".json", ".html", ".htm", ".txt", ".md", ".csv"}
+_IGNORED_FILENAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,8 @@ class CrossCheckSummary:
     official_archived_posts: int
     delta_live_vs_playwright: int | None
     delta_official_vs_playwright: int
+    official_timeline_posts: int | None = None
+    official_nontimeline_posts: int | None = None
 
 
 @dataclass
@@ -99,6 +103,8 @@ class AuditReport:
                     "playwright_posts": c.playwright_posts,
                     "official_active_posts": c.official_active_posts,
                     "official_archived_posts": c.official_archived_posts,
+                    "official_timeline_posts": c.official_timeline_posts,
+                    "official_nontimeline_posts": c.official_nontimeline_posts,
                     "delta_live_vs_playwright": c.delta_live_vs_playwright,
                     "delta_official_vs_playwright": c.delta_official_vs_playwright,
                 }
@@ -166,12 +172,13 @@ def load_collected_directory(
         )
 
     posts: list[Post] = []
-    posts_dir = collected_dir / "posts"
-    if posts_dir.exists():
-        for pf in sorted(posts_dir.glob("*.json")):
-            posts.append(
-                Post.model_validate_json(Path(to_long_path(pf)).read_text(encoding="utf-8"))
-            )
+    for subdir in ("posts", "tagged_posts"):
+        posts_dir = collected_dir / subdir
+        if posts_dir.exists():
+            for pf in sorted(posts_dir.glob("*.json")):
+                posts.append(
+                    Post.model_validate_json(Path(to_long_path(pf)).read_text(encoding="utf-8"))
+                )
 
     stories: list[Story] = []
     hl_path = collected_dir / "highlights.json"
@@ -362,7 +369,28 @@ def audit_sources(
             return
 
         ext = resolved_file.suffix.lower()
-        if media.media_type == "image" or ext in _IMAGE_EXTS:
+        if media.media_type == "audio":
+            if ext in _VIDEO_EXTS or ext == ".m4a":
+                mp4_res = inspect_mp4(resolved_file)
+                if not mp4_res.ok:
+                    all_issues.append(
+                        AuditIssue(
+                            severity="ERROR",
+                            code="CORRUPT_AUDIO",
+                            message=f"손상된 오디오 컨테이너 파일: {mp4_res.error}",
+                            path=media.local_path,
+                        )
+                    )
+                elif not mp4_res.has_audio:
+                    all_issues.append(
+                        AuditIssue(
+                            severity="WARN",
+                            code="AUDIO_NO_STREAM",
+                            message=f"오디오 트랙(soun)이 없는 음성 파일입니다: {media.local_path}",
+                            path=media.local_path,
+                        )
+                    )
+        elif media.media_type == "image" or ext in _IMAGE_EXTS:
             img_res = verify_image(resolved_file)
             if not img_res.ok:
                 all_issues.append(
@@ -417,9 +445,18 @@ def audit_sources(
             else:
                 _audit_media_item(story.media, roots, f"{bundle.platform} story {story.story_id}")
         for thread in bundle.messages:
+            if thread.avatar_local_path:
+                _audit_media_item(
+                    MediaItem(media_type="image", local_path=thread.avatar_local_path),
+                    roots,
+                    f"{bundle.platform} thread {thread.thread_id} avatar",
+                )
             for msg in thread.messages:
                 for m in msg.media:
                     _audit_media_item(m, roots, f"{bundle.platform} thread {thread.thread_id}")
+        for act in bundle.activities:
+            for m in act.media:
+                _audit_media_item(m, roots, f"{bundle.platform} activity {act.activity_id}")
 
     if collected_roots:
         for profile in collected_profiles:
@@ -430,22 +467,35 @@ def audit_sources(
                     f"{profile.platform} collected profile",
                 )
         for post in collected_posts:
+            if post.shared_post and post.shared_post.thumbnail_local_path:
+                _audit_media_item(
+                    MediaItem(media_type="image", local_path=post.shared_post.thumbnail_local_path),
+                    collected_roots,
+                    f"{post.platform} collected post {post.post_id} link thumbnail",
+                )
             for m in post.media:
                 _audit_media_item(m, collected_roots, f"{post.platform} collected post {post.post_id}")
         for story in collected_stories:
+            if story.highlight_cover:
+                _audit_media_item(
+                    MediaItem(media_type="image", local_path=story.highlight_cover),
+                    collected_roots,
+                    f"{story.platform} collected story {story.story_id} highlight cover",
+                )
             if story.media is not None:
                 _audit_media_item(
                     story.media, collected_roots, f"{story.platform} collected story {story.story_id}"
                 )
 
-    # 3. Orphan media files under official <root>/media/
+    # 3. Orphan media/binary files across the entire official export tree
     for bundle in official_bundles:
-        media_root = bundle.root_dir / "media"
-        if not media_root.exists():
+        if not bundle.root_dir.exists():
             continue
         refs = referenced_by_root.get(bundle.root_dir.resolve(), set())
-        for mf in sorted(media_root.rglob("*")):
+        for mf in sorted(bundle.root_dir.rglob("*")):
             if not mf.is_file():
+                continue
+            if mf.name.lower() in _IGNORED_FILENAMES or mf.suffix.lower() in _NON_MEDIA_SCAN_EXTS:
                 continue
             rel = mf.relative_to(bundle.root_dir).as_posix()
             if rel not in refs:
@@ -457,6 +507,60 @@ def audit_sources(
                         path=rel,
                     )
                 )
+
+    # 3b. Detect Facebook Messenger E2EE cutoff when no external `--fb-e2ee` export is supplied
+    for bundle in official_bundles:
+        if bundle.platform != "facebook" or bundle.extra_roots:
+            continue
+        has_e2ee_threads = any(t.is_e2ee for t in bundle.messages)
+        if has_e2ee_threads:
+            continue
+
+        armadillo_count = 0
+        for rel_sec in (
+            "your_facebook_activity/messages/secret_conversations.json",
+            "messages/secret_conversations.json",
+        ):
+            sec_path = bundle.root_dir.joinpath(*rel_sec.split("/"))
+            if sec_path.exists():
+                try:
+                    with open(to_long_path(sec_path), "rb") as handle:
+                        sec_data = json.loads(handle.read().decode("utf-8"))
+                    sc2 = (
+                        sec_data.get("secret_conversations_v2")
+                        if isinstance(sec_data, dict)
+                        else None
+                    )
+                    if isinstance(sc2, dict) and isinstance(sc2.get("armadillo_devices"), list):
+                        armadillo_count = len(sc2["armadillo_devices"])
+                except Exception:
+                    pass
+                break
+
+        max_msg_ts = max(
+            (m.timestamp_unix or 0 for t in bundle.messages for m in t.messages),
+            default=0,
+        )
+        max_other_ts = max(
+            [
+                *(p.timestamp_unix or 0 for p in bundle.posts),
+                *(a.timestamp_unix or 0 for a in bundle.activities),
+            ],
+            default=0,
+        )
+        trailing_days = (max_other_ts - max_msg_ts) // 86400 if (max_msg_ts and max_other_ts > max_msg_ts) else 0
+        if armadillo_count > 0 or trailing_days >= 180:
+            all_issues.append(
+                AuditIssue(
+                    severity="WARN",
+                    code="FB_E2EE_CUTOFF_SUSPECTED",
+                    message=(
+                        f"Facebook 메신저 E2EE 기기({armadillo_count}대) 또는 메시지 조기 중단({trailing_days}일 차이)이 "
+                        "감지되었습니다. 브라우저 보안 저장소(PIN)에 암호화 대화가 있다면 `--fb-e2ee` 백업을 확인하세요."
+                    ),
+                    details={"armadillo_devices": armadillo_count, "trailing_days": trailing_days},
+                )
+            )
 
     # 4. Year x Month continuous histograms & 3+ month zero gaps
     series_timestamps: dict[str, list[int]] = {}
@@ -476,7 +580,7 @@ def audit_sources(
                     series_timestamps.setdefault(key_msgs, []).append(msg.timestamp_unix)
 
     for p in collected_posts:
-        if p.timestamp_unix:
+        if p.timestamp_unix and p.post_type != "tagged":
             series_timestamps.setdefault(f"{p.platform}:collected_posts", []).append(p.timestamp_unix)
 
     for series_name, ts_list in sorted(series_timestamps.items()):
@@ -504,23 +608,30 @@ def audit_sources(
     for platform in platforms:
         live_prof = next((p for p in collected_profiles if p.platform == platform), None)
         live_count = live_prof.counts.posts if live_prof else None
-        pw_count = sum(1 for p in collected_posts if p.platform == platform)
-        off_active = sum(
-            1
-            for b in official_bundles
-            if b.platform == platform
-            for p in b.posts
-            if not p.is_archived
+        pw_count = sum(
+            1 for p in collected_posts if p.platform == platform and p.post_type != "tagged"
         )
-        off_arch = sum(
-            1
-            for b in official_bundles
-            if b.platform == platform
-            for p in b.posts
-            if p.is_archived
-        )
+        plat_off_posts = [
+            p for b in official_bundles if b.platform == platform for p in b.posts
+        ]
+        off_active = sum(1 for p in plat_off_posts if not p.is_archived)
+        off_arch = sum(1 for p in plat_off_posts if p.is_archived)
+
+        off_timeline: int | None = None
+        off_nontimeline: int | None = None
+        if platform == "facebook":
+            off_timeline = sum(
+                1
+                for p in plat_off_posts
+                if not p.is_archived
+                and not p.post_id.startswith(("fb_album_", "fb_photo_", "fb_video_", "fb_group_"))
+            )
+            off_nontimeline = off_active - off_timeline
+
+        has_official = any(b.platform == platform for b in official_bundles)
         delta_live = (live_count - pw_count) if live_count is not None else None
-        delta_off = off_active - pw_count
+        comparable_off = off_timeline if (platform == "facebook" and off_timeline is not None) else off_active
+        delta_off = comparable_off - pw_count
 
         cc = CrossCheckSummary(
             platform=platform,
@@ -530,10 +641,12 @@ def audit_sources(
             official_archived_posts=off_arch,
             delta_live_vs_playwright=delta_live,
             delta_official_vs_playwright=delta_off,
+            official_timeline_posts=off_timeline,
+            official_nontimeline_posts=off_nontimeline,
         )
         report.cross_checks.append(cc)
 
-        if (delta_live is not None and delta_live != 0) or (pw_count > 0 and delta_off != 0):
+        if (delta_live is not None and delta_live != 0) or (has_official and pw_count > 0 and delta_off != 0):
             all_issues.append(
                 AuditIssue(
                     severity="WARN",
@@ -542,7 +655,11 @@ def audit_sources(
                         f"{platform} 게시물 수량 차이: 라이브={live_count}, "
                         f"Playwright={pw_count}, 공식활성={off_active}, 공식보관={off_arch}"
                     ),
-                    details={"platform": platform},
+                    details={
+                        "platform": platform,
+                        "official_timeline_posts": off_timeline,
+                        "official_nontimeline_posts": off_nontimeline,
+                    },
                 )
             )
 
@@ -554,7 +671,9 @@ def audit_sources(
         "official_posts": sum(len(b.posts) for b in official_bundles),
         "official_stories": sum(len(b.stories) for b in official_bundles),
         "official_threads": sum(len(b.messages) for b in official_bundles),
+        "official_activities": sum(len(b.activities) for b in official_bundles),
         "collected_posts": len(collected_posts),
+        "collected_tagged_posts": sum(1 for p in collected_posts if p.post_type == "tagged"),
     }
     return report
 
@@ -572,7 +691,24 @@ def audit_directories(
     json_scan_roots: list[Path] = []
     load_errors: list[AuditIssue] = []
 
-    if ig_official is not None:
+    for flag_label, cand_dir in (
+        ("--ig-official", ig_official),
+        ("--fb-official", fb_official),
+        ("--fb-e2ee", fb_e2ee),
+        ("--ig-collected", ig_collected),
+        ("--fb-collected", fb_collected),
+    ):
+        if cand_dir is not None and not os.path.isdir(to_long_path(cand_dir)):
+            load_errors.append(
+                AuditIssue(
+                    severity="ERROR",
+                    code="MISSING_SOURCE_DIR",
+                    message=f"지정된 입력 디렉터리를 찾을 수 없거나 접근할 수 없습니다 ({flag_label}): {cand_dir}",
+                    path=str(cand_dir),
+                )
+            )
+
+    if ig_official is not None and os.path.isdir(to_long_path(ig_official)):
         json_scan_roots.append(ig_official)
         try:
             bundles.append(parse_ig_official_export(ig_official))
@@ -586,9 +722,9 @@ def audit_directories(
                 )
             )
 
-    if fb_official is not None:
+    if fb_official is not None and os.path.isdir(to_long_path(fb_official)):
         json_scan_roots.append(fb_official)
-        if fb_e2ee is not None:
+        if fb_e2ee is not None and os.path.isdir(to_long_path(fb_e2ee)):
             json_scan_roots.append(fb_e2ee)
         try:
             bundles.append(parse_fb_official_export(fb_official, e2ee_root=fb_e2ee))

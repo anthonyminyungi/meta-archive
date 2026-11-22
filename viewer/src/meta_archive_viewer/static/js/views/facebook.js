@@ -7,8 +7,10 @@ import {
   el,
   extractReactionEntries,
   formatDate,
+  isVideoMedia,
   personButton,
   renderSharedCard,
+  safeExternalHref,
 } from "../dom.js";
 import { renderCarousel } from "../components/carousel.js";
 
@@ -45,7 +47,41 @@ export async function renderFacebookView(container, ctx) {
   const displayName = profile ? profile.full_name || profile.username || "Facebook" : "Facebook Archive";
   const tabTimelineBtn = el("button", { type: "button", className: "btn btn-primary" }, "타임라인");
   const tabAlbumsBtn = el("button", { type: "button", className: "btn" }, `사진 앨범 (${albumsRes.items.length})`);
-  const tabFriendsBtn = el("button", { type: "button", className: "btn" }, `친구 (${fbStats.connections || 0})`);
+  const tabFriendsBtn = el("button", { type: "button", className: "btn" }, `친구·팔로잉 (${fbStats.connections || 0})`);
+  const tabActivitiesBtn = el("button", { type: "button", className: "btn" }, `내 댓글·저장됨 (${fbStats.activities || 0})`);
+
+  function openFbStoriesModal() {
+    ctx.modal.openCustom("Facebook 보관 스토리", async (body) => {
+      const res = await api.stories({ platform: "facebook", limit: 100 });
+      clear(body);
+      if (res.items.length === 0) {
+        body.appendChild(el("div", { className: "empty-box" }, "보관된 Facebook 스토리가 없습니다."));
+        return;
+      }
+      const list = el("div", { className: "feed-list" });
+      for (const s of res.items) {
+        const src = s.media ? mediaUrl(s.media.local_path) : null;
+        list.appendChild(
+          el(
+            "div",
+            { className: "card" },
+            el(
+              "div",
+              { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
+              el("span", { className: "pill pill-accent" }, formatDate(s.created_at, s.timestamp_unix))
+            ),
+            src
+              ? isVideoMedia(s.media)
+                ? el("video", { src, controls: true, playsinline: true, style: "max-width:100%;max-height:420px;border-radius:8px;" })
+                : el("img", { src, alt: "story", loading: "lazy", style: "max-width:100%;max-height:420px;border-radius:8px;cursor:zoom-in;", onClick: () => ctx.openLightbox([s.media], 0) })
+              : null,
+            s.caption ? el("div", { className: "post-caption" }, s.caption) : null
+          )
+        );
+      }
+      body.appendChild(list);
+    });
+  }
 
   root.appendChild(
     el(
@@ -60,10 +96,13 @@ export async function renderFacebookView(container, ctx) {
           { className: "profile-title-row" },
           el("h1", null, displayName),
           el("span", { className: "pill pill-accent" }, `게시물 ${fbStats.posts || 0}`),
-          el("span", { className: "pill" }, `댓글 ${fbStats.comments || 0}`)
+          el("span", { className: "pill" }, `댓글 ${fbStats.comments || 0}`),
+          (fbStats.stories || 0) > 0
+            ? el("button", { type: "button", className: "btn", onClick: openFbStoriesModal }, `보관 스토리 (${fbStats.stories})`)
+            : null
         ),
         profile && profile.bio ? el("p", { className: "profile-bio" }, profile.bio) : null,
-        el("div", { className: "toolbar-group", style: "margin-top:12px;" }, tabTimelineBtn, tabAlbumsBtn, tabFriendsBtn)
+        el("div", { className: "toolbar-group", style: "margin-top:12px;" }, tabTimelineBtn, tabAlbumsBtn, tabFriendsBtn, tabActivitiesBtn)
       )
     )
   );
@@ -75,6 +114,7 @@ export async function renderFacebookView(container, ctx) {
     tabTimelineBtn.className = `btn${state.subtab === "timeline" ? " btn-primary" : ""}`;
     tabAlbumsBtn.className = `btn${state.subtab === "albums" ? " btn-primary" : ""}`;
     tabFriendsBtn.className = `btn${state.subtab === "friends" ? " btn-primary" : ""}`;
+    tabActivitiesBtn.className = `btn${state.subtab === "activities" ? " btn-primary" : ""}`;
   }
 
   async function renderTimeline() {
@@ -144,6 +184,7 @@ export async function renderFacebookView(container, ctx) {
       const typeButtons = [
         ["", "전체"],
         ["original", "내 글·사진만"],
+        ["group_post", "그룹 글"],
         ["shared", "공유 글만"],
       ].map(([val, label]) =>
         el(
@@ -217,11 +258,17 @@ export async function renderFacebookView(container, ctx) {
                 { className: "post-author-block" },
                 personButton(post.author_username, post.author_name, ctx.openPerson),
                 post.post_type === "shared" ? el("span", { className: "pill pill-warn" }, "공유") : null,
+                post.post_type === "group_post"
+                  ? el("span", { className: "pill pill-accent" }, post.group_name ? `그룹: ${post.group_name}` : "그룹 글")
+                  : null,
                 post.album_name ? el("span", { className: "pill" }, `앨범: ${post.album_name}`) : null,
                 post.audience ? el("span", { className: "pill" }, post.audience) : null
               ),
               el("span", { style: "font-size:0.82rem;color:var(--text-muted);" }, formatDate(post.created_at, post.timestamp_unix))
             ),
+            !post.caption && post.activity_title
+              ? el("div", { style: "font-size:0.86rem;color:var(--text-muted);margin-bottom:6px;" }, post.activity_title)
+              : null,
             post.caption ? el("div", { className: "post-caption" }, post.caption) : null,
             sharedNode,
             carousel,
@@ -307,24 +354,33 @@ export async function renderFacebookView(container, ctx) {
 
   async function renderFriends() {
     clear(contentHost);
+    let relation = "";
+    const relSelect = el(
+      "select",
+      { className: "select", "aria-label": "관계 필터" },
+      el("option", { value: "" }, "전체 (친구 + 팔로잉)"),
+      el("option", { value: "friend" }, "친구 (Friends)"),
+      el("option", { value: "following" }, "팔로잉 (Following)")
+    );
     const searchInput = el("input", {
       type: "search",
       className: "input",
-      placeholder: "Facebook 친구 이름 또는 아이디 검색...",
+      placeholder: "Facebook 친구·팔로잉 이름 검색...",
     });
     const grid = el("div", { className: "connections-grid" });
-    contentHost.append(el("div", { className: "search-bar" }, searchInput), grid);
+    contentHost.append(el("div", { className: "search-bar" }, relSelect, searchInput), grid);
 
     async function load(q = "") {
       clear(grid);
       const res = await api.connections({
         platform: "facebook",
+        relation: relation || undefined,
         q: q || undefined,
         limit: 300,
       });
       clear(grid);
       if (res.items.length === 0) {
-        grid.appendChild(el("div", { className: "empty-box" }, "표시할 친구 목록이 없습니다."));
+        grid.appendChild(el("div", { className: "empty-box" }, "표시할 친구·팔로잉 목록이 없습니다."));
         return;
       }
       for (const f of res.items) {
@@ -349,11 +405,115 @@ export async function renderFacebookView(container, ctx) {
     }
 
     let timer = null;
+    relSelect.addEventListener("change", () => {
+      relation = relSelect.value;
+      load(searchInput.value);
+    });
     searchInput.addEventListener("input", () => {
       clearTimeout(timer);
       timer = setTimeout(() => load(searchInput.value), 180);
     });
     await load();
+  }
+
+  async function renderActivities() {
+    clear(contentHost);
+    let kind = "";
+    let q = "";
+    let actOffset = 0;
+    const actLimit = 100;
+    let actTotal = 0;
+
+    const kindSelect = el(
+      "select",
+      { className: "select", "aria-label": "활동 종류" },
+      el("option", { value: "" }, "전체 활동 (댓글·그룹댓글·저장됨)"),
+      el("option", { value: "own_comment" }, "내가 쓴 댓글"),
+      el("option", { value: "group_comment" }, "그룹에 쓴 댓글"),
+      el("option", { value: "saved_item" }, "저장한 항목")
+    );
+    const qInput = el("input", {
+      type: "search",
+      className: "input",
+      placeholder: "댓글·저장 제목·대상·그룹 검색...",
+    });
+    const countPill = el("span", { className: "pill" }, "0건");
+    const listEl = el("div", { className: "feed-list" });
+    const moreWrap = el("div", { className: "load-more-wrap" });
+    const moreBtn = el("button", { type: "button", className: "btn" }, "더 보기");
+    moreWrap.appendChild(moreBtn);
+
+    contentHost.append(
+      el("div", { className: "search-bar" }, kindSelect, qInput, countPill),
+      listEl,
+      moreWrap
+    );
+
+    async function load(reset = true) {
+      if (reset) {
+        actOffset = 0;
+        clear(listEl);
+      }
+      moreBtn.disabled = true;
+      const res = await api.activities({
+        platform: "facebook",
+        kind: kind || undefined,
+        q: q || undefined,
+        offset: actOffset,
+        limit: actLimit,
+      });
+      actTotal = res.total;
+      actOffset += res.items.length;
+      countPill.textContent = `${actOffset} / ${actTotal}건`;
+      moreWrap.classList.toggle("hidden", actOffset >= actTotal);
+      moreBtn.disabled = false;
+
+      if (reset && res.items.length === 0) {
+        listEl.appendChild(el("div", { className: "empty-box" }, "해당하는 활동 내역이 없습니다."));
+        return;
+      }
+      for (const a of res.items) {
+        const href = safeExternalHref(a.url);
+        const mediaNodes = (a.media || [])
+          .map((m) => {
+            const src = mediaUrl(m.local_path);
+            return src ? el("img", { src, alt: "sticker", loading: "lazy", style: "max-height:72px;border-radius:6px;" }) : null;
+          })
+          .filter(Boolean);
+
+        listEl.appendChild(
+          el(
+            "article",
+            { className: "card" },
+            el(
+              "div",
+              { className: "post-meta-row", style: "margin-top:0;margin-bottom:6px;" },
+              el("span", { className: "pill pill-accent" }, a.kind),
+              el("span", { className: "pill" }, formatDate(a.created_at, a.timestamp_unix)),
+              a.group_name ? el("span", { className: "pill" }, `그룹: ${a.group_name}`) : null,
+              a.target_author ? el("span", { className: "pill" }, `대상: ${a.target_author}`) : null
+            ),
+            a.title ? el("div", { style: "font-size:0.84rem;color:var(--text-muted);margin-bottom:6px;" }, a.title) : null,
+            a.text ? el("div", { className: "post-caption" }, a.text) : null,
+            mediaNodes.length > 0 ? el("div", { style: "display:flex;gap:8px;margin-top:6px;" }, mediaNodes) : null,
+            href ? el("a", { href, target: "_blank", rel: "noopener noreferrer" }, a.url) : null
+          )
+        );
+      }
+    }
+
+    let timer = null;
+    kindSelect.addEventListener("change", () => {
+      kind = kindSelect.value;
+      load(true);
+    });
+    qInput.addEventListener("input", () => {
+      q = qInput.value;
+      clearTimeout(timer);
+      timer = setTimeout(() => load(true), 180);
+    });
+    moreBtn.addEventListener("click", () => load(false));
+    await load(true);
   }
 
   tabTimelineBtn.addEventListener("click", () => {
@@ -370,6 +530,11 @@ export async function renderFacebookView(container, ctx) {
     state.subtab = "friends";
     updateSubtabButtons();
     renderFriends();
+  });
+  tabActivitiesBtn.addEventListener("click", () => {
+    state.subtab = "activities";
+    updateSubtabButtons();
+    renderActivities();
   });
 
   updateSubtabButtons();

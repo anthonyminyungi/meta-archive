@@ -495,3 +495,435 @@ def test_parse_fb_official_extended_sources_and_avif(tmp_path: Path) -> None:
         ("your_facebook_activity/messages/filtered_threads/flt1/files/2.pdf", "unknown"),
         ("your_facebook_activity/messages/stickers_used/3.png", "image"),
     ]
+
+
+def test_parse_ig_real_2026_wrapped_label_values_mp4_audio_and_activities(tmp_path: Path) -> None:
+    root = tmp_path / "ig_real_2026"
+
+    _write_json(
+        root / "your_instagram_activity" / "media" / "posts_1.json",
+        [
+            {
+                "title": _garble("캐러셀 본문"),
+                "creation_timestamp": 1700000000,
+                "media": [
+                    {"uri": "media/posts/202311/s1.jpg", "creation_timestamp": 1700000000},
+                    {"uri": "media/posts/202311/s2.mp4", "creation_timestamp": 1700000000},
+                ],
+            }
+        ],
+    )
+
+    # Actual 2026 Instagram posts.json structure with anonymous `{"title": "", "dict": [...]}` wrappers
+    _write_json(
+        root / "your_instagram_activity" / "media" / "posts.json",
+        [
+            {
+                "timestamp": 1700000000,
+                "media": [],
+                "label_values": [
+                    {"label": "Media", "media": []},
+                    {"label": "Creation time", "timestamp_value": 1700000000},
+                    {"label": "Latitude", "value": "37.5665"},
+                    {"label": "Longitude", "value": "126.9780"},
+                    {
+                        "title": "Media",
+                        "dict": [
+                            {
+                                "title": "",
+                                "dict": [
+                                    {"label": "Media", "media": [{"uri": "media/posts/202311/s1.jpg"}]},
+                                    {"label": "Original width", "value": "1440"},
+                                    {"label": "Original height", "value": "1800"},
+                                ],
+                            },
+                            {
+                                "title": "",
+                                "dict": [
+                                    {"label": "Media", "media": [{"uri": "media/posts/202311/s2.mp4"}]},
+                                    {"label": "Is audio muted", "value": "True"},
+                                    {
+                                        "label": "Metadata",
+                                        "dict": [
+                                            {"label": "duration", "value": "8.5"},
+                                            {"label": "width", "value": "1080"},
+                                            {"label": "height", "value": "1920"},
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "title": "Place",
+                        "dict": [
+                            {
+                                "title": "",
+                                "dict": [
+                                    {"label": "Name", "value": _garble("광화문광장")},
+                                    {"label": "Description", "value": _garble("서울 종로구")},
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "title": "Hashtags",
+                        "dict": [
+                            {"title": "", "dict": [{"label": "Name", "value": _garble("#서울")}]},
+                        ],
+                    },
+                ],
+            }
+        ],
+    )
+
+    _write_json(
+        root / "your_instagram_activity" / "media" / "stories.json",
+        {
+            "ig_stories": [
+                {
+                    "uri": "media/stories/202405/st1.jpg",
+                    "creation_timestamp": 1715000000,
+                    "title": _garble("스토리 캡션 텍스트"),
+                }
+            ]
+        },
+    )
+
+    # Group DM with custom thread image + .mp4 voice message + rich share metadata
+    _write_json(
+        root / "your_instagram_activity" / "messages" / "inbox" / "grp_1" / "message_1.json",
+        {
+            "title": _garble("우리 단톡"),
+            "image": {"uri": "your_instagram_activity/messages/photos/grp_cover.jpg"},
+            "participants": [{"name": _garble("윤기")}],
+            "messages": [
+                {
+                    "sender_name": _garble("윤기"),
+                    "timestamp_ms": 1715000100000,
+                    "audio_files": [{"uri": "your_instagram_activity/messages/inbox/grp_1/audio/voice1.mp4"}],
+                    "share": {
+                        "link": "https://www.instagram.com/reel/REEL99/",
+                        "share_text": _garble("재밌는 릴스 캡션"),
+                        "original_content_owner": "funny_creator",
+                    },
+                }
+            ],
+        },
+    )
+
+    # Own comments, saved posts, and reposts
+    _write_json(
+        root / "your_instagram_activity" / "comments" / "post_comments_1.json",
+        [
+            {
+                "media_list_data": [],
+                "string_map_data": {
+                    "Comment": {"value": _garble("내가 쓴 인스타 댓글")},
+                    "Media Owner": {"value": "friend_owner"},
+                    "Time": {"timestamp": 1710000000},
+                },
+            }
+        ],
+    )
+    _write_json(
+        root / "your_instagram_activity" / "comments" / "reels_comments.json",
+        {
+            "comments_reels_comments": [
+                {
+                    "string_map_data": {
+                        "Comment": {"value": _garble("내가 쓴 릴스 댓글")},
+                        "Media Owner": {"value": "reel_owner"},
+                        "Time": {"timestamp": 1710000500},
+                    }
+                }
+            ]
+        },
+    )
+    _write_json(
+        root / "your_instagram_activity" / "saved" / "saved_posts.json",
+        [
+            {
+                "timestamp": 1712000000,
+                "media": [],
+                "label_values": [
+                    {"label": "URL", "href": "https://www.instagram.com/p/SAVED1/", "value": "https://www.instagram.com/p/SAVED1/"},
+                    {"label": "Caption", "value": _garble("저장해둔 맛집 리스트")},
+                    {
+                        "title": "Owner",
+                        "dict": [
+                            {
+                                "title": "",
+                                "dict": [
+                                    {"label": "Username", "value": "foodie_kr"},
+                                    {"label": "Name", "value": _garble("맛집탐방")},
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+    )
+    _write_json(
+        root / "your_instagram_activity" / "media" / "reposts.json",
+        {
+            "timestamp": 1713000000,
+            "media": [],
+            "label_values": [
+                {"label": "Text", "value": _garble("리포스트 메모")},
+                {
+                    "title": "Media",
+                    "dict": [
+                        {
+                            "title": "",
+                            "dict": [
+                                {"label": "URL", "href": "https://www.instagram.com/p/REP1/", "value": "https://www.instagram.com/p/REP1/"},
+                                {"label": "Caption", "value": _garble("원본 리포스트 캡션")},
+                            ],
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    bundle = parse_ig_official_export(root)
+    # Must NOT duplicate the carousel into a second ig_postsjson_* post!
+    assert len(bundle.posts) == 1
+    p = bundle.posts[0]
+    assert p.post_type == "carousel"
+    assert p.location is not None
+    assert p.location.name == "광화문광장"
+    assert p.location.description == "서울 종로구"
+    assert p.location.lat == 37.5665
+    assert p.hashtags == ["서울"]
+    assert p.media[0].width == 1440
+    assert p.media[1].is_audio_muted is True
+    assert p.media[1].duration_sec == 8.5
+    assert p.media[1].width == 1080
+
+    assert bundle.stories[0].caption == "스토리 캡션 텍스트"
+
+    thread = bundle.messages[0]
+    assert thread.avatar_local_path == "your_instagram_activity/messages/photos/grp_cover.jpg"
+    msg = thread.messages[0]
+    assert msg.media[0].media_type == "audio"
+    assert msg.shared_link == "https://www.instagram.com/reel/REEL99/"
+    assert msg.share_text == "재밌는 릴스 캡션"
+    assert msg.share_owner == "funny_creator"
+
+    by_kind = {a.kind: [x for x in bundle.activities if x.kind == a.kind] for a in bundle.activities}
+    assert len(by_kind["own_comment"]) == 2
+    assert by_kind["saved_item"][0].url == "https://www.instagram.com/p/SAVED1/"
+    assert by_kind["saved_item"][0].target_author == "foodie_kr"
+    assert by_kind["repost"][0].url == "https://www.instagram.com/p/REP1/"
+
+
+def test_parse_fb_real_2026_taken_timestamp_groups_following_and_activities(tmp_path: Path) -> None:
+    fb_root = tmp_path / "fb_real_2026"
+
+    # Timeline post: system `title` without `data[].post` must go to `activity_title`, NOT `caption`!
+    # Also test `tags` and `life_event` and `taken_timestamp` EXIF.
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "your_posts__check_ins__photos_and_videos_1.json",
+        [
+            {
+                "timestamp": 1680000000,
+                "title": _garble("윤기님이 링크를 공유했습니다."),
+                "data": [{"update_timestamp": 1680000005}],
+                "tags": [{"name": _garble("김철수")}],
+                "attachments": [
+                    {
+                        "data": [
+                            {
+                                "external_context": {
+                                    "url": "https://example.org/article",
+                                }
+                            }
+                        ]
+                    }
+                ],
+            },
+            {
+                "timestamp": 1690000000,
+                "title": _garble("윤기님이 중요 이벤트를 추가했습니다."),
+                "attachments": [
+                    {"data": [{"life_event": {"title": _garble("대학 졸업")}}]},
+                ],
+            },
+        ],
+    )
+
+    # Empty album (photos=[]) with cover_photo must still preserve cover_photo!
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "album" / "3.json",
+        {
+            "name": _garble("삼성전자 S 아카데미 Photos"),
+            "photos": [],
+            "cover_photo": {
+                "uri": "your_facebook_activity/posts/media/your_posts/3450136083.png",
+                "creation_timestamp": 1400000000,
+            },
+            "last_modified_timestamp": 1400000000,
+        },
+    )
+
+    # Uncategorized photo with integer `taken_timestamp` in exif_data
+    _write_json(
+        fb_root / "your_facebook_activity" / "posts" / "your_uncategorized_photos.json",
+        {
+            "other_photos_v2": [
+                {
+                    "uri": "your_facebook_activity/posts/media/your_posts/cam1.avif",
+                    "creation_timestamp": 1600000500,
+                    "media_metadata": {
+                        "photo_metadata": {"exif_data": [{"taken_timestamp": 1599990000}]}
+                    },
+                }
+            ]
+        },
+    )
+
+    # Group posts with PDF / extensionless file in `files/`
+    _write_json(
+        fb_root / "your_facebook_activity" / "groups" / "group_posts_and_comments.json",
+        {
+            "group_posts_v2": [
+                {
+                    "timestamp": 1580000000,
+                    "title": _garble("윤기님이 컴퓨터공학과 학회 그룹에 게시물을 남겼습니다."),
+                    "data": [{"post": _garble("발표 자료 공유합니다.")}],
+                    "attachments": [
+                        {"data": [{"media": {"uri": "files/204712957226567"}}]},
+                        {"data": [{"media": {"uri": "files/1014542048960874.pdf"}}]},
+                    ],
+                }
+            ]
+        },
+    )
+
+    # Following list (`who_you've_followed.json`)
+    _write_json(
+        fb_root / "connections" / "followers" / "who_you've_followed.json",
+        {"following_v3": [{"name": _garble("박지성"), "timestamp": 1500000000}]},
+    )
+
+    # Messenger: .mp4 audio_files, extensionless photo, missed call, share_text
+    _write_json(
+        fb_root / "your_facebook_activity" / "messages" / "inbox" / "friend_a" / "message_1.json",
+        {
+            "title": _garble("친구A"),
+            "participants": [{"name": _garble("친구A")}],
+            "messages": [
+                {
+                    "sender_name": _garble("친구A"),
+                    "timestamp_ms": 1700000000000,
+                    "audio_files": [{"uri": "your_facebook_activity/messages/inbox/friend_a/audio/clip.mp4"}],
+                    "photos": [{"uri": "your_facebook_activity/messages/inbox/friend_a/photos/noext_img"}],
+                    "share": {"link": "https://fb.com/watch/1", "share_text": _garble("공유 설명")},
+                    "missed": True,
+                    "call_duration": 0,
+                }
+            ],
+        },
+    )
+
+    # FB user activities: own comments (+ sticker), group comments, saved items
+    _write_json(
+        fb_root / "your_facebook_activity" / "comments_and_reactions" / "comments.json",
+        {
+            "comments_v2": [
+                {
+                    "timestamp": 1650000000,
+                    "title": _garble("윤기님이 이영희님의 게시물에 댓글을 남겼습니다."),
+                    "data": [{"comment": {"timestamp": 1650000000, "comment": _garble("축하해요!"), "author": _garble("윤기")}}],
+                    "attachments": [
+                        {"data": [{"media": {"uri": "your_facebook_activity/posts/media/stickers_used/st1.png"}}]}
+                    ],
+                }
+            ]
+        },
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "groups" / "your_comments_in_groups.json",
+        {
+            "group_comments_v2": [
+                {
+                    "timestamp": 1651000000,
+                    "title": _garble("윤기님이 스터디모임 그룹의 게시물에 댓글을 남겼습니다."),
+                    "data": [
+                        {
+                            "comment": {
+                                "timestamp": 1651000000,
+                                "comment": _garble("참석합니다!"),
+                                "author": _garble("윤기"),
+                                "group": _garble("스터디모임"),
+                            }
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    _write_json(
+        fb_root / "your_facebook_activity" / "saved_items_and_collections" / "your_saved_items.json",
+        {
+            "saves_v2": [
+                {
+                    "timestamp": 1660000000,
+                    "title": _garble("윤기님이 링크를 저장했습니다."),
+                    "attachments": [
+                        {
+                            "data": [
+                                {
+                                    "external_context": {
+                                        "name": _garble("좋은 개발 아티클"),
+                                        "url": "https://l.facebook.com/l.php?u=https%3A%2F%2Fdev.example.io%2F1",
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    bundle = parse_fb_official_export(fb_root)
+
+    shared_p = next(p for p in bundle.posts if p.post_type == "shared")
+    assert shared_p.caption == ""
+    assert shared_p.activity_title == "윤기님이 링크를 공유했습니다."
+    assert [u.full_name for u in shared_p.tagged_users] == ["김철수"]
+
+    life_p = next(p for p in bundle.posts if p.timestamp_unix == 1690000000)
+    assert life_p.caption == "대학 졸업"
+    assert life_p.activity_title == "윤기님이 중요 이벤트를 추가했습니다."
+
+    cover_only = next(p for p in bundle.posts if p.album_name == "삼성전자 S 아카데미 Photos")
+    assert cover_only.media[0].local_path == "your_facebook_activity/posts/media/your_posts/3450136083.png"
+
+    uncat = next(p for p in bundle.posts if p.album_name == "미분류 사진")
+    assert uncat.media[0].taken_at_unix == 1599990000
+
+    grp_p = next(p for p in bundle.posts if p.post_type == "group_post")
+    assert grp_p.group_name == "컴퓨터공학과 학회"
+    assert grp_p.caption == "발표 자료 공유합니다."
+    assert len(grp_p.media) == 2
+
+    assert [(c.relation, c.full_name) for c in bundle.connections] == [("following", "박지성")]
+
+    msg = bundle.messages[0].messages[0]
+    assert [(m.local_path.split("/")[-1], m.media_type) for m in msg.media if m.local_path] == [
+        ("noext_img", "image"),
+        ("clip.mp4", "audio"),
+    ]
+    assert msg.share_text == "공유 설명"
+    assert msg.is_missed_call is True
+
+    acts_by_kind = {a.kind: a for a in bundle.activities}
+    assert acts_by_kind["own_comment"].text == "축하해요!"
+    assert acts_by_kind["own_comment"].media[0].local_path == "your_facebook_activity/posts/media/stickers_used/st1.png"
+    assert acts_by_kind["group_comment"].group_name == "스터디모임"
+    assert acts_by_kind["saved_item"].url == "https://dev.example.io/1"

@@ -396,7 +396,7 @@ def build(
     console.print(
         f"[green]아카이브 빌드 완료[/green]: posts={summary.posts_count}, stories={summary.stories_count}, "
         f"connections={summary.connections_count}, threads={summary.threads_count}, "
-        f"ambiguous={summary.ambiguous_count}"
+        f"activities={summary.activities_count}, ambiguous={summary.ambiguous_count}"
     )
     console.print(
         f"미디어 복사={summary.media_copied}, XMP 생성={summary.xmp_written}, "

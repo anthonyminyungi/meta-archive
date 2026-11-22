@@ -53,6 +53,7 @@ export const api = {
   threads: (params) => getJson(`/api/threads${buildQuery(params)}`),
   threadMessages: (threadId, params) =>
     getJson(`/api/threads/${encodeURIComponent(threadId)}/messages${buildQuery(params)}`),
+  activities: (params) => getJson(`/api/activities${buildQuery(params)}`),
   search: (params) => getJson(`/api/search${buildQuery(params)}`),
   person: (identifier, limit = 50) =>
     getJson(`/api/people/${encodeURIComponent(identifier)}${buildQuery({ limit })}`),

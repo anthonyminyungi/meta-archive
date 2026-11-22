@@ -86,6 +86,10 @@ class ArchivePaths:
     def messages_json(self) -> Path:
         return self.data_dir / "messages.json"
 
+    @property
+    def activities_json(self) -> Path:
+        return self.data_dir / "activities.json"
+
     @staticmethod
     def media_rel_path(platform: str, category: str, filename: str) -> str:
         """Build a normalized relative path under `media/<platform>/<category>/<filename>`."""
