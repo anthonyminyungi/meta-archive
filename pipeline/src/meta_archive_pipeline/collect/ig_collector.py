@@ -50,15 +50,35 @@ IgPass = Literal["core", "likes", "connections", "tagged", "saved"]
 
 _SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CODE_SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,}$")
+_DOM_HREF_SHORTCODE_RE = re.compile(
+    r"^/(?:([A-Za-z0-9._]+)/)?(?:p|reel|tv)/([A-Za-z0-9_-]{5,})(?:[/?#]|$)"
+)
+_RESERVED_IG_SEGMENTS = frozenset({"explore", "accounts", "direct", "stories", "reels"})
+_EXCLUDED_SHORTCODE_CONTAINERS = frozenset(
+    {
+        "xdt_api__v1__feed__timeline__connection",
+        "xdt_api__v1__discover__web__explore_grid__connection",
+        "explore_story",
+        "ad",
+        "injected",
+        "chaining_results",
+        "suggested_users",
+        "carousel_media",
+        "edge_sidecar_to_children",
+    }
+)
 _HASHTAG_RE = re.compile(r"#([\w\uac00-\ud7a3]+)")
-_EXPAND_BUTTON_LABELS = (
+_EXPAND_BUTTON_LABELS: tuple[Any, ...] = (
     "숨겨진 댓글 보기",
     "댓글 더 보기",
+    "댓글 더 읽어들이기",
     "답글 보기",
+    "답글 모두 보기",
     "View hidden comments",
     "View more comments",
     "Load more comments",
     "View replies",
+    re.compile(r"(?:답글.*보기|View (?:all \d+ |more )?replies)", re.IGNORECASE),
 )
 
 
@@ -205,16 +225,20 @@ def _extract_edge_nodes(container: Any) -> list[dict[str, Any]]:
 
 def extract_ig_profile_from_payloads(
     payloads: Sequence[dict[str, Any]],
+    *,
+    target_username: str | None = None,
 ) -> tuple[Profile | None, str | None]:
     """Extract the richest Instagram Profile and avatar URL from SSR/API payloads."""
-    best_score = -1
-    best_profile: Profile | None = None
-    best_avatar: str | None = None
+    target_norm = target_username.strip().lower() if target_username else None
+    fragments_by_user: dict[str, list[tuple[int, dict[str, Any]]]] = {}
 
     for payload in payloads:
         for node in _walk_dicts(payload):
             username = node.get("username")
             if not isinstance(username, str) or not username:
+                continue
+            uname_low = username.strip().lower()
+            if target_norm and uname_low != target_norm:
                 continue
 
             has_gql = any(
@@ -224,7 +248,8 @@ def extract_ig_profile_from_payloads(
             has_v1 = any(
                 k in node for k in ("media_count", "follower_count", "following_count")
             )
-            if not (has_gql or has_v1):
+            has_bio = "biography" in node
+            if not (has_gql or has_v1 or has_bio):
                 continue
 
             posts_cnt = _safe_int(
@@ -256,25 +281,59 @@ def extract_ig_profile_from_payloads(
             full_name = node.get("full_name") if isinstance(node.get("full_name"), str) else None
             bio = node.get("biography") if isinstance(node.get("biography"), str) else None
 
-            score = sum(
-                x is not None
-                for x in (user_id, full_name, bio, avatar_url, posts_cnt, followers_cnt, following_cnt)
+            parsed_frag = {
+                "username": username,
+                "user_id": user_id,
+                "full_name": full_name,
+                "bio": bio,
+                "avatar_url": avatar_url if isinstance(avatar_url, str) else None,
+                "posts_cnt": posts_cnt,
+                "followers_cnt": followers_cnt,
+                "following_cnt": following_cnt,
+            }
+            score = sum(v is not None for k, v in parsed_frag.items() if k != "username")
+            fragments_by_user.setdefault(uname_low, []).append((score, parsed_frag))
+
+    if not fragments_by_user:
+        return None, None
+
+    best_score = -1
+    best_profile: Profile | None = None
+    best_avatar: str | None = None
+
+    for frags in fragments_by_user.values():
+        frags_sorted = [f for _, f in sorted(frags, key=lambda item: item[0], reverse=True)]
+        merged: dict[str, Any] = {}
+        for field_name in (
+            "username",
+            "user_id",
+            "full_name",
+            "bio",
+            "avatar_url",
+            "posts_cnt",
+            "followers_cnt",
+            "following_cnt",
+        ):
+            merged[field_name] = next(
+                (f[field_name] for f in frags_sorted if f[field_name] is not None),
+                None,
             )
-            if score > best_score:
-                best_score = score
-                best_avatar = avatar_url if isinstance(avatar_url, str) else None
-                best_profile = Profile(
-                    platform="instagram",
-                    user_id=user_id,
-                    username=username,
-                    full_name=full_name,
-                    bio=bio,
-                    counts=ProfileCounts(
-                        posts=posts_cnt,
-                        followers=followers_cnt,
-                        following=following_cnt,
-                    ),
-                )
+        total_score = sum(v is not None for k, v in merged.items() if k != "username")
+        if total_score > best_score:
+            best_score = total_score
+            best_avatar = merged["avatar_url"]
+            best_profile = Profile(
+                platform="instagram",
+                user_id=merged["user_id"],
+                username=merged["username"],
+                full_name=merged["full_name"],
+                bio=merged["bio"],
+                counts=ProfileCounts(
+                    posts=merged["posts_cnt"],
+                    followers=merged["followers_cnt"],
+                    following=merged["following_cnt"],
+                ),
+            )
 
     return best_profile, best_avatar
 
@@ -298,13 +357,86 @@ def _looks_like_media_dict(d: dict[str, Any]) -> bool:
     )
 
 
-def extract_ig_shortcodes_from_payloads(payloads: Sequence[dict[str, Any]]) -> list[str]:
-    """Extract unique ordered post/reel shortcodes from timeline, tagged, or saved payloads."""
+def _walk_shortcode_dicts(
+    obj: Any,
+    inherited_owner: str | None = None,
+) -> Iterator[tuple[dict[str, Any], str | None]]:
+    if isinstance(obj, dict):
+        uname = obj.get("username")
+        if isinstance(uname, str) and uname and any(
+            k in obj
+            for k in (
+                "edge_owner_to_timeline_media",
+                "media_count",
+                "edge_followed_by",
+                "follower_count",
+            )
+        ):
+            inherited_owner = uname.strip().lower()
+        yield obj, inherited_owner
+        for key, val in obj.items():
+            if key in _EXCLUDED_SHORTCODE_CONTAINERS:
+                continue
+            yield from _walk_shortcode_dicts(val, inherited_owner)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk_shortcode_dicts(item, inherited_owner)
+
+
+def _node_explicit_authors(d: dict[str, Any]) -> set[str]:
+    authors: set[str] = set()
+    for key in ("owner", "user"):
+        u = d.get(key)
+        if isinstance(u, dict) and isinstance(u.get("username"), str) and u["username"]:
+            authors.add(u["username"].strip().lower())
+    coauthors = d.get("coauthor_producers")
+    if isinstance(coauthors, list):
+        for entry in coauthors:
+            if isinstance(entry, dict) and isinstance(entry.get("username"), str) and entry["username"]:
+                authors.add(entry["username"].strip().lower())
+    return authors
+
+
+def extract_ig_dom_shortcodes(hrefs: Sequence[str]) -> list[str]:
+    """Extract ordered post/reel shortcodes from `<main>` anchor `href` attributes."""
     seen: set[str] = set()
     ordered: list[str] = []
+    for raw_href in hrefs:
+        if not isinstance(raw_href, str) or not raw_href:
+            continue
+        m = _DOM_HREF_SHORTCODE_RE.match(raw_href.strip())
+        if not m:
+            continue
+        prefix, sc = m.group(1), m.group(2)
+        if prefix and prefix.lower() in _RESERVED_IG_SEGMENTS:
+            continue
+        if sc not in seen:
+            seen.add(sc)
+            ordered.append(sc)
+    return ordered
+
+
+def extract_ig_shortcodes_from_payloads(
+    payloads: Sequence[dict[str, Any]],
+    *,
+    owner_username: str | None = None,
+) -> list[str]:
+    """Extract unique ordered post/reel shortcodes while excluding Home Feed/Explore/Ad preloads."""
+    target = owner_username.strip().lower() if owner_username else None
+    raw_entries: list[tuple[str, str | None]] = []
+    known_authors_by_code: dict[str, set[str]] = {}
 
     for payload in payloads:
-        for d in _walk_dicts(payload):
+        for d, inherited_owner in _walk_shortcode_dicts(payload):
+            if d.get("carousel_parent_id"):
+                continue
+            if (
+                "campaign_id" in d
+                or "dl_source" in d
+                or any(k.startswith("__relay_internal__") for k in d)
+            ):
+                continue
+
             raw_shortcode = d.get("shortcode")
             if isinstance(raw_shortcode, str) and _SHORTCODE_RE.match(raw_shortcode):
                 code = raw_shortcode
@@ -319,9 +451,25 @@ def extract_ig_shortcodes_from_payloads(payloads: Sequence[dict[str, Any]]) -> l
                 else:
                     continue
 
-            if code not in seen:
-                seen.add(code)
-                ordered.append(code)
+            explicit_authors = _node_explicit_authors(d)
+            if explicit_authors:
+                known_authors_by_code.setdefault(code, set()).update(explicit_authors)
+            raw_entries.append((code, inherited_owner))
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for code, inherited_owner in raw_entries:
+        if code in seen:
+            continue
+        if target:
+            known_authors = known_authors_by_code.get(code)
+            if known_authors:
+                if target not in known_authors:
+                    continue
+            elif inherited_owner and inherited_owner != target:
+                continue
+        seen.add(code)
+        ordered.append(code)
 
     return ordered
 
@@ -535,13 +683,44 @@ def _collect_comments_from_media_node(node: dict[str, Any]) -> list[Comment]:
     return [_parse_ig_comment_node(c) for c in raw]
 
 
+def _walk_comment_containers(
+    obj: Any,
+    target_media_id: str | None,
+) -> Iterator[dict[str, Any]]:
+    if isinstance(obj, dict):
+        polaris_id = obj.get("id")
+        if (
+            target_media_id
+            and isinstance(polaris_id, str)
+            and polaris_id.startswith("POLARIS_")
+            and polaris_id != f"POLARIS_{target_media_id}"
+        ):
+            return
+        yield obj
+        for val in obj.values():
+            yield from _walk_comment_containers(val, target_media_id)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk_comment_containers(item, target_media_id)
+
+
 def _collect_paginated_comments(
     payloads: Sequence[dict[str, Any]],
     target_media_id: str | None,
-) -> list[Comment]:
-    parsed: list[Comment] = []
+) -> tuple[list[Comment], dict[str, list[Comment]]]:
+    top_level: list[Comment] = []
+    replies_by_parent: dict[str, list[Comment]] = {}
+
+    def _record_raw_comment(c: dict[str, Any]) -> None:
+        parsed_c = _parse_ig_comment_node(c)
+        parent_id = str(c.get("parent_comment_id") or "")
+        if parent_id:
+            replies_by_parent.setdefault(parent_id, []).append(parsed_c)
+        else:
+            top_level.append(parsed_c)
+
     for payload in payloads:
-        for d in _walk_dicts(payload):
+        for d in _walk_comment_containers(payload, target_media_id):
             # v1 comments endpoint: {"comments": [...], ...}
             if isinstance(d.get("comments"), list) and "shortcode" not in d and "code" not in d:
                 for c in d["comments"]:
@@ -549,14 +728,38 @@ def _collect_paginated_comments(
                         media_id_attr = str(c.get("media_id") or "")
                         if target_media_id and media_id_attr and media_id_attr != target_media_id:
                             continue
-                        parsed.append(_parse_ig_comment_node(c))
+                        _record_raw_comment(c)
 
-            # GraphQL comments connection
+            # GraphQL / 2026 Polaris comments connections
             for key, val in d.items():
-                if "comments__connection" in key or key == "edge_media_to_parent_comment":
+                if (
+                    key in ("comments_connection", "child_comments_connection", "edge_media_to_parent_comment")
+                    or "comments__connection" in key
+                ):
                     for c in _extract_edge_nodes(val):
-                        parsed.append(_parse_ig_comment_node(c))
-    return parsed
+                        _record_raw_comment(c)
+    return top_level, replies_by_parent
+
+
+def _post_belongs_to_user(
+    shortcode: str,
+    post: Post,
+    payloads: Sequence[dict[str, Any]],
+    owner_username: str,
+) -> bool:
+    target = owner_username.strip().lower()
+    if post.author.username and post.author.username.strip().lower() == target:
+        return True
+    explicit_authors: set[str] = set()
+    if post.author.username:
+        explicit_authors.add(post.author.username.strip().lower())
+    for payload in payloads:
+        for d in _walk_dicts(payload):
+            if d.get("shortcode") == shortcode or d.get("code") == shortcode:
+                explicit_authors.update(_node_explicit_authors(d))
+    if not explicit_authors:
+        return True
+    return target in explicit_authors
 
 
 def extract_ig_post_from_payloads(
@@ -686,8 +889,18 @@ def extract_ig_post_from_payloads(
     all_comments: list[Comment] = []
     for node in matching_nodes:
         all_comments.extend(_collect_comments_from_media_node(node))
-    all_comments.extend(_collect_paginated_comments(payloads, pk_id))
+    paginated_top, replies_by_parent = _collect_paginated_comments(payloads, pk_id)
+    all_comments.extend(paginated_top)
     merged_comments = _merge_comments(all_comments)
+    if replies_by_parent:
+        remaining_parent_ids = dict(replies_by_parent)
+        for top_c in merged_comments:
+            if top_c.comment_id and top_c.comment_id in remaining_parent_ids:
+                extra_replies = remaining_parent_ids.pop(top_c.comment_id)
+                top_c.replies = _merge_comments([*top_c.replies, *extra_replies])
+        if remaining_parent_ids:
+            orphan_replies = [r for grp in remaining_parent_ids.values() for r in grp]
+            merged_comments = _merge_comments([*merged_comments, *orphan_replies])
 
     post = Post(
         platform="instagram",
@@ -1044,7 +1257,9 @@ class IgCollector:
         else:
             ctx = getattr(page, "context", None)
             self.request_context = getattr(ctx, "request", None)
-        self.collector = ResponseCollector(url_substrings=("/graphql/query", "/api/v1/"))
+        self.collector = ResponseCollector(
+            url_substrings=("/graphql/query", "/api/graphql", "/graphql", "/api/v1/")
+        )
         self.collector.attach(self.page)
 
     def _safe_body_text(self) -> str:
@@ -1055,6 +1270,17 @@ class IgCollector:
         except Exception:
             pass
         return ""
+
+    def _harvest_dom_shortcodes(self) -> list[str]:
+        try:
+            hrefs = self.page.evaluate(
+                "() => Array.from(document.querySelectorAll('main a[href]'), a => a.getAttribute('href') || '')"
+            )
+            if isinstance(hrefs, list):
+                return extract_ig_dom_shortcodes(hrefs)
+        except Exception:
+            pass
+        return []
 
     def _visit_and_collect(self, url: str) -> list[dict[str, Any]]:
         self.collector.drain()
@@ -1074,7 +1300,14 @@ class IgCollector:
             payloads.extend(resp.payloads)
         return payloads
 
-    def _scroll_and_collect(self, max_scrolls: int, stop_count: int | None = None) -> list[dict[str, Any]]:
+    def _scroll_and_collect(
+        self,
+        max_scrolls: int,
+        stop_count: int | None = None,
+        *,
+        owner_username: str | None = None,
+        dom_shortcodes: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         collected: list[dict[str, Any]] = []
         last_height = -1
         stagnant = 0
@@ -1084,9 +1317,24 @@ class IgCollector:
             check_page_safety(str(getattr(self.page, "url", "")), self._safe_body_text())
             for resp in self.collector.drain():
                 collected.extend(resp.payloads)
+            if dom_shortcodes is not None:
+                for sc in self._harvest_dom_shortcodes():
+                    if sc not in dom_shortcodes:
+                        dom_shortcodes.append(sc)
 
-            if stop_count is not None and len(extract_ig_shortcodes_from_payloads(collected)) >= stop_count:
-                break
+            if stop_count is not None:
+                found = list(
+                    dict.fromkeys(
+                        [
+                            *(dom_shortcodes or []),
+                            *extract_ig_shortcodes_from_payloads(
+                                collected, owner_username=owner_username
+                            ),
+                        ]
+                    )
+                )
+                if len(found) >= stop_count:
+                    break
 
             try:
                 height = self.page.evaluate("() => document.body.scrollHeight")
@@ -1105,7 +1353,52 @@ class IgCollector:
 
         for resp in self.collector.drain():
             collected.extend(resp.payloads)
+        if dom_shortcodes is not None:
+            for sc in self._harvest_dom_shortcodes():
+                if sc not in dom_shortcodes:
+                    dom_shortcodes.append(sc)
         return collected
+
+    def _visit_and_scroll_grid(
+        self,
+        url: str,
+        *,
+        stop_count: int | None = None,
+        owner_username: str | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        payloads = self._visit_and_collect(url)
+        dom_codes = self._harvest_dom_shortcodes()
+        initial_codes = list(
+            dict.fromkeys(
+                [
+                    *dom_codes,
+                    *extract_ig_shortcodes_from_payloads(payloads, owner_username=owner_username),
+                ]
+            )
+        )
+        rem_stop: int | None = None
+        if stop_count is not None:
+            if len(initial_codes) >= stop_count:
+                return payloads, initial_codes
+            rem_stop = stop_count
+        scroll_dom = list(initial_codes)
+        payloads.extend(
+            self._scroll_and_collect(
+                self.config.max_scrolls,
+                stop_count=rem_stop,
+                owner_username=owner_username,
+                dom_shortcodes=scroll_dom,
+            )
+        )
+        combined = list(
+            dict.fromkeys(
+                [
+                    *scroll_dom,
+                    *extract_ig_shortcodes_from_payloads(payloads, owner_username=owner_username),
+                ]
+            )
+        )
+        return payloads, combined
 
     def run_pass_core(self) -> IgCollectSummary:
         """Pass 1: profile index, post details + comments + media/DASH mux, and highlights."""
@@ -1118,14 +1411,15 @@ class IgCollector:
                 shortcodes = list(dict.fromkeys(self.config.shortcodes))
             else:
                 profile_url = f"https://www.instagram.com/{self.config.username}/"
-                profile_payloads = self._visit_and_collect(profile_url)
-                profile_payloads.extend(
-                    self._scroll_and_collect(
-                        self.config.max_scrolls,
-                        stop_count=self.config.limit,
-                    )
+                profile_payloads, shortcodes = self._visit_and_scroll_grid(
+                    profile_url,
+                    stop_count=self.config.limit,
+                    owner_username=self.config.username,
                 )
-                profile, avatar_url = extract_ig_profile_from_payloads(profile_payloads)
+                profile, avatar_url = extract_ig_profile_from_payloads(
+                    profile_payloads,
+                    target_username=self.config.username,
+                )
                 if profile is not None:
                     if avatar_url and self.config.download_avatars and self.request_context is not None:
                         avatar_dest = out / "media" / "profile" / f"{self.config.username}.jpg"
@@ -1139,18 +1433,16 @@ class IgCollector:
                             f"media/instagram/profile/{self.config.username}.jpg"
                         )
                     _write_json_atomic(out / "profile.json", profile.model_dump(mode="json"))
-                shortcodes = extract_ig_shortcodes_from_payloads(profile_payloads)
                 if self.config.limit is None or len(shortcodes) < self.config.limit:
                     reels_url = f"https://www.instagram.com/{self.config.username}/reels/"
                     rem = (self.config.limit - len(shortcodes)) if self.config.limit is not None else None
                     try:
-                        reel_payloads = self._visit_and_collect(reels_url)
-                        reel_payloads.extend(
-                            self._scroll_and_collect(self.config.max_scrolls, stop_count=rem)
+                        _, reel_codes = self._visit_and_scroll_grid(
+                            reels_url,
+                            stop_count=rem,
+                            owner_username=self.config.username,
                         )
-                        shortcodes = list(
-                            dict.fromkeys([*shortcodes, *extract_ig_shortcodes_from_payloads(reel_payloads)])
-                        )
+                        shortcodes = list(dict.fromkeys([*shortcodes, *reel_codes]))
                     except SafetyStopError:
                         raise
                     except Exception:
@@ -1184,6 +1476,12 @@ class IgCollector:
                     post, candidates = extract_ig_post_from_payloads(sc, post_payloads)
                     if post is None:
                         raise RuntimeError(f"Could not extract post payload for shortcode {sc}")
+                    if not self.config.shortcodes and not _post_belongs_to_user(
+                        sc, post, post_payloads, self.config.username
+                    ):
+                        raise RuntimeError(
+                            f"Foreign post {sc} (author={post.author.username}) does not belong to {self.config.username}"
+                        )
 
                     if self.request_context is not None and candidates:
                         saved_media = download_post_media(
@@ -1391,9 +1689,7 @@ class IgCollector:
         summary.processed = 1
         try:
             url = f"https://www.instagram.com/{self.config.username}/{url_suffix}/"
-            payloads = self._visit_and_collect(url)
-            payloads.extend(self._scroll_and_collect(self.config.max_scrolls, stop_count=self.config.limit))
-            shortcodes = extract_ig_shortcodes_from_payloads(payloads)
+            _, shortcodes = self._visit_and_scroll_grid(url, stop_count=self.config.limit)
             if self.config.limit is not None:
                 shortcodes = shortcodes[: self.config.limit]
             _write_json_atomic(out / f"{collect_pass}_index.json", shortcodes)
@@ -1412,11 +1708,7 @@ class IgCollector:
                 shortcodes = list(dict.fromkeys(self.config.shortcodes))
             else:
                 url = f"https://www.instagram.com/{self.config.username}/tagged/"
-                payloads = self._visit_and_collect(url)
-                payloads.extend(
-                    self._scroll_and_collect(self.config.max_scrolls, stop_count=self.config.limit)
-                )
-                shortcodes = extract_ig_shortcodes_from_payloads(payloads)
+                _, shortcodes = self._visit_and_scroll_grid(url, stop_count=self.config.limit)
                 if self.config.limit is not None:
                     shortcodes = shortcodes[: self.config.limit]
                 _write_json_atomic(out / "tagged_index.json", shortcodes)

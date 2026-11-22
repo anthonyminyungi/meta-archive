@@ -267,7 +267,7 @@ class ResponseCollector:
 
     def __init__(
         self,
-        url_substrings: Sequence[str] = ("/graphql/query", "/api/v1/", "/api/graphql/"),
+        url_substrings: Sequence[str] = ("/graphql/query", "/api/graphql", "/graphql", "/api/v1/"),
     ) -> None:
         self.url_substrings = tuple(url_substrings)
         self.responses: list[CapturedResponse] = []

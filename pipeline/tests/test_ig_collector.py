@@ -692,3 +692,405 @@ def test_ig_collector_reels_tab_union_highlight_routes_and_tagged_pass(tmp_path:
     assert tag_post["post_type"] == "tagged"
     assert tag_post["media"][0]["local_path"] == "media/instagram/tagged/SC_TAG_1_01.jpg"
     assert (out_dir / "media" / "tagged" / "SC_TAG_1_01.jpg").exists()
+
+
+def test_2026_polaris_ignores_home_feed_ads_and_collects_api_graphql_and_dom_links(
+    tmp_path: Path,
+) -> None:
+    blobs = {
+        "https://cdn.example.com/dom1.jpg": _jpeg_bytes((11, 22, 33)),
+        "https://cdn.example.com/gql2.jpg": _jpeg_bytes((44, 55, 66)),
+        "https://cdn.example.com/collab3.jpg": _jpeg_bytes((77, 88, 99)),
+    }
+
+    # Preloaded logged-in Home Feed + Explore + Sponsored Ad + unrelated author timeline
+    polluted_preload_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__feed__timeline__connection": {
+                    "edges": [
+                        {
+                            "node": {
+                                "media": {
+                                    "pk": "9001",
+                                    "code": "DgCmAchhdn-",
+                                    "media_type": 1,
+                                    "user": {"username": "sihyunhkim"},
+                                }
+                            }
+                        },
+                        {
+                            "node": {
+                                "explore_story": {
+                                    "media": {
+                                        "pk": "9002",
+                                        "code": "Df1jUKmg2YQ",
+                                        "media_type": 2,
+                                        "user": {"username": "jominnnnnnn"},
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "node": {
+                                "ad": {
+                                    "items": [
+                                        {
+                                            "pk": "9003",
+                                            "code": "DfrjjdCMqmL",
+                                            "media_type": 1,
+                                            "user": {"username": "adobefirefly"},
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                    ]
+                },
+                "xdt_api__v1__profile_timeline": {
+                    "profile_grid_items": [
+                        {
+                            "media": {
+                                "pk": "9004",
+                                "code": "STRANGER_GRID_1",
+                                "media_type": 1,
+                                "user": {"username": "other_person"},
+                            }
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    # 2026 Polaris /api/graphql response for yungis_ profile grid (including a collab post)
+    api_graphql_profile_resp = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__profile_timeline": {
+                    "num_results": 2,
+                    "profile_grid_items": [
+                        {
+                            "media": {
+                                "pk": "5002",
+                                "code": "MY_GQL_2",
+                                "media_type": 1,
+                                "user": {"username": "yungis_"},
+                            }
+                        },
+                        {
+                            "media": {
+                                "pk": "5003",
+                                "code": "MY_COLLAB_3",
+                                "media_type": 1,
+                                "user": {"username": "friend_host"},
+                                "coauthor_producers": [{"id": "10", "username": "yungis_"}],
+                            }
+                        },
+                    ],
+                }
+            }
+        }
+    )
+
+    def _web_info_ssr(pk: str, code: str, author: str, img_url: str, coauthors: list[dict] | None = None) -> str:
+        return json.dumps(
+            {
+                "data": {
+                    "xdt_api__v1__media__shortcode__web_info": {
+                        "items": [
+                            {
+                                "pk": pk,
+                                "id": f"{pk}_10",
+                                "code": code,
+                                "taken_at": 1750000000,
+                                "media_type": 1,
+                                "user": {"pk": "10", "username": author},
+                                "coauthor_producers": coauthors or [],
+                                "caption": {"text": f"내 게시물 {code}"},
+                                "image_versions2": {
+                                    "candidates": [{"url": img_url, "width": 1080, "height": 1080}]
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+
+    routes = {
+        "https://www.instagram.com/yungis_/": (
+            f'<html><main><a href="/yungis_/p/MY_DOM_1/">post1</a></main>'
+            f'<script type="application/json">{polluted_preload_ssr}</script></html>',
+            [
+                _FakeResp(
+                    "https://www.instagram.com/api/graphql",
+                    200,
+                    api_graphql_profile_resp,
+                )
+            ],
+        ),
+        "https://www.instagram.com/yungis_/reels/": ("<html><main></main></html>", []),
+        "https://www.instagram.com/p/MY_DOM_1/": (
+            f'<script type="application/json">{_web_info_ssr("5001", "MY_DOM_1", "yungis_", "https://cdn.example.com/dom1.jpg")}</script>',
+            [],
+        ),
+        "https://www.instagram.com/p/MY_GQL_2/": (
+            f'<script type="application/json">{_web_info_ssr("5002", "MY_GQL_2", "yungis_", "https://cdn.example.com/gql2.jpg")}</script>',
+            [],
+        ),
+        "https://www.instagram.com/p/MY_COLLAB_3/": (
+            f'<script type="application/json">{_web_info_ssr("5003", "MY_COLLAB_3", "friend_host", "https://cdn.example.com/collab3.jpg", [{"username": "yungis_"}])}</script>',
+            [],
+        ),
+    }
+
+    class _DomAwareFakePage(_FakeIgPage):
+        def evaluate(self, script: str):
+            if "querySelectorAll" in script and "yungis_" in self.url and "/reels/" not in self.url:
+                return ["/yungis_/p/MY_DOM_1/", "/explore/"]
+            return 1000
+
+    out_dir = tmp_path / "ig_2026"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = IgCollector(
+        _DomAwareFakePage(routes),
+        IgCollectConfig(username="yungis_", output_dir=out_dir, limit=3, cooldown=cooldown),
+        request_context=_FakeRequestContext(blobs),
+    ).run_pass_core()
+
+    saved_index = json.loads((out_dir / "index_shortcodes.json").read_text(encoding="utf-8"))
+    assert saved_index == ["MY_DOM_1", "MY_GQL_2", "MY_COLLAB_3"]
+    assert summary.succeeded == 3
+    assert (out_dir / "posts" / "MY_DOM_1.json").exists()
+    assert (out_dir / "posts" / "MY_GQL_2.json").exists()
+    assert (out_dir / "posts" / "MY_COLLAB_3.json").exists()
+    assert not (out_dir / "posts" / "DgCmAchhdn-.json").exists()
+
+
+def test_2026_polaris_comments_media_single_underscore_and_parent_comment_id_replies() -> None:
+    media_payload = {
+        "data": {
+            "xdt_api__v1__media__shortcode__web_info": {
+                "items": [
+                    {
+                        "pk": "4032284358781134352",
+                        "id": "4032284358781134352_1001",
+                        "code": "SC_2026_CMT",
+                        "taken_at": 1760000000,
+                        "media_type": 1,
+                        "user": {"pk": "1001", "username": "yungis_"},
+                        "image_versions2": {
+                            "candidates": [{"url": "https://cdn.example.com/p.jpg", "width": 1080, "height": 1080}]
+                        },
+                        "preview_comments": [],
+                    }
+                ]
+            }
+        }
+    }
+    polaris_comments_payload = {
+        "data": {
+            "comments_media": {
+                "__typename": "XDTCommentsMedia",
+                "id": "POLARIS_4032284358781134352",
+                "comments_connection": {
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "XIGComment",
+                                "pk": "c_top_1",
+                                "id": "c_top_1",
+                                "created_at": 1760000100,
+                                "text": "첫 댓글!",
+                                "comment_like_count": 3,
+                                "parent_comment_id": None,
+                                "child_comment_count": 1,
+                                "user": {"pk": "2001", "username": "friend_1", "full_name": "친구1"},
+                            }
+                        },
+                        {
+                            "node": {
+                                "__typename": "XIGComment",
+                                "pk": "c_top_2",
+                                "id": "c_top_2",
+                                "created_at": 1760000300,
+                                "text": "두번째 댓글!",
+                                "comment_like_count": 0,
+                                "parent_comment_id": None,
+                                "child_comment_count": 0,
+                                "user": {"pk": "2002", "username": "friend_2"},
+                            }
+                        },
+                    ]
+                },
+            }
+        }
+    }
+    polaris_child_replies_payload = {
+        "data": {
+            "xdt_api__v1__media__media_id__comments__parent_comment_id__child_comments__connection": {
+                "edges": [
+                    {
+                        "node": {
+                            "__typename": "XIGComment",
+                            "pk": "c_reply_1",
+                            "id": "c_reply_1",
+                            "created_at": 1760000200,
+                            "text": "답글입니다!",
+                            "comment_like_count": 1,
+                            "parent_comment_id": "c_top_1",
+                            "user": {"pk": "1001", "username": "yungis_"},
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    unrelated_media_comments = {
+        "data": {
+            "comments_media": {
+                "__typename": "XDTCommentsMedia",
+                "id": "POLARIS_9999999999999999999",
+                "comments_connection": {
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "XIGComment",
+                                "pk": "c_foreign",
+                                "id": "c_foreign",
+                                "created_at": 1760000500,
+                                "text": "다른 글 댓글",
+                                "parent_comment_id": None,
+                                "user": {"pk": "9999", "username": "stranger"},
+                            }
+                        }
+                    ]
+                },
+            }
+        }
+    }
+
+    post, _ = extract_ig_post_from_payloads(
+        "SC_2026_CMT",
+        [media_payload, polaris_comments_payload, polaris_child_replies_payload, unrelated_media_comments],
+    )
+    assert post is not None
+    assert [c.comment_id for c in post.comments] == ["c_top_1", "c_top_2"]
+    assert post.comments[0].text == "첫 댓글!"
+    assert post.comments[0].like_count == 3
+    assert [r.comment_id for r in post.comments[0].replies] == ["c_reply_1"]
+    assert post.comments[0].replies[0].text == "답글입니다!"
+
+
+def test_extract_ig_profile_filters_target_username_and_merges_fragments() -> None:
+    celebrity_preload = {
+        "user": {
+            "id": "8888",
+            "username": "celeb_account",
+            "full_name": "유명인",
+            "biography": "광고 계정",
+            "profile_pic_url_hd": "https://cdn.example.com/celeb.jpg",
+            "media_count": 999,
+            "follower_count": 500000,
+            "following_count": 10,
+        }
+    }
+    yungis_bio_fragment = {
+        "data": {
+            "id": "1621016495",
+            "username": "yungis_",
+            "full_name": "민윤기",
+            "biography": "💻",
+            "profile_pic_url_hd": "https://cdn.example.com/yungis.jpg",
+        }
+    }
+    yungis_counts_fragment = {
+        "user": {
+            "pk": "1621016495",
+            "username": "yungis_",
+            "follower_count": 107,
+            "following_count": 151,
+            "media_count": 200,
+        }
+    }
+
+    profile, avatar_url = extract_ig_profile_from_payloads(
+        [celebrity_preload, yungis_bio_fragment, yungis_counts_fragment],
+        target_username="yungis_",
+    )
+    assert profile is not None
+    assert profile.username == "yungis_"
+    assert profile.full_name == "민윤기"
+    assert profile.bio == "💻"
+    assert profile.counts.posts == 200
+    assert profile.counts.followers == 107
+    assert profile.counts.following == 151
+    assert avatar_url == "https://cdn.example.com/yungis.jpg"
+
+
+def test_shortcode_extraction_skips_carousel_child_codes_and_relay_variables() -> None:
+    payloads = [
+        {
+            "variables": {
+                "shortcode": "FOREIGN_POST",
+                "__relay_internal__pv__PolarisThreadsStyleCommentsEnabledrelayprovider": True,
+            },
+            "tracking": {
+                "shortcode": "FOREIGN_POST",
+                "campaign_id": None,
+                "dl_source": None,
+            },
+            "data": {
+                "xdt_api__v1__media__shortcode__web_info": {
+                    "items": [
+                        {
+                            "pk": "900",
+                            "code": "FOREIGN_POST",
+                            "media_type": 8,
+                            "user": {"username": "stranger_user"},
+                            "carousel_media": [
+                                {
+                                    "id": "900_1",
+                                    "carousel_parent_id": "900",
+                                    "code": "FOREIGN_SLIDE_1",
+                                    "image_versions2": {"candidates": []},
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "xdt_api__v1__profile_timeline": {
+                    "profile_grid_items": [
+                        {
+                            "media": {
+                                "pk": "500",
+                                "code": "MY_CAROUSEL",
+                                "media_type": 8,
+                                "user": {"username": "yungis_"},
+                                "carousel_media": [
+                                    {
+                                        "id": "500_1",
+                                        "carousel_parent_id": "500",
+                                        "code": "MY_SLIDE_CHILD_1",
+                                        "image_versions2": {"candidates": []},
+                                    },
+                                    {
+                                        "id": "500_2",
+                                        "carousel_parent_id": "500",
+                                        "code": "MY_SLIDE_CHILD_2",
+                                        "image_versions2": {"candidates": []},
+                                    },
+                                ],
+                            }
+                        }
+                    ]
+                },
+            },
+        }
+    ]
+
+    assert extract_ig_shortcodes_from_payloads(payloads, owner_username="yungis_") == ["MY_CAROUSEL"]
+    assert extract_ig_shortcodes_from_payloads(payloads) == ["FOREIGN_POST", "MY_CAROUSEL"]
+
+
