@@ -1,6 +1,6 @@
-/** Instagram archive view: gradient profile/highlights, 3-col hover grid, feed cards, stories grid. */
+/** Instagram archive view: clean profile, highlights, borderless 3-col hover grid with prefetch, feed cards, stories. */
 
-import { api, mediaUrl } from "../api.js?v=2";
+import { api, mediaUrl } from "../api.js?v=3";
 import {
   avatarEl,
   clear,
@@ -11,12 +11,15 @@ import {
   personButton,
   renderCollapsibleText,
   safeExternalHref,
-} from "../dom.js?v=2";
-import { renderCarousel } from "../components/carousel.js?v=2";
+  skeletonCards,
+  skeletonGrid,
+} from "../dom.js?v=3";
+import { icon } from "../icons.js?v=3";
+import { renderCarousel } from "../components/carousel.js?v=3";
 
 export async function renderInstagramView(container, ctx) {
   clear(container);
-  container.appendChild(el("div", { className: "loading-box" }, "Instagram 아카이브 불러오는 중..."));
+  container.appendChild(skeletonGrid(9));
 
   const state = {
     viewMode: "grid", // grid | feed
@@ -83,7 +86,7 @@ export async function renderInstagramView(container, ctx) {
                 }),
                 el(
                   "div",
-                  { style: "font-size:0.76rem;color:var(--text-muted);" },
+                  { className: "tabular", style: "font-size:0.76rem;color:var(--text-muted);" },
                   `${c.relation}${c.connected_at ? ` · ${formatShortDate(c.connected_at, c.timestamp_unix)}` : ""}`
                 )
               )
@@ -123,6 +126,7 @@ export async function renderInstagramView(container, ctx) {
                 src,
                 alt: s.highlight_title || "story",
                 loading: "lazy",
+                decoding: "async",
                 style: "cursor:zoom-in;",
                 onClick: () => ctx.openLightbox(allMedia, Math.max(0, lbIdx)),
               });
@@ -133,11 +137,11 @@ export async function renderInstagramView(container, ctx) {
             { className: "card story-card" },
             el(
               "div",
-              { className: "post-meta-row", style: "margin-top:0;font-size:0.75rem;" },
-              el("span", { className: "pill pill-ig" }, formatDate(s.created_at, s.timestamp_unix)),
-              s.highlight_title ? el("span", { className: "pill" }, s.highlight_title) : null,
-              s.location_name ? el("span", { className: "pill" }, `📍 ${s.location_name}`) : null,
-              s.likes_count > 0 ? el("span", { className: "pill" }, `♥ ${s.likes_count}`) : null
+              { className: "post-meta-row tabular", style: "margin-top:0;font-size:0.75rem;" },
+              el("span", { className: "meta-chip" }, formatDate(s.created_at, s.timestamp_unix)),
+              s.highlight_title ? el("span", { className: "meta-chip" }, s.highlight_title) : null,
+              s.location_name ? el("span", { className: "inline-meta" }, icon("pin", 12), s.location_name) : null,
+              s.likes_count > 0 ? el("span", { className: "inline-meta" }, icon("heart", 12), String(s.likes_count)) : null
             ),
             mediaEl,
             s.caption ? el("div", { style: "font-size:0.84rem;white-space:pre-wrap;" }, s.caption) : null
@@ -149,7 +153,7 @@ export async function renderInstagramView(container, ctx) {
   }
 
   function openActivitiesModal() {
-    ctx.modal.openCustom("Instagram 내 활동 (내 댓글 · 저장됨 · 리포스트)", async (body) => {
+    ctx.modal.openCustom("Instagram 내 활동", async (body) => {
       let kind = "";
       let q = "";
       clear(body);
@@ -167,7 +171,7 @@ export async function renderInstagramView(container, ctx) {
 
       async function reload() {
         clear(listEl);
-        listEl.appendChild(el("div", { className: "loading-box" }, "불러오는 중..."));
+        listEl.appendChild(skeletonCards(2));
         const res = await api.activities({
           platform: "instagram",
           kind: kind || undefined,
@@ -187,10 +191,10 @@ export async function renderInstagramView(container, ctx) {
               { className: "card" },
               el(
                 "div",
-                { className: "post-meta-row", style: "margin-top:0;margin-bottom:6px;" },
-                el("span", { className: "pill pill-ig" }, a.kind),
-                el("span", { className: "pill" }, formatDate(a.created_at, a.timestamp_unix)),
-                a.target_author ? el("span", { className: "pill" }, `@${a.target_author}`) : null
+                { className: "post-meta-row tabular", style: "margin-top:0;margin-bottom:6px;" },
+                el("span", { className: "meta-chip" }, a.kind),
+                el("span", null, formatDate(a.created_at, a.timestamp_unix)),
+                a.target_author ? el("span", { className: "meta-chip" }, `@${a.target_author}`) : null
               ),
               a.text ? el("div", { className: "post-caption" }, a.text) : null,
               href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", style: "font-size:0.82rem;word-break:break-all;" }, a.url) : null
@@ -214,44 +218,47 @@ export async function renderInstagramView(container, ctx) {
   }
 
   // Profile Header
-  const displayTitle = profile
-    ? `${profile.full_name || profile.username || "Instagram"}${profile.username ? ` (@${profile.username})` : ""}`
-    : "Instagram Archive";
+  const displayName = profile ? profile.full_name || profile.username || "Instagram" : "Instagram Archive";
+  const handleText = profile && profile.username ? `@${profile.username}` : null;
 
   root.appendChild(
     el(
       "section",
-      { className: "card profile-header" },
-      el("div", { className: "avatar-ring-ig" }, avatarEl(profile ? profile.avatar_local_path : null, displayTitle, "lg")),
+      { className: "profile-header" },
+      el("div", { className: "avatar-ring-ig" }, avatarEl(profile ? profile.avatar_local_path : null, displayName, "lg")),
       el(
         "div",
         { className: "profile-meta" },
         el(
           "div",
           { className: "profile-title-row" },
-          el("h1", null, displayTitle),
-          el("span", { className: "pill pill-ig" }, `스토리 ${igStats.stories || 0}`),
-          el("span", { className: "pill" }, `댓글 ${igStats.comments || 0}`)
+          el("h1", null, displayName),
+          handleText ? el("span", { className: "profile-handle" }, handleText) : null
         ),
         el(
           "div",
-          { className: "profile-stats" },
-          el("span", null, "게시물", el("span", { className: "profile-stat-val" }, String(igStats.posts || 0))),
+          { className: "profile-stats tabular" },
+          el("span", { className: "profile-stat" }, "게시물", el("strong", null, (igStats.posts || 0).toLocaleString())),
           el(
             "button",
-            { type: "button", className: "btn-link", onClick: () => openConnectionsModal("follower") },
-            `팔로워 ${(profile && profile.counts && profile.counts.followers) ?? "목록"}`
+            { type: "button", className: "profile-stat-btn", onClick: () => openConnectionsModal("follower") },
+            "팔로워",
+            el("strong", null, String((profile && profile.counts && profile.counts.followers) ?? "목록"))
           ),
           el(
             "button",
-            { type: "button", className: "btn-link", onClick: () => openConnectionsModal("following") },
-            `팔로잉 ${(profile && profile.counts && profile.counts.following) ?? "목록"}`
+            { type: "button", className: "profile-stat-btn", onClick: () => openConnectionsModal("following") },
+            "팔로잉",
+            el("strong", null, String((profile && profile.counts && profile.counts.following) ?? "목록"))
           ),
+          el("span", { className: "profile-stat" }, "스토리", el("strong", null, (igStats.stories || 0).toLocaleString())),
+          el("span", { className: "profile-stat" }, "댓글", el("strong", null, (igStats.comments || 0).toLocaleString())),
           (igStats.activities || 0) > 0
             ? el(
                 "button",
-                { type: "button", className: "btn-link", onClick: openActivitiesModal },
-                `내 댓글·저장됨 (${igStats.activities})`
+                { type: "button", className: "profile-stat-btn", onClick: openActivitiesModal },
+                "내 활동",
+                el("strong", null, (igStats.activities || 0).toLocaleString())
               )
             : null
         ),
@@ -271,8 +278,8 @@ export async function renderInstagramView(container, ctx) {
           className: "highlight-btn",
           onClick: () => openStoriesModal(null, "전체 스토리"),
         },
-        el("span", { className: "highlight-ring" }, el("span", { className: "highlight-ring-inner" }, el("strong", null, "ALL"))),
-        el("span", { className: "highlight-label" }, `스토리 (${igStats.stories || 0})`)
+        el("span", { className: "highlight-ring" }, el("span", { className: "highlight-ring-inner" }, el("strong", { style: "font-size:0.74rem;letter-spacing:0.04em;" }, "ALL"))),
+        el("span", { className: "highlight-label tabular" }, `스토리 ${igStats.stories || 0}`)
       )
     );
     for (const h of highlightsRes.items) {
@@ -292,11 +299,11 @@ export async function renderInstagramView(container, ctx) {
               "span",
               { className: "highlight-ring-inner" },
               coverSrc
-                ? el("img", { src: coverSrc, alt: h.highlight_title, loading: "lazy" })
+                ? el("img", { src: coverSrc, alt: h.highlight_title, loading: "lazy", decoding: "async" })
                 : el("strong", null, (h.highlight_title || "HL").slice(0, 2))
             )
           ),
-          el("span", { className: "highlight-label", title: h.highlight_title }, `${h.highlight_title} (${h.count})`)
+          el("span", { className: "highlight-label", title: `${h.highlight_title} (${h.count})` }, h.highlight_title)
         )
       );
     }
@@ -312,9 +319,9 @@ export async function renderInstagramView(container, ctx) {
     el("option", { value: "archived" }, "보관됨 (Archived)"),
     el("option", { value: "tagged" }, "태그된 게시물 (Tagged)")
   );
-  const gridBtn = el("button", { type: "button", className: "btn btn-primary" }, "3열 그리드");
-  const feedBtn = el("button", { type: "button", className: "btn" }, "피드 보기");
-  const countPill = el("span", { className: "pill" }, "0건");
+  const gridBtn = el("button", { type: "button", className: "seg-btn active" }, icon("grid", 14), "그리드");
+  const feedBtn = el("button", { type: "button", className: "seg-btn" }, icon("list", 14), "피드");
+  const countLabel = el("span", { className: "toolbar-count tabular" }, "");
 
   const postsHost = el("div");
   const loadMoreWrap = el("div", { className: "load-more-wrap" });
@@ -325,8 +332,8 @@ export async function renderInstagramView(container, ctx) {
     el(
       "div",
       { className: "toolbar" },
-      el("div", { className: "toolbar-group" }, filterSelect, countPill),
-      el("div", { className: "toolbar-group" }, gridBtn, feedBtn)
+      el("div", { className: "toolbar-group" }, filterSelect, countLabel),
+      el("div", { className: "segmented-control" }, gridBtn, feedBtn)
     )
   );
   root.appendChild(postsHost);
@@ -334,11 +341,11 @@ export async function renderInstagramView(container, ctx) {
 
   function renderPosts() {
     clear(postsHost);
-    countPill.textContent = `${state.items.length} / ${state.total}건`;
+    countLabel.textContent = `${state.items.length.toLocaleString()} / ${state.total.toLocaleString()}`;
     loadMoreWrap.classList.toggle("hidden", state.items.length >= state.total);
 
-    gridBtn.className = `btn${state.viewMode === "grid" ? " btn-primary" : ""}`;
-    feedBtn.className = `btn${state.viewMode === "feed" ? " btn-primary" : ""}`;
+    gridBtn.classList.toggle("active", state.viewMode === "grid");
+    feedBtn.classList.toggle("active", state.viewMode === "feed");
 
     if (state.items.length === 0) {
       postsHost.appendChild(el("div", { className: "empty-box" }, "표시할 Instagram 게시물이 없습니다."));
@@ -354,16 +361,21 @@ export async function renderInstagramView(container, ctx) {
         if (src && isVideoMedia(primary)) {
           thumb = el("video", { src, muted: true, preload: "metadata" });
         } else if (src) {
-          thumb = el("img", { src, alt: post.caption ? post.caption.slice(0, 40) : post.post_id, loading: "lazy" });
+          thumb = el("img", {
+            src,
+            alt: post.caption ? post.caption.slice(0, 40) : post.post_id,
+            loading: "lazy",
+            decoding: "async",
+          });
         } else {
           thumb = el("div", { className: "ig-tile-text-only" }, (post.caption || post.post_id).slice(0, 60));
         }
 
         const rightBadge =
           (post.media || []).length > 1
-            ? el("span", { className: "tile-badge" }, `❐ ${post.media.length}`)
+            ? el("span", { className: "tile-badge tabular" }, icon("layers", 12), String(post.media.length))
             : isVideoMedia(primary)
-              ? el("span", { className: "tile-badge" }, "▶")
+              ? el("span", { className: "tile-badge" }, icon("play", 11))
               : null;
 
         grid.appendChild(
@@ -372,6 +384,7 @@ export async function renderInstagramView(container, ctx) {
             {
               type: "button",
               className: "ig-tile",
+              onPointerenter: () => api.prefetchPost(post.post_id),
               onClick: () => ctx.openPost(post.post_id),
             },
             thumb,
@@ -383,8 +396,13 @@ export async function renderInstagramView(container, ctx) {
             ),
             el(
               "div",
-              { className: "ig-tile-hover" },
-              el("span", null, `♥ ${post.likes_count}   💬 ${post.comments_count}`),
+              { className: "ig-tile-hover tabular" },
+              el(
+                "div",
+                { className: "ig-tile-hover-metrics" },
+                el("span", { className: "inline-meta" }, icon("heartFilled", 14), String(post.likes_count || 0)),
+                el("span", { className: "inline-meta" }, icon("comment", 14), String(post.comments_count || 0))
+              ),
               el("small", null, formatShortDate(post.created_at, post.timestamp_unix))
             )
           )
@@ -414,15 +432,17 @@ export async function renderInstagramView(container, ctx) {
                 { className: "post-author-meta" },
                 el(
                   "div",
-                  { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap;" },
+                  { className: "author-name-line" },
                   personButton(post.author_username, post.author_name, ctx.openPerson),
                   post.is_archived ? el("span", { className: "pill pill-warn" }, "보관됨") : null
                 ),
                 el(
                   "div",
-                  { className: "post-author-sub" },
+                  { className: "post-author-sub tabular" },
                   el("span", null, formatDate(post.created_at, post.timestamp_unix)),
-                  post.location && post.location.name ? el("span", null, `· 📍 ${post.location.name}`) : null
+                  post.location && post.location.name
+                    ? el("span", { className: "inline-meta" }, icon("pin", 12), post.location.name)
+                    : null
                 )
               )
             )
@@ -432,11 +452,12 @@ export async function renderInstagramView(container, ctx) {
           el(
             "div",
             { className: "post-footer-bar" },
-            el("span", { className: "pill pill-ig" }, `♥ 좋아요 ${post.likes_count}`),
+            el("span", { className: "stat-chip tabular" }, icon("heart", 13), `좋아요 ${(post.likes_count || 0).toLocaleString()}`),
             el(
               "button",
-              { type: "button", className: "btn btn-sm", onClick: () => ctx.openPost(post.post_id) },
-              `상세 & 댓글 ${post.comments_count} 보기`
+              { type: "button", className: "btn btn-sm btn-ghost tabular", onClick: () => ctx.openPost(post.post_id) },
+              icon("comment", 14),
+              `댓글 ${post.comments_count || 0}`
             )
           )
         )

@@ -918,6 +918,17 @@ def test_static_spa_serves_and_has_zero_external_cdns(
 
     app_js = client.get("/static/js/app.js")
     assert app_js.status_code == 200
+    assert app_js.headers.get("cache-control") == "no-cache"
+
+    font_res = client.get("/static/fonts/PretendardVariable.woff2")
+    assert font_res.status_code == 200
+    assert "immutable" in (font_res.headers.get("cache-control") or "")
+    assert font_res.content[:4] == b"wOF2"
+
+    media_res = client.get("/media/instagram/posts/jeju.jpg")
+    assert media_res.status_code == 200
+    assert "immutable" in (media_res.headers.get("cache-control") or "")
+    assert "etag" in media_res.headers
 
     static_dir = Path(__file__).resolve().parents[1] / "src" / "meta_archive_viewer" / "static"
     for asset in static_dir.rglob("*"):
@@ -1104,41 +1115,60 @@ def test_extensionless_magic_mime_activities_tail_messages_group_posts_and_js_fi
 
 
 def test_avatar_enrichment_thread_sorting_preview_in_thread_search_and_media_only(
-    sample_archive: Path,
+    tmp_path: Path,
 ) -> None:
-    app = create_app(sample_archive)
-    with TestClient(app) as client:
+    archive_dir = _build_fixture_archive(tmp_path / "avatar_enrich")
+    (archive_dir / "media" / "instagram" / "avatars" / "friend_one.jpg").write_bytes(
+        b"\xff\xd8\xff\xe0" + b"F" * 16
+    )
+    conn = sqlite3.connect(archive_dir / "archive.sqlite")
+    conn.execute(
+        "UPDATE connections SET avatar_local_path = ? WHERE username = ?",
+        ("media/instagram/avatars/friend_one.jpg", "friend_one"),
+    )
+    conn.execute(
+        """
+        INSERT INTO profiles (platform, user_id, username, full_name, bio, avatar_local_path, counts_json, exported_at)
+        VALUES ('facebook', 'fb_u1', 'fb_me', '홍길동', '', NULL, '{}', '2026-11-20T10:00:00+09:00')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with TestClient(create_app(archive_dir)) as client:
         # 1. Post list and detail include resolved author/comment/like avatars
         posts = client.get("/api/posts", params={"platform": "instagram"}).json()
-        assert posts["items"][0]["author_avatar_local_path"] == "media/instagram/profile/me.jpg"
+        assert posts["items"][0]["author_avatar_local_path"] == "media/instagram/avatars/me.jpg"
 
         detail = client.get("/api/posts/ig:AAA111").json()
-        assert detail["author_avatar_local_path"] == "media/instagram/profile/me.jpg"
-        assert detail["comments"][0]["author_avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
-        assert detail["likes_users"][0]["avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
+        assert detail["author_avatar_local_path"] == "media/instagram/avatars/me.jpg"
+        assert detail["comments"][0]["author_avatar_local_path"] == "media/instagram/avatars/friend_one.jpg"
+        assert detail["likes_users"][0]["avatar_local_path"] == "media/instagram/avatars/friend_one.jpg"
 
         # 2. Thread list resolves partner avatar, last_message_preview, and sort=messages
         threads = client.get("/api/threads", params={"sort": "messages"}).json()
-        assert threads["total"] >= 2
-        ig_thread = next(t for t in threads["items"] if t["thread_id"] == "ig_dm_1")
-        assert ig_thread["avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
-        assert "민수" in ig_thread["last_message_preview"] or "제주" in ig_thread["last_message_preview"]
+        assert threads["total"] == 1
+        fb_thread = threads["items"][0]
+        assert fb_thread["thread_id"] == "fb/e2ee:thread_1"
+        assert fb_thread["avatar_local_path"] == "media/instagram/avatars/friend_one.jpg"
+        assert "사진" in fb_thread["last_message_preview"]
 
         # 3. Thread messages include owner_names, sender_avatar_local_path, in-thread q, and media_only
-        msgs = client.get("/api/threads/ig_dm_1/messages").json()
+        msgs = client.get("/api/threads/fb/e2ee:thread_1/messages").json()
         assert "홍길동" in msgs["thread"]["owner_names"]
-        assert "my_ig" in msgs["thread"]["owner_names"]
-        partner_msg = next(m for m in msgs["items"] if m["sender"] == "김민수")
-        assert partner_msg["sender_avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
+        assert "fb_me" in msgs["thread"]["owner_names"]
+        partner_msg = next(m for m in msgs["items"] if m["sender"] == "김철수")
+        assert partner_msg["sender_avatar_local_path"] == "media/instagram/avatars/friend_one.jpg"
 
-        q_res = client.get("/api/threads/ig_dm_1/messages", params={"q": "제주"}).json()
-        assert q_res["total"] >= 1
+        q_res = client.get("/api/threads/fb/e2ee:thread_1/messages", params={"q": "제주"}).json()
+        assert q_res["total"] == 1
         assert all("제주" in (m["text"] + " " + (m["sender"] or "")) for m in q_res["items"])
 
-        media_res = client.get("/api/threads/ig_dm_1/messages", params={"media_only": "true"}).json()
+        media_res = client.get("/api/threads/fb/e2ee:thread_1/messages", params={"media_only": "true"}).json()
+        assert media_res["total"] == 1
         assert all(len(m["media"]) > 0 for m in media_res["items"])
 
         # 4. Person activity includes resolved avatar_local_path
-        person = client.get("/api/people/minsu").json()
-        assert person["avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
+        person = client.get("/api/people/friend_one").json()
+        assert person["avatar_local_path"] == "media/instagram/avatars/friend_one.jpg"
 

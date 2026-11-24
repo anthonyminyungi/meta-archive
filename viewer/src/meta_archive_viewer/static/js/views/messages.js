@@ -1,6 +1,6 @@
 /** Authentic Messenger / IG DM inbox and chat viewer with left/right bubbles, avatars, in-thread search, and media gallery. */
 
-import { api, mediaUrl } from "../api.js?v=2";
+import { api, mediaUrl } from "../api.js?v=3";
 import {
   avatarEl,
   clear,
@@ -17,7 +17,8 @@ import {
   isVideoMedia,
   personButton,
   safeExternalHref,
-} from "../dom.js?v=2";
+} from "../dom.js?v=3";
+import { icon } from "../icons.js?v=3";
 
 export async function renderMessagesView(container, ctx, initialThreadId = null, initialTs = null) {
   clear(container);
@@ -56,12 +57,12 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
     className: "input",
     placeholder: "대화방 제목 / 참여자 검색...",
   });
-  const threadsCountEl = el("div", { style: "font-size:0.76rem;color:var(--text-muted);padding:0 2px;" }, "");
+  const threadsCountEl = el("div", { className: "tabular", style: "font-size:0.75rem;color:var(--text-muted);padding:0 2px;" }, "");
   const threadsListEl = el("div", { className: "thread-list" });
   const chatPane = el(
     "section",
     { className: "card chat-pane" },
-    el("div", { className: "empty-box", style: "margin:auto;" }, "좌측에서 대화방을 선택하세요.")
+    el("div", { className: "empty-box", style: "margin:auto;border:none;background:transparent;" }, "좌측에서 대화방을 선택하세요.")
   );
 
   const shell = el(
@@ -85,7 +86,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
 
   async function loadThreads() {
     clear(threadsListEl);
-    threadsListEl.appendChild(el("div", { className: "loading-box" }, "대화 목록 불러오는 중..."));
+    threadsListEl.appendChild(el("div", { className: "loading-box", style: "border:none;" }, "대화 목록 불러오는 중..."));
     const res = await api.threads({
       platform: state.platform || undefined,
       sort: state.sort,
@@ -95,7 +96,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
     threadsCountEl.textContent = `대화방 ${res.total.toLocaleString()}개`;
     clear(threadsListEl);
     if (res.items.length === 0) {
-      threadsListEl.appendChild(el("div", { className: "empty-box" }, "저장된 대화방이 없습니다."));
+      threadsListEl.appendChild(el("div", { className: "empty-box", style: "border:none;" }, "저장된 대화방이 없습니다."));
       return;
     }
 
@@ -136,7 +137,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
             { className: "thread-item-top" },
             el("span", { className: "thread-item-title" }, t.title || t.thread_id),
             t.last_timestamp_unix
-              ? el("span", { className: "thread-item-time" }, formatShortDate(null, t.last_timestamp_unix))
+              ? el("span", { className: "thread-item-time tabular" }, formatShortDate(null, t.last_timestamp_unix))
               : null
           ),
           t.last_message_preview
@@ -144,10 +145,10 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
             : null,
           el(
             "div",
-            { className: "thread-item-meta" },
+            { className: "thread-item-meta tabular" },
             el("span", null, `${(t.message_count || 0).toLocaleString()}건`),
-            t.is_e2ee ? el("span", { className: "pill pill-accent" }, "E2EE") : null,
-            t.is_pending ? el("span", { className: "pill" }, "요청함") : null
+            t.is_e2ee ? el("span", { className: "meta-chip" }, "E2EE") : null,
+            t.is_pending ? el("span", { className: "meta-chip" }, "요청함") : null
           )
         )
       );
@@ -190,13 +191,14 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
             "button",
             {
               type: "button",
-              className: "btn btn-sm",
+              className: "icon-btn",
+              "aria-label": "검색 닫기",
               onClick: () => {
                 state.activeSubpanel = null;
                 renderSubpanel(threadId, hostEl);
               },
             },
-            "닫기"
+            icon("close", 15)
           )
         ),
         hitsEl
@@ -217,7 +219,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
           hitsEl.appendChild(el("div", { style: "font-size:0.82rem;color:var(--text-muted);" }, `'${q}' 일치 결과 없음`));
           return;
         }
-        hitsEl.appendChild(el("div", { style: "font-size:0.78rem;color:var(--text-muted);" }, `일치 ${res.total.toLocaleString()}건 (최근 ${res.items.length}건 표시)`));
+        hitsEl.appendChild(el("div", { className: "tabular", style: "font-size:0.78rem;color:var(--text-muted);" }, `일치 ${res.total.toLocaleString()}건 (최근 ${res.items.length}건 표시)`));
         for (const hit of res.items) {
           hitsEl.appendChild(
             el(
@@ -233,7 +235,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
               },
               el(
                 "div",
-                { style: "display:flex;justify-content:space-between;gap:8px;font-size:0.75rem;color:var(--text-muted);" },
+                { className: "tabular", style: "display:flex;justify-content:space-between;gap:8px;font-size:0.75rem;color:var(--text-muted);" },
                 el("strong", { style: "color:var(--text);" }, hit.sender || "알 수 없음"),
                 el("span", null, formatDate(hit.created_at, hit.timestamp_unix))
               ),
@@ -262,13 +264,14 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
           "button",
           {
             type: "button",
-            className: "btn btn-sm",
+            className: "icon-btn",
+            "aria-label": "미디어 닫기",
             onClick: () => {
               state.activeSubpanel = null;
               renderSubpanel(threadId, hostEl);
             },
           },
-          "닫기"
+          icon("close", 15)
         )
       );
       const galHost = el("div", { style: "font-size:0.82rem;color:var(--text-muted);" }, "불러오는 중...");
@@ -298,7 +301,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
           } else if (isDocumentMedia(med)) {
             const fname = (med.local_path || "파일").split("/").pop();
             grid.appendChild(
-              el("a", { className: "pill", href: src, target: "_blank", rel: "noopener noreferrer" }, `📎 ${fname}`)
+              el("a", { className: "meta-chip", href: src, target: "_blank", rel: "noopener noreferrer" }, icon("file", 12), fname)
             );
           } else if (isVideoMedia(med)) {
             const idx = lightboxItems.indexOf(med);
@@ -319,13 +322,14 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
                 src,
                 alt: "shared photo",
                 loading: "lazy",
+                decoding: "async",
                 onClick: () => ctx.openLightbox(lightboxItems, Math.max(0, idx)),
               })
             );
           }
         }
         galHost.append(
-          el("div", { style: "font-size:0.76rem;color:var(--text-muted);margin-bottom:6px;" }, `최근 첨부 메시지 ${res.items.length} / ${res.total}건 (${allMedia.length}개 파일)`),
+          el("div", { className: "tabular", style: "font-size:0.76rem;color:var(--text-muted);margin-bottom:6px;" }, `최근 첨부 메시지 ${res.items.length} / ${res.total}건 (${allMedia.length}개 파일)`),
           grid
         );
       });
@@ -339,18 +343,12 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
     let queryParams = { limit: state.limit };
     if (mode === "tail") {
       state.messages = [];
-      clear(chatPane);
-      chatPane.appendChild(el("div", { className: "loading-box", style: "margin:auto;" }, "메시지 불러오는 중..."));
       queryParams.tail = true;
     } else if (mode === "head") {
       state.messages = [];
-      clear(chatPane);
-      chatPane.appendChild(el("div", { className: "loading-box", style: "margin:auto;" }, "첫 메시지 불러오는 중..."));
       queryParams.offset = 0;
     } else if (mode === "around" && state.jumpTs) {
       state.messages = [];
-      clear(chatPane);
-      chatPane.appendChild(el("div", { className: "loading-box", style: "margin:auto;" }, "해당 시점 메시지 불러오는 중..."));
       queryParams.around_ts = state.jumpTs;
     } else if (mode === "older" && state.messages.length > 0) {
       queryParams.before_seq = state.messages[0].seq;
@@ -389,29 +387,31 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
       "button",
       {
         type: "button",
-        className: `btn btn-sm${state.activeSubpanel === "search" ? " btn-primary" : ""}`,
+        className: `btn btn-sm${state.activeSubpanel === "search" ? " btn-primary" : " btn-ghost"}`,
         onClick: () => {
           state.activeSubpanel = state.activeSubpanel === "search" ? null : "search";
-          searchToggleBtn.className = `btn btn-sm${state.activeSubpanel === "search" ? " btn-primary" : ""}`;
-          mediaToggleBtn.className = `btn btn-sm${state.activeSubpanel === "media" ? " btn-primary" : ""}`;
+          searchToggleBtn.className = `btn btn-sm${state.activeSubpanel === "search" ? " btn-primary" : " btn-ghost"}`;
+          mediaToggleBtn.className = `btn btn-sm${state.activeSubpanel === "media" ? " btn-primary" : " btn-ghost"}`;
           renderSubpanel(threadId, subbarEl);
         },
       },
-      "🔍 검색"
+      icon("search", 14),
+      "검색"
     );
     const mediaToggleBtn = el(
       "button",
       {
         type: "button",
-        className: `btn btn-sm${state.activeSubpanel === "media" ? " btn-primary" : ""}`,
+        className: `btn btn-sm${state.activeSubpanel === "media" ? " btn-primary" : " btn-ghost"}`,
         onClick: () => {
           state.activeSubpanel = state.activeSubpanel === "media" ? null : "media";
-          searchToggleBtn.className = `btn btn-sm${state.activeSubpanel === "search" ? " btn-primary" : ""}`;
-          mediaToggleBtn.className = `btn btn-sm${state.activeSubpanel === "media" ? " btn-primary" : ""}`;
+          searchToggleBtn.className = `btn btn-sm${state.activeSubpanel === "search" ? " btn-primary" : " btn-ghost"}`;
+          mediaToggleBtn.className = `btn btn-sm${state.activeSubpanel === "media" ? " btn-primary" : " btn-ghost"}`;
           renderSubpanel(threadId, subbarEl);
         },
       },
-      "🖼️ 미디어"
+      icon("image", 14),
+      "미디어"
     );
 
     const header = el(
@@ -427,27 +427,27 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
           el(
             "div",
             { style: "display:flex;gap:7px;align-items:center;flex-wrap:wrap;" },
-            el("strong", { style: "font-size:1rem;" }, t.title || t.thread_id),
-            el("span", { className: `pill ${platCode === "ig" ? "pill-ig" : "pill-fb"}` }, platCode === "ig" ? "IG DM" : "Messenger"),
-            t.is_e2ee ? el("span", { className: "pill pill-warn" }, "E2EE") : null
+            el("strong", { style: "font-size:0.98rem;letter-spacing:-0.015em;" }, t.title || t.thread_id),
+            el("span", { className: `plat-tag ${t.platform}` }, platCode === "ig" ? "IG DM" : "Messenger"),
+            t.is_e2ee ? el("span", { className: "meta-chip" }, "E2EE") : null
           ),
           participantNodes.length > 0
-            ? el("div", { className: "post-meta-row", style: "margin-top:3px;font-size:0.78rem;" }, participantNodes)
+            ? el("div", { className: "post-meta-row", style: "margin-top:2px;font-size:0.78rem;" }, participantNodes)
             : null
         )
       ),
       el(
         "div",
-        { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap;" },
+        { style: "display:flex;gap:4px;align-items:center;flex-wrap:wrap;" },
         searchToggleBtn,
         mediaToggleBtn,
         state.total > state.limit
-          ? el("button", { type: "button", className: "btn btn-sm", onClick: () => loadThreadMessages(threadId, "head") }, "처음")
+          ? el("button", { type: "button", className: "btn btn-sm btn-ghost", onClick: () => loadThreadMessages(threadId, "head") }, "처음")
           : null,
         state.total > state.limit
-          ? el("button", { type: "button", className: "btn btn-sm", onClick: () => loadThreadMessages(threadId, "tail") }, "최신")
+          ? el("button", { type: "button", className: "btn btn-sm btn-ghost", onClick: () => loadThreadMessages(threadId, "tail") }, "최신")
           : null,
-        el("span", { className: "pill" }, `${state.messages.length.toLocaleString()} / ${state.total.toLocaleString()}`)
+        el("span", { className: "toolbar-count tabular", style: "margin-left:4px;" }, `${state.messages.length.toLocaleString()} / ${state.total.toLocaleString()}`)
       )
     );
 
@@ -464,7 +464,8 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
               className: "btn btn-sm",
               onClick: () => loadThreadMessages(threadId, "older"),
             },
-            "⬆ 이전 메시지 더 불러오기"
+            icon("chevronUp", 14),
+            "이전 메시지 더 불러오기"
           )
         )
       );
@@ -473,7 +474,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
     let highlightedNode = null;
 
     if (state.messages.length === 0) {
-      scrollArea.appendChild(el("div", { className: "empty-box" }, "메시지가 없습니다."));
+      scrollArea.appendChild(el("div", { className: "empty-box", style: "border:none;background:transparent;" }, "메시지가 없습니다."));
     } else {
       let lastDayKey = "";
 
@@ -486,7 +487,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
         if (dayKey && dayKey !== lastDayKey) {
           lastDayKey = dayKey;
           scrollArea.appendChild(
-            el("div", { className: "msg-day-divider" }, el("span", null, formatDayLabel(m.created_at, m.timestamp_unix)))
+            el("div", { className: "msg-day-divider tabular" }, el("span", null, formatDayLabel(m.created_at, m.timestamp_unix)))
           );
         }
 
@@ -497,13 +498,13 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
         const prevSameSender =
           prevM &&
           formatDayKey(prevM.created_at, prevM.timestamp_unix) === dayKey &&
-          (prevM.sender || "").trim().toLowerCase() === senderLower &&
+          (prevM.sender || "").normalize("NFC").trim().toLowerCase() === senderLower &&
           Math.abs((m.timestamp_unix || 0) - (prevM.timestamp_unix || 0)) <= 300;
 
         const nextSameSender =
           nextM &&
           formatDayKey(nextM.created_at, nextM.timestamp_unix) === dayKey &&
-          (nextM.sender || "").trim().toLowerCase() === senderLower &&
+          (nextM.sender || "").normalize("NFC").trim().toLowerCase() === senderLower &&
           Math.abs((nextM.timestamp_unix || 0) - (m.timestamp_unix || 0)) <= 300;
 
         const mediaGrid =
@@ -513,7 +514,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
                 { className: "msg-media-grid" },
                 m.media.map((med) => {
                   const src = mediaUrl(med.local_path);
-                  if (!src) return el("span", { className: "pill" }, med.original_uri || "미디어 없음");
+                  if (!src) return el("span", { className: "meta-chip" }, med.original_uri || "미디어 없음");
                   if (isAudioMedia(med)) {
                     return el("audio", { src, controls: true, preload: "metadata" });
                   }
@@ -524,14 +525,16 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
                     const fname = (med.local_path || med.original_uri || "첨부파일").split("/").pop();
                     return el(
                       "a",
-                      { className: "pill", href: src, target: "_blank", rel: "noopener noreferrer" },
-                      `📎 ${fname}`
+                      { className: "meta-chip", href: src, target: "_blank", rel: "noopener noreferrer" },
+                      icon("file", 12),
+                      fname
                     );
                   }
                   return el("img", {
                     src,
                     alt: "message attachment",
                     loading: "lazy",
+                    decoding: "async",
                     style: "cursor:zoom-in;",
                     onClick: () => ctx.openLightbox([med], 0),
                   });
@@ -590,20 +593,19 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
               ? el("div", { className: "msg-text" }, m.text)
               : null,
           m.is_missed_call
-            ? el("div", { className: "pill pill-warn", style: "margin-top:4px;" }, "📵 부재중 통화")
+            ? el("div", { className: "inline-meta", style: "margin-top:4px;font-size:0.82rem;opacity:0.85;" }, icon("phoneMissed", 13), "부재중 통화")
             : null,
           m.call_duration !== null && m.call_duration !== undefined && m.call_duration > 0
-            ? el("div", { className: "pill", style: "margin-top:4px;" }, `📞 통화 ${formatDuration(m.call_duration)}`)
+            ? el("div", { className: "inline-meta tabular", style: "margin-top:4px;font-size:0.82rem;opacity:0.85;" }, icon("phone", 13), `통화 ${formatDuration(m.call_duration)}`)
             : null,
           shareBlock,
           mediaGrid
         );
 
         const timeLabel = !nextSameSender
-          ? el("span", { className: "msg-time-side" }, formatTimeOnly(m.created_at, m.timestamp_unix))
+          ? el("span", { className: "msg-time-side tabular" }, formatTimeOnly(m.created_at, m.timestamp_unix))
           : null;
 
-        // Show avatar on bottom bubble of a consecutive group for partner messages
         const avatarSlot = !isMine
           ? el(
               "div",
@@ -623,7 +625,6 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
             )
           : null;
 
-        // Show sender name on first bubble of group (always in group chats, or when sender is non-empty on first of cluster)
         const senderLabel =
           !isMine && !prevSameSender && senderStr
             ? el(
@@ -666,7 +667,8 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
               className: "btn btn-sm",
               onClick: () => loadThreadMessages(threadId, "newer"),
             },
-            "⬇ 다음 메시지 더 불러오기"
+            icon("chevronDown", 14),
+            "다음 메시지 더 불러오기"
           )
         )
       );

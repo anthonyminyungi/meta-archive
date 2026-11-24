@@ -1,7 +1,8 @@
 /** Slide-over People activity drawer with tabbed comments, likes, and DMs (direct timestamp jump). */
 
-import { api } from "../api.js?v=2";
-import { avatarEl, clear, el, formatDate } from "../dom.js?v=2";
+import { api } from "../api.js?v=3";
+import { avatarEl, clear, el, formatDate, skeletonCards } from "../dom.js?v=3";
+import { icon } from "../icons.js?v=3";
 
 export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
   function close() {
@@ -16,7 +17,7 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
   async function open(identifier) {
     if (!identifier) return;
     clear(hostEl);
-    const panel = el("aside", { className: "drawer-panel" }, el("div", { className: "loading-box" }, "인물 활동 불러오는 중..."));
+    const panel = el("aside", { className: "drawer-panel" }, skeletonCards(3));
     hostEl.appendChild(panel);
     hostEl.classList.remove("hidden");
 
@@ -38,15 +39,19 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
             el(
               "div",
               { style: "min-width:0;" },
-              el("strong", { style: "font-size:1.05rem;" }, data.identifier),
+              el("strong", { style: "font-size:1.02rem;letter-spacing:-0.015em;" }, data.identifier),
               el(
                 "div",
-                { style: "font-size:0.79rem;color:var(--text-muted);" },
+                { className: "tabular", style: "font-size:0.78rem;color:var(--text-muted);" },
                 `댓글 ${data.comments.length} · 좋아요 ${data.liked_posts.length} · DM ${data.messages.length}`
               )
             )
           ),
-          el("button", { type: "button", className: "btn btn-sm", onClick: close }, "✕ 닫기")
+          el(
+            "button",
+            { type: "button", className: "icon-btn", onClick: close, "aria-label": "닫기", title: "닫기 (ESC)" },
+            icon("close", 17)
+          )
         )
       );
 
@@ -54,19 +59,18 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
         panel.appendChild(
           el(
             "div",
-            { className: "post-meta-row", style: "margin-top:0;margin-bottom:10px;" },
+            { className: "post-meta-row", style: "margin-top:0;margin-bottom:12px;" },
             data.connections.map((c) =>
               el(
                 "span",
-                { className: `pill ${c.platform === "instagram" ? "pill-ig" : "pill-fb"}` },
-                `${c.platform} · ${c.relation}${c.full_name ? ` (${c.full_name})` : ""}`
+                { className: "meta-chip" },
+                `${c.platform === "instagram" ? "IG" : "FB"} · ${c.relation}${c.full_name ? ` (${c.full_name})` : ""}`
               )
             )
           )
         );
       }
 
-      // Default to whichever tab actually has items
       let activeTab =
         data.comments.length > 0
           ? "comments"
@@ -76,7 +80,7 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
               ? "likes"
               : "comments";
 
-      const tabsWrap = el("div", { className: "drawer-tabs" });
+      const tabsWrap = el("div", { className: "segmented-control drawer-tabs" });
       const bodyHost = el("div", { className: "feed-list" });
       panel.append(tabsWrap, bodyHost);
 
@@ -84,9 +88,9 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
         clear(tabsWrap);
         clear(bodyHost);
         const defs = [
-          ["comments", `댓글 (${data.comments.length})`],
-          ["likes", `좋아요 (${data.liked_posts.length})`],
-          ["messages", `메시지 (${data.messages.length})`],
+          ["comments", `댓글 ${data.comments.length}`],
+          ["likes", `좋아요 ${data.liked_posts.length}`],
+          ["messages", `메시지 ${data.messages.length}`],
         ];
         for (const [key, label] of defs) {
           tabsWrap.appendChild(
@@ -94,7 +98,7 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
               "button",
               {
                 type: "button",
-                className: `btn btn-sm${activeTab === key ? " btn-primary" : ""}`,
+                className: `seg-btn${activeTab === key ? " active" : ""}`,
                 onClick: () => {
                   activeTab = key;
                   renderTab();
@@ -114,13 +118,13 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
             bodyHost.appendChild(
               el(
                 "div",
-                { className: "card", style: "padding:11px;" },
+                { className: "card drawer-item-card" },
                 el(
                   "div",
-                  { style: "font-size:0.76rem;color:var(--text-muted);" },
-                  `${c.platform} · ${formatDate(c.created_at, c.timestamp_unix)}`
+                  { className: "drawer-item-meta" },
+                  `${c.platform === "instagram" ? "Instagram" : "Facebook"} · ${formatDate(c.created_at, c.timestamp_unix)}`
                 ),
-                el("div", { style: "margin:5px 0;font-size:0.9rem;" }, c.text || "(내용 없음)"),
+                el("div", { className: "drawer-item-body" }, c.text || "(내용 없음)"),
                 el(
                   "button",
                   {
@@ -132,7 +136,7 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
                       onOpenPost(c.post_id);
                     },
                   },
-                  `원글 보기${c.post_caption ? `: ${c.post_caption.slice(0, 42)}` : ""}`
+                  `원글 보기${c.post_caption ? ` · ${c.post_caption.slice(0, 40)}` : ""}`
                 )
               )
             );
@@ -148,15 +152,14 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
                 "button",
                 {
                   type: "button",
-                  className: "card",
-                  style: "padding:11px;text-align:left;cursor:pointer;",
+                  className: "card drawer-item-card drawer-item-btn",
                   onClick: () => {
                     close();
                     onOpenPost(lp.post_id);
                   },
                 },
-                el("div", { style: "font-size:0.76rem;color:var(--text-muted);" }, `${lp.platform} · ${formatDate(lp.created_at, lp.timestamp_unix)}`),
-                el("div", { style: "margin-top:4px;font-size:0.9rem;" }, lp.caption ? lp.caption.slice(0, 80) : lp.post_id)
+                el("div", { className: "drawer-item-meta" }, `${lp.platform === "instagram" ? "Instagram" : "Facebook"} · ${formatDate(lp.created_at, lp.timestamp_unix)}`),
+                el("div", { className: "drawer-item-body" }, lp.caption ? lp.caption.slice(0, 84) : lp.post_id)
               )
             );
           }
@@ -171,8 +174,7 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
                 "button",
                 {
                   type: "button",
-                  className: "card",
-                  style: "padding:11px;text-align:left;cursor:pointer;",
+                  className: "card drawer-item-card drawer-item-btn",
                   onClick: () => {
                     close();
                     onNavigateThread(m.thread_id, m.timestamp_unix);
@@ -180,10 +182,10 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
                 },
                 el(
                   "div",
-                  { style: "font-size:0.76rem;color:var(--text-muted);" },
+                  { className: "drawer-item-meta" },
                   `${m.thread_title || m.thread_id} · ${formatDate(m.created_at, m.timestamp_unix)}`
                 ),
-                el("div", { style: "margin-top:4px;font-size:0.9rem;" }, m.text || "(미디어/첨부)")
+                el("div", { className: "drawer-item-body" }, m.text || "(미디어/첨부)")
               )
             );
           }

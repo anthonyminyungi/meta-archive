@@ -1,7 +1,8 @@
 /** Recursive nested comment/reply tree renderer with commenter avatars and clean speech bubbles. */
 
-import { mediaUrl } from "../api.js?v=2";
-import { avatarEl, el, formatDate, isAudioMedia, isVideoMedia, personButton } from "../dom.js?v=2";
+import { mediaUrl } from "../api.js?v=3";
+import { avatarEl, el, formatDate, isAudioMedia, isVideoMedia, personButton } from "../dom.js?v=3";
+import { icon } from "../icons.js?v=3";
 
 function renderCommentNode(comment, onOpenPerson, onOpenLightbox) {
   const repliesNode =
@@ -15,7 +16,7 @@ function renderCommentNode(comment, onOpenPerson, onOpenLightbox) {
 
   const extraPills = [];
   if (comment.like_count > 0) {
-    extraPills.push(el("span", null, `♥ ${comment.like_count}`));
+    extraPills.push(el("span", { className: "inline-meta" }, icon("heart", 12), String(comment.like_count)));
   }
 
   const inlineMedia = [];
@@ -25,19 +26,19 @@ function renderCommentNode(comment, onOpenPerson, onOpenLightbox) {
         const sUrl = mediaUrl(st);
         if (sUrl) {
           inlineMedia.push(
-            el("img", { src: sUrl, alt: "sticker", loading: "lazy", style: "max-height:72px;border-radius:8px;" })
+            el("img", { src: sUrl, alt: "sticker", loading: "lazy", decoding: "async", style: "max-height:72px;border-radius:8px;" })
           );
           continue;
         }
       }
-      extraPills.push(el("span", { className: "pill" }, typeof st === "string" ? st : "스티커"));
+      extraPills.push(el("span", { className: "meta-chip" }, typeof st === "string" ? st : "스티커"));
     }
   }
   if (comment.media && comment.media.length > 0) {
     for (const med of comment.media) {
       const src = med && med.local_path ? mediaUrl(med.local_path) : null;
       if (!src) {
-        extraPills.push(el("span", { className: "pill" }, "첨부 미디어"));
+        extraPills.push(el("span", { className: "meta-chip" }, "첨부 미디어"));
       } else if (isAudioMedia(med)) {
         inlineMedia.push(el("audio", { src, controls: true, preload: "metadata" }));
       } else if (isVideoMedia(med)) {
@@ -56,6 +57,7 @@ function renderCommentNode(comment, onOpenPerson, onOpenLightbox) {
             src,
             alt: "comment media",
             loading: "lazy",
+            decoding: "async",
             style: "max-width:180px;max-height:180px;border-radius:8px;cursor:zoom-in;",
             onClick: () => onOpenLightbox && onOpenLightbox([med], 0),
           })
@@ -97,7 +99,7 @@ function renderCommentNode(comment, onOpenPerson, onOpenLightbox) {
 
 export function renderCommentTree(comments, onOpenPerson, onOpenLightbox = null) {
   if (!comments || comments.length === 0) {
-    return el("div", { className: "empty-box", style: "padding:14px;font-size:0.86rem;" }, "저장된 댓글이 없습니다.");
+    return el("div", { className: "empty-box", style: "padding:16px;font-size:0.85rem;" }, "저장된 댓글이 없습니다.");
   }
   return el(
     "div",

@@ -1,14 +1,15 @@
 /** Main SPA hash router & shared controllers for Meta Archive viewer. */
 
-import { api } from "./api.js?v=2";
-import { clear, el } from "./dom.js?v=2";
-import { createLightbox } from "./components/lightbox.js?v=2";
-import { createPersonDrawer } from "./components/person_drawer.js?v=2";
-import { createPostModal } from "./components/post_modal.js?v=2";
-import { renderFacebookView } from "./views/facebook.js?v=2";
-import { renderInstagramView } from "./views/instagram.js?v=2";
-import { renderMessagesView } from "./views/messages.js?v=2";
-import { renderSearchView } from "./views/search.js?v=2";
+import { api } from "./api.js?v=3";
+import { clear, el } from "./dom.js?v=3";
+import { icon } from "./icons.js?v=3";
+import { createLightbox } from "./components/lightbox.js?v=3";
+import { createPersonDrawer } from "./components/person_drawer.js?v=3";
+import { createPostModal } from "./components/post_modal.js?v=3";
+import { renderFacebookView } from "./views/facebook.js?v=3";
+import { renderInstagramView } from "./views/instagram.js?v=3";
+import { renderMessagesView } from "./views/messages.js?v=3";
+import { renderSearchView } from "./views/search.js?v=3";
 
 const mainEl = document.getElementById("app-main");
 const modalRoot = document.getElementById("modal-root");
@@ -37,9 +38,10 @@ personDrawer = createPersonDrawer(drawerRoot, {
 postModal = createPostModal(modalRoot, {
   onOpenLightbox: (mediaList, idx) => lightbox.open(mediaList, idx),
   onOpenPerson: (ident) => personDrawer.open(ident),
+  isLightboxOpen: () => !lightboxRoot.classList.contains("hidden"),
 });
 
-// Centralized Escape priority: Lightbox -> Drawer -> Modal (never closes two layers at once)
+// Centralized Escape priority: Lightbox -> Drawer -> Modal
 window.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") {
     if (!lightboxRoot.classList.contains("hidden")) {
@@ -84,7 +86,10 @@ function currentEffectiveTheme() {
 
 function updateThemeButton() {
   const isDark = currentEffectiveTheme() === "dark";
-  themeBtn.textContent = isDark ? "☀️ 라이트" : "🌙 다크";
+  clear(themeBtn);
+  themeBtn.appendChild(icon(isDark ? "sun" : "moon", 16));
+  themeBtn.title = isDark ? "라이트 모드로 전환" : "다크 모드로 전환";
+  themeBtn.setAttribute("aria-label", themeBtn.title);
 }
 
 function initTheme() {
@@ -119,7 +124,7 @@ async function refreshHeaderStats() {
   try {
     const ov = await api.overview();
     const t = ov.totals || {};
-    overviewBadge.textContent = `게시물 ${(t.posts || 0).toLocaleString()} · 스토리 ${(t.stories || 0).toLocaleString()} · 메시지 ${(t.messages || 0).toLocaleString()}`;
+    overviewBadge.textContent = `${(t.posts || 0).toLocaleString()} 게시물 · ${(t.stories || 0).toLocaleString()} 스토리 · ${(t.messages || 0).toLocaleString()} 메시지`;
   } catch (err) {
     overviewBadge.textContent = `오프라인 (${err.message})`;
   }
@@ -150,7 +155,7 @@ async function routeNow() {
         el("div", { style: "margin-top:8px;" }, err.message),
         el(
           "div",
-          { style: "margin-top:8px;font-size:0.85rem;color:var(--text-muted);" },
+          { style: "margin-top:8px;font-size:0.84rem;color:var(--text-muted);" },
           "ARCHIVE_DIR 경로와 archive/archive.sqlite 생성 여부를 확인하세요."
         )
       )

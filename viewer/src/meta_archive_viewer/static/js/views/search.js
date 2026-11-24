@@ -1,7 +1,8 @@
-/** Hybrid Korean Search view with safe <mark> keyword highlighting. */
+/** Hybrid Korean Search view with safe <mark> keyword highlighting and clean metadata chips. */
 
-import { api, mediaUrl } from "../api.js?v=2";
-import { clear, el, formatDate, highlightTextNodes, isVideoMedia, safeExternalHref } from "../dom.js?v=2";
+import { api, mediaUrl } from "../api.js?v=3";
+import { clear, el, formatDate, highlightTextNodes, isVideoMedia, safeExternalHref, skeletonCards } from "../dom.js?v=3";
+import { icon } from "../icons.js?v=3";
 
 const TYPE_LABELS = {
   post: "게시물",
@@ -19,7 +20,7 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
     type: "search",
     className: "input",
     value: initialQuery,
-    placeholder: "한국어/영문 검색어 입력 (단축키 '/' · 1~2글자 및 3글자+ FTS5 모두 지원)...",
+    placeholder: "검색어 입력 (단축키 '/' · 한글 1~2글자 및 3글자 이상 모두 지원)",
   });
   const platformSelect = el(
     "select",
@@ -36,12 +37,12 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
     el("option", { value: "comment" }, "댓글"),
     el("option", { value: "message" }, "메시지"),
     el("option", { value: "story" }, "스토리"),
-    el("option", { value: "activity" }, "내 활동 (댓글·저장)"),
+    el("option", { value: "activity" }, "내 활동"),
     el("option", { value: "connection" }, "인물")
   );
-  const submitBtn = el("button", { type: "submit", className: "btn btn-primary" }, "🔍 검색");
+  const submitBtn = el("button", { type: "submit", className: "btn btn-primary" }, icon("search", 15), "검색");
 
-  const statusRow = el("div", { className: "post-meta-row", style: "margin-bottom:12px;" });
+  const statusRow = el("div", { className: "post-meta-row tabular", style: "margin-bottom:12px;" });
   const resultsEl = el("div", { className: "feed-list" });
 
   const form = el(
@@ -63,7 +64,7 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
       return;
     }
 
-    resultsEl.appendChild(el("div", { className: "loading-box" }, "검색 중..."));
+    resultsEl.appendChild(skeletonCards(3));
     const res = await api.search({
       q,
       platform: platformSelect.value || undefined,
@@ -73,10 +74,10 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
 
     clear(statusRow);
     const modeLabel =
-      res.mode === "fts5_trigram" ? "FTS5 Trigram (3글자 이상)" : "INSTR 폴백 (1~2글자)";
+      res.mode === "fts5_trigram" ? "FTS5 Trigram" : "단문 검색";
     statusRow.append(
-      el("span", { className: "pill pill-accent" }, `검색 결과 ${res.total.toLocaleString()}건`),
-      el("span", { className: "pill" }, modeLabel)
+      el("span", { style: "font-weight:600;color:var(--text);" }, `검색 결과 ${res.total.toLocaleString()}건`),
+      el("span", { className: "meta-chip" }, modeLabel)
     );
 
     clear(resultsEl);
@@ -86,15 +87,13 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
     }
 
     for (const item of res.items) {
-      const platCls = item.platform === "instagram" ? "pill-ig" : "pill-fb";
       const snippet = (item.body || item.entity_id || "").slice(0, 320);
 
       const card = el(
         "button",
         {
           type: "button",
-          className: "card",
-          style: "text-align:left;cursor:pointer;",
+          className: "card search-result-card",
           onClick: () => {
             if (item.entity_type === "post" || item.entity_type === "comment") {
               ctx.openPost(item.entity_id);
@@ -116,14 +115,14 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
                     { className: "card" },
                     el(
                       "div",
-                      { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
-                      el("span", { className: `pill ${platCls}` }, formatDate(s.created_at, s.timestamp_unix)),
-                      s.highlight_title ? el("span", { className: "pill" }, s.highlight_title) : null
+                      { className: "post-meta-row tabular", style: "margin-top:0;margin-bottom:8px;" },
+                      el("span", { className: "meta-chip" }, formatDate(s.created_at, s.timestamp_unix)),
+                      s.highlight_title ? el("span", { className: "meta-chip" }, s.highlight_title) : null
                     ),
                     src
                       ? isVideoMedia(s.media)
                         ? el("video", { src, controls: true, playsinline: true, style: "max-width:100%;max-height:460px;border-radius:8px;" })
-                        : el("img", { src, alt: "story", style: "max-width:100%;max-height:460px;border-radius:8px;cursor:zoom-in;", onClick: () => ctx.openLightbox([s.media], 0) })
+                        : el("img", { src, alt: "story", decoding: "async", style: "max-width:100%;max-height:460px;border-radius:8px;cursor:zoom-in;", onClick: () => ctx.openLightbox([s.media], 0) })
                       : null,
                     s.caption ? el("div", { className: "post-caption" }, s.caption) : null
                   )
@@ -145,13 +144,13 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
                     { className: "card" },
                     el(
                       "div",
-                      { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
-                      el("span", { className: `pill ${platCls}` }, a.kind),
-                      el("span", { className: "pill" }, formatDate(a.created_at, a.timestamp_unix)),
-                      a.target_author ? el("span", { className: "pill" }, `대상: ${a.target_author}`) : null,
-                      a.group_name ? el("span", { className: "pill" }, `그룹: ${a.group_name}`) : null
+                      { className: "post-meta-row tabular", style: "margin-top:0;margin-bottom:8px;" },
+                      el("span", { className: "meta-chip" }, a.kind),
+                      el("span", null, formatDate(a.created_at, a.timestamp_unix)),
+                      a.target_author ? el("span", { className: "meta-chip" }, a.target_author) : null,
+                      a.group_name ? el("span", { className: "meta-chip" }, a.group_name) : null
                     ),
-                    a.title ? el("div", { style: "font-size:0.86rem;color:var(--text-muted);margin-bottom:6px;" }, a.title) : null,
+                    a.title ? el("div", { className: "activity-subtitle" }, a.title) : null,
                     a.text ? el("div", { className: "post-caption" }, a.text) : null,
                     href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", style: "font-size:0.82rem;word-break:break-all;" }, a.url) : null
                   )
@@ -164,13 +163,13 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
         },
         el(
           "div",
-          { className: "post-meta-row", style: "margin-top:0;margin-bottom:6px;" },
-          el("span", { className: "pill pill-accent" }, TYPE_LABELS[item.entity_type] || item.entity_type),
-          el("span", { className: `pill ${platCls}` }, item.platform),
-          item.author ? el("strong", null, highlightTextNodes(item.author, q)) : null,
+          { className: "post-meta-row tabular", style: "margin-top:0;margin-bottom:6px;" },
+          el("span", { className: "meta-chip" }, TYPE_LABELS[item.entity_type] || item.entity_type),
+          el("span", { className: `plat-tag ${item.platform}` }, item.platform === "instagram" ? "IG" : "FB"),
+          item.author ? el("strong", { style: "color:var(--text);" }, highlightTextNodes(item.author, q)) : null,
           item.timestamp_unix ? el("span", null, formatDate(null, item.timestamp_unix)) : null
         ),
-        el("div", { style: "white-space:pre-wrap;font-size:0.92rem;" }, highlightTextNodes(snippet, q))
+        el("div", { style: "white-space:pre-wrap;font-size:0.92rem;color:var(--text);" }, highlightTextNodes(snippet, q))
       );
       resultsEl.appendChild(card);
     }

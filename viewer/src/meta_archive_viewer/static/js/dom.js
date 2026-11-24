@@ -1,6 +1,33 @@
-/** Safe DOM builders and formatting helpers (strictly textContent, zero unescaped innerHTML). */
+/** Safe DOM builders, cached date formatters, skeletons, and shared cards (zero innerHTML). */
 
-import { mediaUrl } from "./api.js?v=2";
+import { mediaUrl } from "./api.js?v=3";
+import { icon } from "./icons.js?v=3";
+
+const DATE_FMT = new Intl.DateTimeFormat("ko-KR", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+});
+
+const SHORT_DATE_FMT = new Intl.DateTimeFormat("ko-KR", {
+  year: "2-digit",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+const TIME_ONLY_FMT = new Intl.DateTimeFormat("ko-KR", {
+  hour: "2-digit",
+  minute: "2-digit",
+});
+
+const DAY_LABEL_FMT = new Intl.DateTimeFormat("ko-KR", {
+  year: "numeric",
+  month: "long",
+  day: "numeric",
+  weekday: "short",
+});
 
 export function el(tag, attrs = null, ...children) {
   const node = document.createElement(tag);
@@ -57,33 +84,17 @@ function parseDateObj(createdAt, timestampUnix) {
 
 export function formatDate(createdAt, timestampUnix) {
   const d = parseDateObj(createdAt, timestampUnix);
-  if (!d) return "날짜 정보 없음";
-  return new Intl.DateTimeFormat("ko-KR", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(d);
+  return d ? DATE_FMT.format(d) : "날짜 정보 없음";
 }
 
 export function formatShortDate(createdAt, timestampUnix) {
   const d = parseDateObj(createdAt, timestampUnix);
-  if (!d) return "";
-  return new Intl.DateTimeFormat("ko-KR", {
-    year: "2-digit",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(d);
+  return d ? SHORT_DATE_FMT.format(d) : "";
 }
 
 export function formatTimeOnly(createdAt, timestampUnix) {
   const d = parseDateObj(createdAt, timestampUnix);
-  if (!d) return "";
-  return new Intl.DateTimeFormat("ko-KR", {
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(d);
+  return d ? TIME_ONLY_FMT.format(d) : "";
 }
 
 export function formatDayKey(createdAt, timestampUnix) {
@@ -94,13 +105,7 @@ export function formatDayKey(createdAt, timestampUnix) {
 
 export function formatDayLabel(createdAt, timestampUnix) {
   const d = parseDateObj(createdAt, timestampUnix);
-  if (!d) return "날짜 정보 없음";
-  return new Intl.DateTimeFormat("ko-KR", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    weekday: "short",
-  }).format(d);
+  return d ? DAY_LABEL_FMT.format(d) : "날짜 정보 없음";
 }
 
 export function formatDuration(seconds) {
@@ -154,6 +159,12 @@ function hashColorIndex(label) {
   return h % 8;
 }
 
+function makeAvatarFallback(cls, label) {
+  const initial = (String(label || "?").trim().slice(0, 1) || "?").toUpperCase();
+  const colorCls = `av-c${hashColorIndex(label)}`;
+  return el("span", { className: `${cls} avatar-fallback ${colorCls}`, "aria-hidden": "true" }, initial);
+}
+
 export function avatarEl(localPath, label = "?", sizeOrLarge = false) {
   let sizeCls = "avatar-md";
   if (sizeOrLarge === true || sizeOrLarge === "lg") sizeCls = "avatar-lg";
@@ -161,11 +172,21 @@ export function avatarEl(localPath, label = "?", sizeOrLarge = false) {
   const cls = `avatar ${sizeCls}`;
   const src = mediaUrl(localPath);
   if (src) {
-    return el("img", { className: cls, src, alt: label, loading: "lazy" });
+    const img = el("img", {
+      className: cls,
+      src,
+      alt: label,
+      loading: "lazy",
+      decoding: "async",
+    });
+    img.addEventListener("error", () => {
+      if (img.parentNode) {
+        img.parentNode.replaceChild(makeAvatarFallback(cls, label), img);
+      }
+    });
+    return img;
   }
-  const initial = (String(label || "?").trim().slice(0, 1) || "?").toUpperCase();
-  const colorCls = `av-c${hashColorIndex(label)}`;
-  return el("span", { className: `${cls} avatar-fallback ${colorCls}`, "aria-hidden": "true" }, initial);
+  return makeAvatarFallback(cls, label);
 }
 
 export function personButton(username, fullName, onOpenPerson) {
@@ -175,7 +196,7 @@ export function personButton(username, fullName, onOpenPerson) {
       : fullName || (username ? `@${username}` : "알 수 없음");
   const identifier = username || fullName;
   if (!identifier || !onOpenPerson) {
-    return el("span", { style: "font-weight:600;" }, label);
+    return el("span", { className: "person-name-static" }, label);
   }
   return el(
     "button",
@@ -208,26 +229,32 @@ export function extractReactionEntries(reactions) {
   return Object.entries(map);
 }
 
-const REACTION_EMOJI_MAP = {
-  LIKE: "👍",
-  "좋아요": "👍",
-  LOVE: "❤️",
-  "최고예요": "❤️",
-  HAHA: "😆",
-  "웃겨요": "😆",
-  WOW: "😮",
-  "멋져요": "😮",
-  SAD: "😢",
-  "슬퍼요": "😢",
-  ANGRY: "😠",
-  "화나요": "😠",
-  CARE: "🤗",
-  "힘내요": "🤗",
+const REACTION_META = {
+  LIKE: ["👍", "좋아요"],
+  "좋아요": ["👍", "좋아요"],
+  LOVE: ["❤️", "최고예요"],
+  "최고예요": ["❤️", "최고예요"],
+  HAHA: ["😆", "웃겨요"],
+  "웃겨요": ["😆", "웃겨요"],
+  WOW: ["😮", "멋져요"],
+  "멋져요": ["😮", "멋져요"],
+  SAD: ["😢", "슬퍼요"],
+  "슬퍼요": ["😢", "슬퍼요"],
+  ANGRY: ["😠", "화나요"],
+  "화나요": ["😠", "화나요"],
+  CARE: ["🤗", "힘내요"],
+  "힘내요": ["🤗", "힘내요"],
 };
 
+export function reactionLabel(rtype) {
+  const entry = REACTION_META[rtype] || REACTION_META[String(rtype).toUpperCase()];
+  return entry ? entry[1] : String(rtype || "반응");
+}
+
 export function formatReactionBadge(rtype, count) {
-  const emoji = REACTION_EMOJI_MAP[rtype] || REACTION_EMOJI_MAP[String(rtype).toUpperCase()] || "👍";
-  return `${emoji} ${rtype} ${count}`;
+  const entry = REACTION_META[rtype] || REACTION_META[String(rtype).toUpperCase()];
+  const emoji = entry ? entry[0] : "👍";
+  return `${emoji} ${count}`;
 }
 
 export function renderCollapsibleText(text, { maxChars = 320, maxLines = 6, className = "post-caption" } = {}) {
@@ -284,6 +311,40 @@ export function highlightTextNodes(text, query) {
   return nodes;
 }
 
+export function skeletonGrid(count = 9) {
+  const tiles = [];
+  for (let i = 0; i < count; i += 1) {
+    tiles.push(el("div", { className: "skeleton skeleton-tile" }));
+  }
+  return el("div", { className: "ig-grid", "aria-busy": "true" }, tiles);
+}
+
+export function skeletonCards(count = 3) {
+  const cards = [];
+  for (let i = 0; i < count; i += 1) {
+    cards.push(
+      el(
+        "div",
+        { className: "card skeleton-card" },
+        el(
+          "div",
+          { className: "skeleton-row" },
+          el("div", { className: "skeleton skeleton-circle" }),
+          el(
+            "div",
+            { style: "flex:1;display:flex;flex-direction:column;gap:6px;" },
+            el("div", { className: "skeleton skeleton-line", style: "width:34%;" }),
+            el("div", { className: "skeleton skeleton-line", style: "width:22%;height:10px;" })
+          )
+        ),
+        el("div", { className: "skeleton skeleton-line", style: "width:88%;margin-top:12px;" }),
+        el("div", { className: "skeleton skeleton-line", style: "width:64%;margin-top:6px;" })
+      )
+    );
+  }
+  return el("div", { className: "feed-list", "aria-busy": "true" }, cards);
+}
+
 export function renderSharedCard(sharedPost, onOpenLightbox) {
   if (!sharedPost) return null;
   const thumbSrc = mediaUrl(sharedPost.thumbnail_local_path);
@@ -293,6 +354,7 @@ export function renderSharedCard(sharedPost, onOpenLightbox) {
         src: thumbSrc,
         alt: sharedPost.title || sharedPost.domain || "shared link thumbnail",
         loading: "lazy",
+        decoding: "async",
         onClick: onOpenLightbox
           ? (ev) => {
               ev.stopPropagation();
@@ -307,8 +369,10 @@ export function renderSharedCard(sharedPost, onOpenLightbox) {
       ? el(
           "div",
           { className: "shared-card-meta" },
-          sharedPost.domain ? el("span", { className: "shared-card-domain" }, `🔗 ${sharedPost.domain}`) : null,
-          sharedPost.author_name ? el("span", { className: "pill" }, `원작자: ${sharedPost.author_name}`) : null
+          sharedPost.domain
+            ? el("span", { className: "shared-card-domain" }, icon("link", 12), sharedPost.domain)
+            : null,
+          sharedPost.author_name ? el("span", { className: "meta-chip" }, sharedPost.author_name) : null
         )
       : null;
 

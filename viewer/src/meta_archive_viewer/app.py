@@ -22,6 +22,7 @@ mimetypes.add_type("image/heic", ".heic")
 mimetypes.add_type("image/avif", ".avif")
 mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/quicktime", ".mov")
+mimetypes.add_type("font/woff2", ".woff2")
 
 
 def _sniff_magic_mime(path: Path) -> str | None:
@@ -155,12 +156,13 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
     fastapi_app.state.reader = reader
 
     @fastapi_app.middleware("http")
-    async def _static_no_cache_middleware(request: Request, call_next: Any) -> Response:
+    async def _static_cache_middleware(request: Request, call_next: Any) -> Response:
         response: Response = await call_next(request)
         path = request.url.path
-        if path == "/" or path.startswith("/static/"):
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
+        if path.startswith("/static/fonts/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif path == "/" or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
     @fastapi_app.exception_handler(ArchiveNotReadyError)
@@ -337,19 +339,15 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
         media_type = _guess_media_mime(target)
         base_headers = {
             "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=86400",
+            "Cache-Control": "public, max-age=31536000, immutable",
         }
 
         range_header = request.headers.get("range")
         if not range_header:
-            headers = {**base_headers, "Content-Length": str(file_size)}
-            if request.method == "HEAD":
-                return Response(status_code=200, headers=headers, media_type=media_type)
-            return StreamingResponse(
-                _iter_file_range(target, 0, file_size - 1) if file_size > 0 else iter(()),
-                status_code=200,
-                headers=headers,
+            return FileResponse(
+                target,
                 media_type=media_type,
+                headers=base_headers,
             )
 
         try:
