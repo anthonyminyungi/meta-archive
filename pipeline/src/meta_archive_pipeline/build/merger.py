@@ -867,7 +867,7 @@ def _copy_file_lossless(src: Path, dest: Path, chunk_size: int = 1024 * 1024) ->
             tempfile.NamedTemporaryFile(
                 mode="wb",
                 dir=to_long_path(dest.parent),
-                prefix=f".{dest.name}.",
+                prefix=f".{dest.name[:80]}.",
                 suffix=".tmp",
                 delete=False,
             ) as tmp,

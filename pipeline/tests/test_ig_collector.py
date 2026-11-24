@@ -1300,4 +1300,438 @@ def test_index_shortcodes_preserves_existing_entries_and_comment_pane_scrolls(tm
     assert merged_index == ["NEW_SC_1", "OLD_SC_1", "OLD_SC_2"]
 
 
+def test_2026_polaris_likers_connection_ignores_dm_mailbox_and_connections_ignores_dm_threads() -> None:
+    polaris_liked_by_payloads = [
+        {
+            "data": {
+                "fetch__XDTMediaDict": {
+                    "likers_connection": {
+                        "edges": [
+                            {"node": {"id": "1394481258", "pk": "1394481258", "username": "han_o315", "full_name": "한"}},
+                            {"node": {"id": "2222222", "pk": "2222222", "username": "ttaeyong_j", "full_name": "태용"}},
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "data": {
+                "get_slide_mailbox_for_iris_subscription": {
+                    "threads_by_folder": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "as_ig_direct_thread": {
+                                        "thread_key": "t1",
+                                        "thread_title": "DM방",
+                                        "users": [
+                                            {"pk": "9001", "username": "dm_only_friend"},
+                                            {"pk": "9002", "username": "Instagram 사용자"},
+                                        ],
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    ]
+
+    likers = extract_ig_likers_from_payloads(polaris_liked_by_payloads)
+    assert [u.username for u in likers] == ["han_o315", "ttaeyong_j"]
+
+    conns, _ = extract_ig_connections_from_payloads(
+        [
+            polaris_liked_by_payloads[1],
+            {"users": [{"pk": "555", "username": "real_follower"}]},
+        ],
+        "follower",
+    )
+    assert [c.username for c in conns] == ["real_follower"]
+
+
+def test_dialog_scroll_targets_overflow_scrollable_and_continues_on_new_payloads(
+    tmp_path: Path,
+) -> None:
+    from meta_archive_pipeline.collect.ig_collector import _DIALOG_SCROLL_JS
+
+    # _DIALOG_SCROLL_JS must filter by computed overflowY so non-scrollable dialog wrappers are skipped
+    assert "getComputedStyle" in _DIALOG_SCROLL_JS
+    assert "overflowY" in _DIALOG_SCROLL_JS
+    assert "scrollIntoView" in _DIALOG_SCROLL_JS
+
+    page1 = {"users": [{"pk": str(i), "username": f"f_{i}"} for i in range(1, 21)]}
+    page2 = {"users": [{"pk": str(i), "username": f"f_{i}"} for i in range(21, 41)]}
+    page3 = {"users": [{"pk": str(i), "username": f"f_{i}"} for i in range(41, 61)]}
+    page4 = {"users": [{"pk": str(i), "username": f"f_{i}"} for i in range(61, 81)]}
+
+    class _PaginatedVirtualizedDialogPage(_FakeIgPage):
+        def __init__(self, routes) -> None:
+            super().__init__(routes)
+            self.follower_scrolls = 0
+
+        def evaluate(self, script: str):
+            if "dialog" in script and "/followers/" in self.url:
+                self.follower_scrolls += 1
+                # Simulate virtualized list whose scrollHeight stays fixed at 1000 while pages stream in
+                batches = {1: page2, 2: page3, 3: page4}
+                if self.follower_scrolls in batches:
+                    resp = _FakeResp(
+                        f"https://www.instagram.com/api/v1/friendships/10/followers/?max_id={self.follower_scrolls}",
+                        200,
+                        json.dumps(batches[self.follower_scrolls]),
+                    )
+                    for fn in self._handlers.get("response", []):
+                        fn(resp)
+                return {"height": 1000, "scrollTop": 600, "moved": False, "links": 20}
+            return {"height": 1000, "scrollTop": 600, "moved": False, "links": 20}
+
+    routes = {
+        "https://www.instagram.com/yungis_/followers/": (
+            "<html></html>",
+            [_FakeResp("https://www.instagram.com/api/v1/friendships/10/followers/", 200, json.dumps(page1))],
+        ),
+        "https://www.instagram.com/yungis_/following/": (
+            "<html></html>",
+            [_FakeResp("https://www.instagram.com/api/v1/friendships/10/following/", 200, json.dumps({"users": []}))],
+        ),
+    }
+
+    out_dir = tmp_path / "ig_conns_paginated"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = IgCollector(
+        _PaginatedVirtualizedDialogPage(routes),
+        IgCollectConfig(
+            username="yungis_",
+            output_dir=out_dir,
+            collect_pass="connections",
+            download_avatars=False,
+            cooldown=cooldown,
+            max_scrolls=15,
+        ),
+        request_context=_FakeRequestContext({}),
+    ).run_pass_connections()
+
+    assert summary.succeeded == 2
+    saved = json.loads((out_dir / "connections.json").read_text(encoding="utf-8"))
+    assert len(saved) == 80
+    assert (out_dir / "raw" / "connections" / "followers.json").exists()
+
+
+def test_connections_clicks_profile_link_to_open_modal_and_never_scrolls_window(
+    tmp_path: Path,
+) -> None:
+    from meta_archive_pipeline.collect.ig_collector import _DIALOG_SCROLL_JS
+
+    # Dialog scroll script must NEVER fall back to scrolling window / document.body
+    assert "window.scrollTo" not in _DIALOG_SCROLL_JS
+
+    page1 = {"users": [{"pk": str(i), "username": f"flw_{i}"} for i in range(1, 21)]}
+    page2 = {"users": [{"pk": str(i), "username": f"flw_{i}"} for i in range(21, 36)]}
+
+    class _CssLocator:
+        def __init__(self, page: _ModalClickPage, selector: str) -> None:
+            self._page = page
+            self._selector = selector
+
+        @property
+        def first(self) -> _CssLocator:
+            return self
+
+        def count(self) -> int:
+            return 1 if ("followers" in self._selector or "following" in self._selector) else 0
+
+        def is_visible(self) -> bool:
+            return self.count() > 0
+
+        def click(self) -> None:
+            self._page.clicked_selectors.append(self._selector)
+            self._page.dialog_open = True
+            if "followers" in self._selector:
+                resp = _FakeResp(
+                    "https://www.instagram.com/api/v1/friendships/10/followers/",
+                    200,
+                    json.dumps(page1),
+                )
+                for fn in self._page._handlers.get("response", []):
+                    fn(resp)
+
+    class _FakeMouse:
+        def __init__(self, page: _ModalClickPage) -> None:
+            self._page = page
+            self.moves: list[tuple[float, float]] = []
+            self.wheels: list[tuple[float, float]] = []
+
+        def move(self, x: float, y: float) -> None:
+            self.moves.append((x, y))
+
+        def wheel(self, dx: float, dy: float) -> None:
+            self.wheels.append((dx, dy))
+            if self._page.dialog_open and len(self.wheels) == 1 and "followers" in self._page.url:
+                resp = _FakeResp(
+                    "https://www.instagram.com/api/v1/friendships/10/followers/?max_id=2",
+                    200,
+                    json.dumps(page2),
+                )
+                for fn in self._page._handlers.get("response", []):
+                    fn(resp)
+
+    class _ModalClickPage(_FakeIgPage):
+        def __init__(self, routes) -> None:
+            super().__init__(routes)
+            self.dialog_open = False
+            self.clicked_selectors: list[str] = []
+            self.scroll_calls = 0
+            self.mouse = _FakeMouse(self)
+
+        def goto(self, url: str, wait_until: str = "domcontentloaded") -> None:
+            # Direct goto to /followers/ redirects to profile WITHOUT opening dialog
+            self.dialog_open = False
+            super().goto(url, wait_until=wait_until)
+
+        def locator(self, selector: str) -> _CssLocator:
+            return _CssLocator(self, selector)
+
+        def evaluate(self, script: str):
+            if "scrollTop" not in script and "dialog" in script:
+                return self.dialog_open
+            if "dialog" in script:
+                if not self.dialog_open:
+                    return {"hasDialog": False, "height": 0, "scrollTop": 0, "moved": False, "links": 0}
+                self.scroll_calls += 1
+                if len(self.mouse.wheels) >= 1 and "followers" in self.url:
+                    return {"hasDialog": True, "x": 500, "y": 400, "height": 2300, "scrollTop": 900, "moved": True, "links": 71}
+                return {"hasDialog": True, "x": 500, "y": 400, "height": 1650, "scrollTop": 0, "moved": False, "links": 51}
+            return 1000
+
+    routes = {
+        "https://www.instagram.com/yungis_/followers/": ("<html><header></header></html>", []),
+        "https://www.instagram.com/yungis_/following/": ("<html><header></header></html>", []),
+    }
+
+    out_dir = tmp_path / "ig_modal_click"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    page = _ModalClickPage(routes)
+    summary = IgCollector(
+        page,
+        IgCollectConfig(
+            username="yungis_",
+            output_dir=out_dir,
+            collect_pass="connections",
+            download_avatars=False,
+            cooldown=cooldown,
+            max_scrolls=10,
+        ),
+        request_context=_FakeRequestContext({}),
+    ).run_pass_connections()
+
+    assert summary.succeeded == 2
+    assert any("followers" in s for s in page.clicked_selectors)
+    assert any("following" in s for s in page.clicked_selectors)
+    assert len(page.mouse.wheels) >= 1
+    saved = json.loads((out_dir / "connections.json").read_text(encoding="utf-8"))
+    assert len([c for c in saved if c["relation"] == "follower"]) == 35
+
+
+def test_2026_polaris_highlights_from_dom_and_reels_media_connection(tmp_path: Path) -> None:
+    blobs = {
+        "https://cdn.example.com/post1.jpg": _jpeg_bytes((10, 20, 30)),
+        "https://cdn.example.com/hl_cover_jeju.jpg": _jpeg_bytes((40, 50, 60)),
+        "https://cdn.example.com/hl_slide1.jpg": _jpeg_bytes((70, 80, 90)),
+    }
+
+    profile_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__profile_timeline": {
+                    "profile_grid_items": [
+                        {"media": {"pk": "1", "code": "SC_HL_TEST", "media_type": 1, "user": {"username": "yungis_"}}}
+                    ]
+                }
+            }
+        }
+    )
+    post_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__media__shortcode__web_info": {
+                    "items": [
+                        {
+                            "pk": "1",
+                            "id": "1_10",
+                            "code": "SC_HL_TEST",
+                            "taken_at": 1750000000,
+                            "media_type": 1,
+                            "user": {"username": "yungis_"},
+                            "image_versions2": {"candidates": [{"url": "https://cdn.example.com/post1.jpg", "width": 100, "height": 100}]},
+                        }
+                    ]
+                }
+            }
+        }
+    )
+    # 2026 Polaris highlight route SSR uses xdt_api__v1__feed__reels_media__connection.edges[0].node
+    hl_2026_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__feed__reels_media__connection": {
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "XDTReelDict",
+                                "id": "highlight:17968229479379667",
+                                "reel_type": "highlight_reel",
+                                "title": "Jeju 🛫 21.04",
+                                "user": {"username": "yungis_"},
+                                "cover_media": {
+                                    "cropped_image_version": {
+                                        "url": "https://cdn.example.com/hl_cover_jeju.jpg"
+                                    }
+                                },
+                                "items": [
+                                    {
+                                        "pk": "2547956079384712985",
+                                        "id": "2547956079384712985_1621016495",
+                                        "taken_at": 1617960052,
+                                        "media_type": 1,
+                                        "image_versions2": {
+                                            "candidates": [
+                                                {"url": "https://cdn.example.com/hl_slide1.jpg", "width": 1080, "height": 1920}
+                                            ]
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    class _DomHighlightPage(_FakeIgPage):
+        def evaluate(self, script: str):
+            if "/stories/highlights/" in script and "yungis_" in self.url:
+                return [
+                    {
+                        "href": "/stories/highlights/17968229479379667/",
+                        "text": "Jeju 🛫 21.04",
+                        "imgSrc": "https://cdn.example.com/hl_cover_jeju.jpg",
+                    }
+                ]
+            return 1000
+
+    routes = {
+        "https://www.instagram.com/yungis_/": (f'<script type="application/json">{profile_ssr}</script>', []),
+        "https://www.instagram.com/yungis_/reels/": ("<html></html>", []),
+        "https://www.instagram.com/p/SC_HL_TEST/": (f'<script type="application/json">{post_ssr}</script>', []),
+        "https://www.instagram.com/stories/highlights/17968229479379667/": (
+            f'<script type="application/json">{hl_2026_ssr}</script>',
+            [],
+        ),
+    }
+
+    out_dir = tmp_path / "ig_hl_2026"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = IgCollector(
+        _DomHighlightPage(routes),
+        IgCollectConfig(username="yungis_", output_dir=out_dir, limit=1, cooldown=cooldown),
+        request_context=_FakeRequestContext(blobs),
+    ).run_pass_core()
+
+    assert summary.succeeded == 1
+    assert (out_dir / "highlights.json").exists()
+    hl_saved = json.loads((out_dir / "highlights.json").read_text(encoding="utf-8"))
+    assert len(hl_saved) == 1
+    assert hl_saved[0]["highlight_id"] == "highlight:17968229479379667"
+    assert hl_saved[0]["highlight_title"] == "Jeju 🛫 21.04"
+    assert hl_saved[0]["highlight_cover"] == "media/instagram/highlights/cover_highlight_17968229479379667.jpg"
+    assert hl_saved[0]["media"]["local_path"] == "media/instagram/highlights/2547956079384712985_1621016495.jpg"
+    assert (out_dir / "media" / "highlights" / "cover_highlight_17968229479379667.jpg").exists()
+    assert (out_dir / "media" / "highlights" / "2547956079384712985_1621016495.jpg").exists()
+
+
+def test_ig_tagged_pass_skips_non_owner_comments(tmp_path: Path) -> None:
+    blobs = {"https://cdn.example.com/tag1.jpg": _jpeg_bytes((20, 40, 60))}
+    tagged_grid_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__usertags__user_id__feed_connection": {
+                    "edges": [
+                        {
+                            "node": {
+                                "pk": "99",
+                                "code": "TAG_SC1",
+                                "media_type": 1,
+                                "user": {"username": "friend_owner"},
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    )
+    tagged_post_ssr = json.dumps(
+        {
+            "data": {
+                "xdt_api__v1__media__shortcode__web_info": {
+                    "items": [
+                        {
+                            "pk": "99",
+                            "id": "99_1",
+                            "code": "TAG_SC1",
+                            "taken_at": 1750000000,
+                            "media_type": 1,
+                            "user": {"username": "friend_owner"},
+                            "caption": {"text": "태그된 친구 글"},
+                            "image_versions2": {
+                                "candidates": [{"url": "https://cdn.example.com/tag1.jpg", "width": 100, "height": 100}]
+                            },
+                            "comments": [
+                                {
+                                    "pk": "c1",
+                                    "text": "남의 게시물 댓글",
+                                    "created_at": 1750000100,
+                                    "user": {"username": "stranger"},
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
+    )
+    routes = {
+        "https://www.instagram.com/yungis_/tagged/": (
+            f'<script type="application/json">{tagged_grid_ssr}</script>',
+            [],
+        ),
+        "https://www.instagram.com/p/TAG_SC1/": (
+            f'<script type="application/json">{tagged_post_ssr}</script>',
+            [],
+        ),
+    }
+
+    out_dir = tmp_path / "ig_tagged_no_cmts"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = IgCollector(
+        _FakeIgPage(routes),
+        IgCollectConfig(username="yungis_", output_dir=out_dir, collect_pass="tagged", cooldown=cooldown),
+        request_context=_FakeRequestContext(blobs),
+    ).run_pass_tagged()
+
+    assert summary.succeeded == 1
+    saved = json.loads((out_dir / "tagged_posts" / "TAG_SC1.json").read_text(encoding="utf-8"))
+    assert saved["post_type"] == "tagged"
+    assert saved["author"]["username"] == "friend_owner"
+    assert saved["comments"] == []
+    assert len(saved["media"]) == 1
+
+
+
+
+
+
+
 

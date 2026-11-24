@@ -213,7 +213,7 @@ def mux_dash_streams(
     try:
         with tempfile.NamedTemporaryFile(
             dir=out_parent_long,
-            prefix=f".{output_path.stem}.",
+            prefix=f".{output_path.stem[:80]}.",
             suffix=".mp4",
             delete=False,
         ) as tmp:

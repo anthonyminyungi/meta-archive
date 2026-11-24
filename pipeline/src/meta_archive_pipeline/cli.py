@@ -35,6 +35,7 @@ class FbPassChoice(StrEnum):
     """Selectable Facebook collection passes."""
 
     POSTS = "posts"
+    COMMENTS = "comments"
     FRIENDS = "friends"
     ALBUMS = "albums"
 
@@ -170,7 +171,7 @@ def collect_ig_cmd(
 def collect_fb_cmd(
     collect_pass: Annotated[
         FbPassChoice,
-        typer.Option("--pass", help="수집 패스 선택 (posts/friends/albums)"),
+        typer.Option("--pass", help="수집 패스 선택 (posts/comments/friends/albums)"),
     ] = FbPassChoice.POSTS,
     output_dir: Annotated[
         Path,
@@ -200,8 +201,13 @@ def collect_fb_cmd(
         download_avatars=download_avatars,
     )
     summary = collect_facebook(config)
+    extra = (
+        f", 댓글보강게시물={summary.comments_posts_fetched}"
+        if summary.comments_posts_fetched > 0
+        else ""
+    )
     console.print(
-        f"[FB {summary.collect_pass}] 저장항목={summary.items_saved}, 미디어={summary.media_saved}"
+        f"[FB {summary.collect_pass}] 저장항목={summary.items_saved}, 미디어={summary.media_saved}{extra}"
     )
     if summary.paused_reason:
         console.print(f"[yellow]안전 일시중지:[/yellow] {summary.paused_reason}")

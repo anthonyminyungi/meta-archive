@@ -45,7 +45,7 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         with tempfile.NamedTemporaryFile(
             mode="wb",
             dir=parent_long,
-            prefix=f".{path.name}.",
+            prefix=f".{path.name[:80]}.",
             suffix=".tmp",
             delete=False,
         ) as tmp:

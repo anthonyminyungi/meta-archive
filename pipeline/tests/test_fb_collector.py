@@ -295,8 +295,34 @@ def test_fb_collector_posts_friends_and_safety_pause(tmp_path: Path) -> None:
     }
     ndjson_posts = "\n".join(
         [
-            'for (;;);{"data":{"node":{"__typename":"Story","post_id":"p100","creation_time":1710000000,"message":{"text":"테스트 글"},"attachments":[{"media":{"image":{"uri":"https://cdn.fb.com/photo1.jpg"}}}],"feedback":{"reaction_count":{"count":3}}}}}',
+            'for (;;);{"data":{"node":{"__typename":"Story","post_id":"p100","permalink_url":"https://www.facebook.com/me/posts/p100","creation_time":1710000000,"message":{"text":"테스트 글"},"attachments":[{"media":{"image":{"uri":"https://cdn.fb.com/photo1.jpg"}}}],"feedback":{"reaction_count":{"count":3},"comment_rendering_instance":{"comments":{"total_count":1}}}}}}',
         ]
+    )
+    post_detail_feedback = json.dumps(
+        {
+            "data": {
+                "node": {
+                    "__typename": "Feedback",
+                    "id": "fb_p100",
+                    "url": "https://www.facebook.com/me/posts/p100",
+                    "comment_rendering_instance_for_feed_location": {
+                        "comments": {
+                            "edges": [
+                                {
+                                    "node": {
+                                        "__typename": "Comment",
+                                        "id": "c_p100_1",
+                                        "created_time": 1710000200,
+                                        "author": {"id": "u2", "name": "친구A"},
+                                        "body": {"text": "상세 페이지에서 수집된 댓글"},
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                }
+            }
+        }
     )
     friends_json = json.dumps(
         {
@@ -322,6 +348,10 @@ def test_fb_collector_posts_friends_and_safety_pause(tmp_path: Path) -> None:
             "<html></html>",
             [_FakeResp("https://www.facebook.com/api/graphql/", 200, ndjson_posts)],
         ),
+        "https://www.facebook.com/me/posts/p100": (
+            "<html></html>",
+            [_FakeResp("https://www.facebook.com/api/graphql/", 200, post_detail_feedback)],
+        ),
         "https://www.facebook.com/me/friends": (
             "<html></html>",
             [_FakeResp("https://www.facebook.com/api/graphql/", 200, friends_json)],
@@ -341,10 +371,14 @@ def test_fb_collector_posts_friends_and_safety_pause(tmp_path: Path) -> None:
 
     assert sum_posts.items_saved == 1
     assert sum_posts.media_saved == 1
+    assert sum_posts.comments_posts_fetched == 1
     assert sum_posts.paused_reason is None
     assert page_posts.clicked == ["가장 관련성 높은 댓글", "모든 댓글", "댓글 더 보기"]
     assert (out_dir / "raw" / "posts" / "batch_0001.json").exists()
+    assert (out_dir / "raw" / "posts" / "comments_p100.json").exists()
     assert (out_dir / "posts" / "p100.json").exists()
+    saved_p100 = json.loads((out_dir / "posts" / "p100.json").read_text(encoding="utf-8"))
+    assert [c["text"] for c in saved_p100["comments"]] == ["상세 페이지에서 수집된 댓글"]
     assert (out_dir / "media" / "posts" / "p100_01.jpg").exists()
     assert CheckpointStore(out_dir / "state_fb.json").get_status("p100") == "done"
 
@@ -508,36 +542,32 @@ def test_fb_collector_incremental_scroll_checkpoint_on_mid_429_profile_and_album
         def evaluate(self, script: str):
             if "scrollTo" in script:
                 self.scroll_calls += 1
-                if self.scroll_calls >= 2:
+                if self.scroll_calls == 1:
+                    # First scroll delivers comment delta before scroll #2 hits 429
+                    for fn in self._handlers.get("response", []):
+                        fn(_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(early_comment_delta)))
+                elif self.scroll_calls >= 2:
                     # Simulate mid-scroll 429 AFTER first post was already scrolled & checkpointed!
                     for fn in self._handlers.get("response", []):
                         fn(_FakeResp("https://www.facebook.com/api/graphql/", 429, "rate limited"))
                 return None
+            if "querySelectorAll" in script:
+                return False
             return 1000 + self.scroll_calls * 500
 
     dyn_page = _DynamicScrollFbPage()
-    orig_click_locator = _FakeLocator.click
-
-    def _emit_comment_on_expand(loc_self: _FakeLocator) -> None:
-        orig_click_locator(loc_self)
-        if loc_self._page is dyn_page and loc_self._label == "댓글 더 보기":
-            for fn in dyn_page._handlers.get("response", []):
-                fn(_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(early_comment_delta)))
-
-    _FakeLocator.click = _emit_comment_on_expand  # type: ignore[method-assign]
-    try:
-        out_posts = tmp_path / "fb_inc_out"
-        cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
-        summary = FbCollector(
-            dyn_page,
-            FbCollectConfig(output_dir=out_posts, collect_pass="posts", cooldown=cooldown, max_scrolls=10),
-            request_context=_FakeRequestContext(blobs),
-        ).run_pass_posts()
-    finally:
-        _FakeLocator.click = orig_click_locator  # type: ignore[method-assign]
+    out_posts = tmp_path / "fb_inc_out"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = FbCollector(
+        dyn_page,
+        FbCollectConfig(output_dir=out_posts, collect_pass="posts", cooldown=cooldown, max_scrolls=10),
+        request_context=_FakeRequestContext(blobs),
+    ).run_pass_posts()
 
     assert summary.paused_reason is not None and "rate_limited" in summary.paused_reason
-    # Even though scroll #2 hit 429, p_early MUST already be saved with its expanded comment AND profile.json!
+    # Stage 1 timeline scroll must NOT click comment expanders on /me (prevents modal lockup)
+    assert dyn_page.clicked == []
+    # Even though scroll #2 hit 429, p_early MUST already be saved with its delta comment AND profile.json!
     assert summary.items_saved == 1
     assert (out_posts / "profile.json").exists()
     prof = json.loads((out_posts / "profile.json").read_text(encoding="utf-8"))
@@ -970,5 +1000,756 @@ def test_2026_comet_no_uzpf_ghost_duplicates_ufi_feedback_nested_attached_story_
     assert prof.full_name == "민윤기"
     assert prof.username == "dbstnsdl12"
     assert av == "https://cdn.fb.com/me200.jpg"
+
+
+def test_extract_fb_posts_styles_attachment_media_and_subattachments() -> None:
+    payload = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "post_id": "341813122619892",
+                "creation_time": 1377476716,
+                "actors": [{"id": "100003736202459", "name": "민윤기"}],
+                "attachments": [
+                    {
+                        # 2026 Comet stub media without URI at top-level
+                        "media": {"__typename": "Photo", "__isNode": "Photo", "id": "341813122619892"},
+                        "styles": {
+                            "__typename": "StoryAttachmentPhotoStyleRenderer",
+                            "attachment": {
+                                "media": {
+                                    "__typename": "Photo",
+                                    "id": "341813122619892",
+                                    "viewer_image": {"width": 401, "height": 617},
+                                    "photo_image": {
+                                        "uri": "https://cdn.fb.com/univee_full.jpg",
+                                        "width": 401,
+                                        "height": 617,
+                                    },
+                                }
+                            },
+                        },
+                    }
+                ],
+            }
+        }
+    }
+    posts, cands = extract_fb_posts_from_payloads([payload])
+    assert len(posts) == 1
+    assert len(cands) == 1
+    assert cands[0].post_id == "341813122619892"
+    assert cands[0].media_id == "341813122619892"
+    assert cands[0].progressive_url == "https://cdn.fb.com/univee_full.jpg"
+    assert cands[0].width == 401 and cands[0].height == 617
+
+    carousel_payload = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "post_id": "p_car_styles",
+                "creation_time": 1700000000,
+                "attachments": [
+                    {
+                        "styles": {
+                            "attachment": {
+                                "all_subattachments": {
+                                    "nodes": [
+                                        {
+                                            "media": {"__typename": "Photo", "id": "sub1"},
+                                            "styles": {
+                                                "attachment": {
+                                                    "media": {
+                                                        "__typename": "Photo",
+                                                        "id": "sub1",
+                                                        "photo_image": {"uri": "https://cdn.fb.com/sub1.jpg"},
+                                                    }
+                                                }
+                                            },
+                                        },
+                                        {
+                                            "media": {
+                                                "__typename": "Photo",
+                                                "id": "sub2",
+                                                "image": {"uri": "https://cdn.fb.com/sub2.jpg"},
+                                            }
+                                        },
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ],
+            }
+        }
+    }
+    car_posts, car_cands = extract_fb_posts_from_payloads([carousel_payload])
+    assert len(car_posts) == 1
+    assert car_posts[0].post_type == "carousel"
+    assert [c.progressive_url for c in car_cands] == [
+        "https://cdn.fb.com/sub1.jpg",
+        "https://cdn.fb.com/sub2.jpg",
+    ]
+
+
+def test_run_pass_albums_visits_grid_media_photos_and_repairs_medialess_done(tmp_path: Path) -> None:
+    from meta_archive_pipeline.collect.fb_collector import (
+        extract_fb_album_photo_targets,
+        extract_fb_album_titles,
+        extract_fb_photo_post_from_payloads,
+    )
+
+    albums_index_ssr = json.dumps(
+        {
+            "data": {
+                "collection": {
+                    "pageItems": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "__typename": "TimelineAppCollectionItem",
+                                    "title": {"text": "프로필 사진"},
+                                    "url": "https://www.facebook.com/media/set/?set=a.127326950735178&type=3",
+                                    "node": {"__typename": "Album", "id": "127326950735178"},
+                                }
+                            },
+                            {
+                                "node": {
+                                    "__typename": "TimelineAppCollectionItem",
+                                    "title": {"text": "Univee 사진첩"},
+                                    "url": "https://www.facebook.com/media/set/?set=a.341813119286559&type=3",
+                                    "node": {"__typename": "Album", "id": "341813119286559"},
+                                }
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+    )
+
+    profile_album_ssr = json.dumps(
+        {
+            "data": {
+                "grid_media": {
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "Photo",
+                                "id": "3453035611497612",
+                                "image": {"uri": "https://cdn.fb.com/thumb_414.jpg", "width": 414, "height": 414},
+                                "owner": {"__typename": "User", "id": "100003736202459"},
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    photo_detail_ssr = json.dumps(
+        {
+            "data": {
+                "currMedia": {
+                    "__typename": "Photo",
+                    "id": "3453035611497612",
+                    "image": {"uri": "https://cdn.fb.com/full_1080.jpg", "width": 1080, "height": 1080},
+                    "created_time": 1710000000,
+                    "owner": {"id": "100003736202459", "name": "민윤기"},
+                },
+                "comet_photo_root_content_renderer": {
+                    "media": {
+                        "__typename": "Photo",
+                        "id": "3453035611497612",
+                        "message": {"text": "새 프로필 사진"},
+                    },
+                    "feedback": {
+                        "reaction_count": {"count": 5},
+                        "top_reactions": {
+                            "edges": [{"reaction_count": 5, "node": {"reaction_type": "LIKE"}}]
+                        },
+                        "display_comments": {
+                            "edges": [
+                                {
+                                    "node": {
+                                        "id": "pc_1",
+                                        "created_time": 1710000300,
+                                        "author": {"id": "u9", "name": "친구D"},
+                                        "body": {"text": "잘 나왔네!"},
+                                    }
+                                }
+                            ]
+                        },
+                    },
+                },
+            }
+        }
+    )
+
+    univee_album_ssr = json.dumps(
+        {
+            "data": {
+                "grid_media": {
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "Photo",
+                                "id": "341813122619892",
+                                "image": {"uri": "https://cdn.fb.com/univee_thumb.jpg", "width": 269, "height": 414},
+                            }
+                        }
+                    ]
+                },
+                "stories_feed": {
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "Story",
+                                "post_id": "341813122619892",
+                                "creation_time": 1377476716,
+                                "actors": [{"id": "100003736202459", "name": "민윤기"}],
+                                "attachments": [
+                                    {
+                                        "media": {"__typename": "Photo", "id": "341813122619892"},
+                                        "styles": {
+                                            "attachment": {
+                                                "media": {
+                                                    "__typename": "Photo",
+                                                    "id": "341813122619892",
+                                                    "photo_image": {
+                                                        "uri": "https://cdn.fb.com/univee_full.jpg",
+                                                        "width": 401,
+                                                        "height": 617,
+                                                    },
+                                                }
+                                            }
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    # Pure parser checks
+    titles = extract_fb_album_titles([json.loads(albums_index_ssr)])
+    assert titles["a.127326950735178"] == "프로필 사진"
+    assert titles["a.341813119286559"] == "Univee 사진첩"
+
+    targets = extract_fb_album_photo_targets(
+        [json.loads(profile_album_ssr)],
+        album_url="https://www.facebook.com/media/set/?set=a.127326950735178&type=3",
+        album_name="프로필 사진",
+    )
+    assert len(targets) == 1
+    assert targets[0].photo_url == "https://www.facebook.com/photo/?fbid=3453035611497612&set=a.127326950735178"
+
+    ph_post, ph_cands = extract_fb_photo_post_from_payloads(
+        [json.loads(photo_detail_ssr)],
+        photo_id="3453035611497612",
+        photo_url=targets[0].photo_url,
+        album_name="프로필 사진",
+        fallback_image_url=targets[0].fallback_image_url,
+    )
+    assert ph_post is not None
+    assert ph_post.post_type == "album_photo"
+    assert ph_post.album_name == "프로필 사진"
+    assert ph_post.caption == "새 프로필 사진"
+    assert ph_post.reactions.total == 5
+    assert [c.text for c in ph_post.comments] == ["잘 나왔네!"]
+    assert len(ph_cands) == 1 and ph_cands[0].progressive_url == "https://cdn.fb.com/full_1080.jpg"
+
+    # End-to-end run_pass_albums: pre-seed 341813122619892 as "done" with empty media to test repair
+    out_dir = tmp_path / "fb_albums"
+    (out_dir / "posts").mkdir(parents=True, exist_ok=True)
+    store = CheckpointStore(out_dir / "state_fb.json")
+    store.ensure_items(["341813122619892"])
+    store.set_status("341813122619892", "done")
+    (out_dir / "posts" / "341813122619892.json").write_text(
+        json.dumps(
+            {
+                "platform": "facebook",
+                "post_id": "341813122619892",
+                "post_type": "post",
+                "created_at": "2013-08-26T00:25:16Z",
+                "timestamp_unix": 1377476716,
+                "caption": "",
+                "media": [],
+                "comments": [],
+                "source": "playwright",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    routes = {
+        "https://www.facebook.com/me/photos_albums": (
+            f'<script type="application/json">{albums_index_ssr}</script>',
+            [],
+        ),
+        "https://www.facebook.com/media/set/?set=a.127326950735178&type=3": (
+            f'<script type="application/json">{profile_album_ssr}</script>',
+            [],
+        ),
+        "https://www.facebook.com/photo/?fbid=3453035611497612&set=a.127326950735178": (
+            f'<script type="application/json">{photo_detail_ssr}</script>',
+            [],
+        ),
+        "https://www.facebook.com/media/set/?set=a.341813119286559&type=3": (
+            f'<script type="application/json">{univee_album_ssr}</script>',
+            [],
+        ),
+    }
+    blobs = {
+        "https://cdn.fb.com/full_1080.jpg": _jpeg_bytes((10, 200, 30)),
+        "https://cdn.fb.com/univee_full.jpg": _jpeg_bytes((200, 30, 10)),
+    }
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    page = _FakeFbPage(routes)
+    summary = FbCollector(
+        page,
+        FbCollectConfig(output_dir=out_dir, collect_pass="albums", cooldown=cooldown, max_scrolls=1),
+        request_context=_FakeRequestContext(blobs),
+    ).run_pass_albums()
+
+    # 1 new photo saved + 2 media files downloaded (1 new + 1 repaired on existing done post)
+    assert summary.items_saved == 1
+    assert summary.media_saved == 2
+
+    saved_profile_photo = json.loads((out_dir / "posts" / "3453035611497612.json").read_text(encoding="utf-8"))
+    assert saved_profile_photo["album_name"] == "프로필 사진"
+    assert saved_profile_photo["post_type"] == "album_photo"
+    assert len(saved_profile_photo["media"]) == 1
+    assert saved_profile_photo["comments"][0]["text"] == "잘 나왔네!"
+
+    repaired_univee = json.loads((out_dir / "posts" / "341813122619892.json").read_text(encoding="utf-8"))
+    assert repaired_univee["album_name"] == "Univee 사진첩"
+    assert repaired_univee["post_type"] == "album_photo"
+    assert len(repaired_univee["media"]) == 1
+
+    # Re-run should skip visiting the already-complete photo detail page
+    visited_urls: list[str] = []
+    orig_goto = page.goto
+
+    def _track_goto(url: str, **kwargs):
+        visited_urls.append(url)
+        return orig_goto(url, **kwargs)
+
+    page.goto = _track_goto  # type: ignore[method-assign]
+    summary2 = FbCollector(
+        page,
+        FbCollectConfig(output_dir=out_dir, collect_pass="albums", cooldown=cooldown, max_scrolls=1),
+        request_context=_FakeRequestContext(blobs),
+    ).run_pass_albums()
+    assert summary2.items_saved == 0
+    assert summary2.media_saved == 0
+    assert "https://www.facebook.com/photo/?fbid=3453035611497612&set=a.127326950735178" not in visited_urls
+
+
+def test_fb_posts_two_stage_scroll_pagination_and_standalone_feedback_comments(tmp_path: Path) -> None:
+    from meta_archive_pipeline.collect.fb_collector import (
+        extract_fb_comment_counts_from_payloads,
+        extract_fb_comments_and_reactions_from_payloads,
+        extract_fb_timeline_has_next_page,
+    )
+
+    page1_timeline = {
+        "data": {
+            "user": {
+                "timeline_list_feed_units": {
+                    "page_info": {"has_next_page": True, "end_cursor": "cur_1"},
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "Story",
+                                "post_id": "p_with_cmts",
+                                "permalink_url": "https://www.facebook.com/dbstnsdl12/posts/p_with_cmts",
+                                "creation_time": 1700000000,
+                                "message": {"text": "댓글 있는 글"},
+                                "feedback": {
+                                    "comments_count_summary_renderer": {
+                                        "feedback": {
+                                            "comment_rendering_instance": {
+                                                "comments": {"total_count": 2}
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+                        },
+                        {
+                            "node": {
+                                "__typename": "Story",
+                                "post_id": "p_no_cmts",
+                                "permalink_url": "https://www.facebook.com/dbstnsdl12/posts/p_no_cmts",
+                                "creation_time": 1690000000,
+                                "message": {"text": "댓글 없는 글"},
+                            }
+                        },
+                    ],
+                }
+            }
+        }
+    }
+    page2_timeline_end = {
+        "data": {
+            "user": {
+                "timeline_list_feed_units": {
+                    "page_info": {"has_next_page": False, "end_cursor": None},
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "Story",
+                                "post_id": "p_oldest",
+                                "permalink_url": "https://www.facebook.com/dbstnsdl12/posts/p_oldest",
+                                "creation_time": 1380000000,
+                                "message": {"text": "2013년 첫 글"},
+                            }
+                        }
+                    ],
+                }
+            }
+        }
+    }
+    standalone_feedback_2026 = {
+        "data": {
+            "node": {
+                "__typename": "Feedback",
+                "id": "fb_node_1",
+                "url": "https://www.facebook.com/dbstnsdl12/posts/p_with_cmts",
+                "comment_rendering_instance_for_feed_location": {
+                    "comments": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "__typename": "Comment",
+                                    "id": "c_2026_1",
+                                    "created_time": 1700000100,
+                                    "author": {"id": "u1", "name": "김광희"},
+                                    "body": {"text": "첫 댓글"},
+                                    "feedback": {
+                                        "reactors": {"count": 2},
+                                        "parent_object_ent": {
+                                            "__typename": "Comment",
+                                            "id": "c_2026_1",
+                                        },
+                                        "replies_connection": {
+                                            "edges": [
+                                                {
+                                                    "node": {
+                                                        "__typename": "Comment",
+                                                        "id": "r_2026_1",
+                                                        "created_time": 1700000200,
+                                                        "author": {"id": "me", "name": "민윤기"},
+                                                        "body": {"text": "대댓글 테스트"},
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                    },
+                                }
+                            },
+                            {
+                                "node": {
+                                    "__typename": "Comment",
+                                    "id": "c_2026_2",
+                                    "created_time": 1700000300,
+                                    "author": {"id": "u2", "name": "이상호"},
+                                    "body": {"text": "둘째 댓글"},
+                                }
+                            },
+                        ]
+                    }
+                },
+            }
+        }
+    }
+
+    assert extract_fb_comment_counts_from_payloads([page1_timeline]) == {"p_with_cmts": 2}
+    assert extract_fb_timeline_has_next_page([page1_timeline]) is True
+    assert extract_fb_timeline_has_next_page([page2_timeline_end]) is False
+
+    cmts, _ = extract_fb_comments_and_reactions_from_payloads([standalone_feedback_2026])
+    assert [c.text for c in cmts] == ["첫 댓글", "둘째 댓글"]
+    assert cmts[0].like_count == 2
+    assert [r.text for r in cmts[0].replies] == ["대댓글 테스트"]
+
+    class _Keyboard:
+        def __init__(self) -> None:
+            self.pressed: list[str] = []
+
+        def press(self, key: str) -> None:
+            self.pressed.append(key)
+
+    class _TwoStagePage(_FakeFbPage):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "https://www.facebook.com/me": (
+                        "<html></html>",
+                        [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(page1_timeline))],
+                    ),
+                    "https://www.facebook.com/dbstnsdl12/posts/p_with_cmts": (
+                        "<html></html>",
+                        [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(standalone_feedback_2026))],
+                    ),
+                },
+                visible_counts={"가장 관련성 높은 댓글": 1, "댓글 더 보기": 1},
+            )
+            self.keyboard = _Keyboard()
+            self.visited: list[str] = []
+            self.scrolls = 0
+            self.dialog_open = True
+
+        def goto(self, url: str, wait_until: str = "domcontentloaded") -> None:
+            self.visited.append(url)
+            super().goto(url, wait_until=wait_until)
+
+        def evaluate(self, script: str):
+            if "querySelectorAll" in script:
+                if self.dialog_open:
+                    self.dialog_open = False
+                    return True
+                return False
+            if "scrollTo" in script:
+                self.scrolls += 1
+                if self.scrolls == 1:
+                    # Emit page 2 with has_next_page=False while keeping scrollHeight flat to verify data-driven progress!
+                    for fn in self._handlers.get("response", []):
+                        fn(_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(page2_timeline_end)))
+                return None
+            return 1000
+
+    out_dir = tmp_path / "fb_two_stage"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    page = _TwoStagePage()
+    summary = FbCollector(
+        page,
+        FbCollectConfig(output_dir=out_dir, collect_pass="posts", cooldown=cooldown, max_scrolls=10),
+        request_context=_FakeRequestContext({}),
+    ).run_pass_posts()
+
+    assert summary.items_saved == 3
+    assert summary.comments_posts_fetched == 1
+    assert page.keyboard.pressed == ["Escape"]
+    # Stage 2 visited ONLY p_with_cmts, NOT p_no_cmts or p_oldest
+    assert page.visited == [
+        "https://www.facebook.com/me",
+        "https://www.facebook.com/dbstnsdl12/posts/p_with_cmts",
+    ]
+    assert page.clicked == ["가장 관련성 높은 댓글", "모든 댓글", "댓글 더 보기"]
+    saved = json.loads((out_dir / "posts" / "p_with_cmts.json").read_text(encoding="utf-8"))
+    assert [c["text"] for c in saved["comments"]] == ["첫 댓글", "둘째 댓글"]
+    assert [r["text"] for r in saved["comments"][0]["replies"]] == ["대댓글 테스트"]
+
+    # Re-run skips already-fetched comment detail page
+    page.visited.clear()
+    page.scrolls = 0
+    summary2 = FbCollector(
+        page,
+        FbCollectConfig(output_dir=out_dir, collect_pass="posts", cooldown=cooldown, max_scrolls=10),
+        request_context=_FakeRequestContext({}),
+    ).run_pass_posts()
+    assert summary2.items_saved == 0
+    assert summary2.comments_posts_fetched == 0
+    assert page.visited == ["https://www.facebook.com/me"]
+
+
+def test_fb_very_long_base64_post_id_is_hashed_safely_within_ntfs_limit(tmp_path: Path) -> None:
+    from meta_archive_pipeline.collect.fb_collector import _safe_filename_stem
+    from meta_archive_pipeline.utils.fs import atomic_write_bytes, to_long_path
+
+    long_id = "UzpfSUZTOjE6" + ("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789" * 13) + "=="
+    assert len(long_id) > 400
+    stem = _safe_filename_stem(long_id)
+    assert len(stem) <= 81
+    # Deterministic and collision-resistant for distinct suffixes
+    assert stem == _safe_filename_stem(long_id)
+    assert stem != _safe_filename_stem(long_id[:-2] + "XY")
+    # Normal numeric post_id stays unchanged
+    assert _safe_filename_stem("1387058544762006") == "1387058544762006"
+
+    # atomic_write_bytes also handles a valid 240-char target filename without exceeding 255-char temp limit
+    near_limit = tmp_path / ("x" * 235 + ".json")
+    atomic_write_bytes(near_limit, b'{"ok": true}')
+    assert Path(to_long_path(near_limit)).read_bytes() == b'{"ok": true}'
+
+    # End-to-end save & reload for a 450+ char GraphQL Story id without numeric post_id
+    long_story = {
+        "data": {
+            "node": {
+                "__typename": "Story",
+                "id": long_id,
+                "creation_time": 1410000000,
+                "message": {"text": "2014년 오래된 묶음 스토리"},
+            }
+        }
+    }
+    routes = {
+        "https://www.facebook.com/me": (
+            "<html></html>",
+            [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(long_story))],
+        )
+    }
+    out_dir = tmp_path / "fb_long_id"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = FbCollector(
+        _FakeFbPage(routes),
+        FbCollectConfig(output_dir=out_dir, collect_pass="posts", cooldown=cooldown, max_scrolls=1),
+        request_context=_FakeRequestContext({}),
+    ).run_pass_posts()
+
+    assert summary.items_saved == 1
+    saved_file = out_dir / "posts" / f"{stem}.json"
+    assert saved_file.exists()
+    saved = json.loads(saved_file.read_text(encoding="utf-8"))
+    assert saved["post_id"] == long_id
+    assert saved["caption"] == "2014년 오래된 묶음 스토리"
+
+
+def test_fb_skips_and_strips_comments_on_non_owner_tagged_posts_and_supports_comments_pass(
+    tmp_path: Path,
+) -> None:
+    timeline_payload = {
+        "data": {
+            "user": {
+                "profile_header_renderer": {
+                    "user": {
+                        "id": "100003736202459",
+                        "name": "민윤기",
+                        "url": "https://www.facebook.com/dbstnsdl12",
+                    }
+                },
+                "timeline_list_feed_units": {
+                    "page_info": {"has_next_page": False},
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "Story",
+                                "post_id": "own_post_1",
+                                "permalink_url": "https://www.facebook.com/dbstnsdl12/posts/own_post_1",
+                                "creation_time": 1700000000,
+                                "actors": [{"id": "100003736202459", "name": "민윤기"}],
+                                "message": {"text": "내 게시물"},
+                                "feedback": {
+                                    "comment_rendering_instance": {"comments": {"total_count": 1}}
+                                },
+                            }
+                        },
+                        {
+                            "node": {
+                                "__typename": "Story",
+                                "post_id": "tagged_by_other_1",
+                                "permalink_url": "https://www.facebook.com/otheruser/posts/tagged_by_other_1",
+                                "creation_time": 1700000100,
+                                "actors": [{"id": "9999999", "name": "다른사람"}],
+                                "message": {"text": "남이 나를 태그한 전역 글"},
+                                "feedback": {
+                                    "display_comments": {
+                                        "edges": [
+                                            {
+                                                "node": {
+                                                    "id": "foreign_c1",
+                                                    "created_time": 1700000200,
+                                                    "author": {"id": "888", "name": "남의친구"},
+                                                    "body": {"text": "전역 축하해!"},
+                                                }
+                                            }
+                                        ]
+                                    },
+                                    "comment_rendering_instance": {"comments": {"total_count": 73}},
+                                },
+                            }
+                        },
+                    ],
+                },
+            }
+        }
+    }
+    own_post_feedback = {
+        "data": {
+            "node": {
+                "__typename": "Feedback",
+                "id": "fb_own_1",
+                "comment_rendering_instance_for_feed_location": {
+                    "comments": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "__typename": "Comment",
+                                    "id": "own_c1",
+                                    "created_time": 1700000300,
+                                    "author": {"id": "777", "name": "내친구"},
+                                    "body": {"text": "내 글 댓글은 보존"},
+                                }
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+    }
+
+    visited: list[str] = []
+
+    class _TrackingPage(_FakeFbPage):
+        def goto(self, url: str, wait_until: str = "domcontentloaded") -> None:
+            visited.append(url)
+            super().goto(url, wait_until=wait_until)
+
+    routes = {
+        "https://www.facebook.com/me": (
+            "<html></html>",
+            [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(timeline_payload))],
+        ),
+        "https://www.facebook.com/dbstnsdl12/posts/own_post_1": (
+            "<html></html>",
+            [_FakeResp("https://www.facebook.com/api/graphql/", 200, json.dumps(own_post_feedback))],
+        ),
+    }
+
+    out_dir = tmp_path / "fb_non_owner"
+    cooldown = CooldownTracker(min_delay=0.0, max_delay=0.0, batch_size=0, sleep_fn=lambda _: None)
+    summary = FbCollector(
+        _TrackingPage(routes),
+        FbCollectConfig(output_dir=out_dir, collect_pass="posts", cooldown=cooldown, max_scrolls=2),
+        request_context=_FakeRequestContext({}),
+    ).run_pass_posts()
+
+    assert summary.items_saved == 2
+    assert summary.comments_posts_fetched == 1
+    # Must visit ONLY own_post_1, NEVER tagged_by_other_1
+    assert visited == [
+        "https://www.facebook.com/me",
+        "https://www.facebook.com/dbstnsdl12/posts/own_post_1",
+    ]
+    own_saved = json.loads((out_dir / "posts" / "own_post_1.json").read_text(encoding="utf-8"))
+    assert [c["text"] for c in own_saved["comments"]] == ["내 글 댓글은 보존"]
+    tagged_saved = json.loads((out_dir / "posts" / "tagged_by_other_1.json").read_text(encoding="utf-8"))
+    # Even inline comments on non-owner post must be stripped
+    assert tagged_saved["comments"] == []
+
+    # Now test standalone `comments` pass (Stage 2 only, without scrolling /me)
+    store = CheckpointStore(out_dir / "state_fb.json")
+    store.set_status("own_post_1", "done", meta={"comments_fetched": False, "expected_comment_count": 1})
+    own_saved["comments"] = []
+    (out_dir / "posts" / "own_post_1.json").write_text(json.dumps(own_saved, ensure_ascii=False), encoding="utf-8")
+
+    visited.clear()
+    summary_cmt = FbCollector(
+        _TrackingPage(routes),
+        FbCollectConfig(output_dir=out_dir, collect_pass="comments", cooldown=cooldown),
+        request_context=_FakeRequestContext({}),
+    ).run_pass_comments()
+    assert summary_cmt.comments_posts_fetched == 1
+    assert visited == ["https://www.facebook.com/dbstnsdl12/posts/own_post_1"]
+    own_saved2 = json.loads((out_dir / "posts" / "own_post_1.json").read_text(encoding="utf-8"))
+    assert [c["text"] for c in own_saved2["comments"]] == ["내 글 댓글은 보존"]
+
+
+
+
 
 

@@ -53,6 +53,7 @@ _CODE_SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,}$")
 _DOM_HREF_SHORTCODE_RE = re.compile(
     r"^/(?:([A-Za-z0-9._]+)/)?(?:p|reel|tv)/([A-Za-z0-9_-]{5,})(?:[/?#]|$)"
 )
+_DOM_HIGHLIGHT_HREF_RE = re.compile(r"/stories/highlights/(\d+)/?")
 _RESERVED_IG_SEGMENTS = frozenset({"explore", "accounts", "direct", "stories", "reels"})
 _EXCLUDED_SHORTCODE_CONTAINERS = frozenset(
     {
@@ -936,41 +937,78 @@ _EXCLUDED_USER_LIST_CONTAINERS = frozenset(
         "suggestions",
         "ayml_users",
         "coauthor_producers",
+        "get_slide_mailbox_for_iris_subscription",
+        "threads_by_folder",
+        "as_ig_direct_thread",
+        "direct_threads",
+        "inbox",
     }
 )
+_PLACEHOLDER_IG_USERNAMES = frozenset({"instagram 사용자", "instagram user"})
 _DIALOG_SCROLL_JS = """() => {
   const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+  if (dialogs.length === 0) {
+    return { hasDialog: false, x: 0, y: 0, height: 0, scrollTop: 0, moved: false, links: 0 };
+  }
   for (let i = dialogs.length - 1; i >= 0; i--) {
-    const els = [dialogs[i], ...dialogs[i].querySelectorAll('*')];
-    let best = null;
+    const dlg = dialogs[i];
+    const els = [dlg, ...dlg.querySelectorAll('*')];
+    const scrollables = [];
     for (const el of els) {
-      if (el.scrollHeight > el.clientHeight + 20) {
-        if (!best || el.scrollHeight > best.scrollHeight) best = el;
+      if (el.clientHeight <= 0 || el.scrollHeight <= el.clientHeight + 5) continue;
+      const oy = window.getComputedStyle(el).overflowY;
+      if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') {
+        scrollables.push(el);
       }
     }
-    if (best) {
-      const h = best.scrollHeight;
-      best.scrollTop = h;
-      return h;
+    if (scrollables.length > 0) {
+      scrollables.sort((a, b) => {
+        const aLinks = a.querySelectorAll('a[href]').length;
+        const bLinks = b.querySelectorAll('a[href]').length;
+        if (bLinks !== aLinks) return bLinks - aLinks;
+        return b.scrollHeight - a.scrollHeight;
+      });
+      const target = scrollables[0];
+      const r = target.getBoundingClientRect();
+      const x = Math.max(10, Math.min(r.x + r.width / 2, window.innerWidth - 10));
+      const y = Math.max(10, Math.min(r.y + r.height / 2, window.innerHeight - 10));
+      const links = target.querySelectorAll('a[href]');
+      return {
+        hasDialog: true,
+        x,
+        y,
+        height: target.scrollHeight,
+        scrollTop: target.scrollTop,
+        moved: false,
+        links: links.length,
+      };
     }
   }
-  const h = document.body.scrollHeight;
-  window.scrollTo(0, h);
-  return h;
+  const topDlg = dialogs[dialogs.length - 1];
+  const r = topDlg.getBoundingClientRect();
+  const x = Math.max(10, Math.min(r.x + r.width / 2, window.innerWidth - 10));
+  const y = Math.max(10, Math.min(r.y + r.height / 2, window.innerHeight - 10));
+  const links = topDlg.querySelectorAll('a[href]');
+  if (links.length > 0) {
+    try { links[links.length - 1].scrollIntoView({ block: 'end' }); } catch (e) {}
+  }
+  return { hasDialog: true, x, y, height: topDlg.scrollHeight, scrollTop: 0, moved: false, links: links.length };
 }"""
 _COMMENT_PANE_SCROLL_JS = """() => {
   const roots = Array.from(document.querySelectorAll('article, main'));
   let best = null;
   for (const root of roots) {
     for (const el of root.querySelectorAll('ul, div')) {
-      if (el.scrollHeight > el.clientHeight + 40 && el.clientHeight >= 150) {
-        if (!best || el.scrollHeight > best.scrollHeight) best = el;
-      }
+      if (el.clientHeight < 150 || el.scrollHeight <= el.clientHeight + 40) continue;
+      const oy = window.getComputedStyle(el).overflowY;
+      if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') continue;
+      if (!best || el.scrollHeight > best.scrollHeight) best = el;
     }
   }
   if (!best) return 0;
   const h = best.scrollHeight;
   best.scrollTop = h;
+  best.dispatchEvent(new Event('scroll', { bubbles: true }));
   return h;
 }"""
 
@@ -990,18 +1028,25 @@ def _walk_filtered_dicts(
             yield from _walk_filtered_dicts(item, excluded_keys)
 
 
+def _is_direct_thread_dict(d: dict[str, Any]) -> bool:
+    return any(k in d for k in ("thread_key", "thread_title", "slide_read_receipts", "thread_subtype"))
+
+
 def extract_ig_likers_from_payloads(payloads: Sequence[dict[str, Any]]) -> list[UserRef]:
     """Extract deduplicated users who liked a post from modal /likers/ or GraphQL payloads."""
     seen: dict[str, UserRef] = {}
     for payload in payloads:
         for d in _walk_filtered_dicts(payload, _EXCLUDED_USER_LIST_CONTAINERS):
             user_dicts: list[dict[str, Any]] = []
-            if isinstance(d.get("users"), list):
-                user_dicts.extend(u for u in d["users"] if isinstance(u, dict))
+            if isinstance(d.get("likers_connection"), dict):
+                user_dicts.extend(_extract_edge_nodes(d["likers_connection"]))
             if isinstance(d.get("edge_liked_by"), dict):
                 user_dicts.extend(_extract_edge_nodes(d["edge_liked_by"]))
+            if isinstance(d.get("users"), list) and not _is_direct_thread_dict(d):
+                user_dicts.extend(u for u in d["users"] if isinstance(u, dict))
             for raw_user in user_dicts:
-                if "username" not in raw_user:
+                uname = raw_user.get("username")
+                if not isinstance(uname, str) or not uname or uname.strip().lower() in _PLACEHOLDER_IG_USERNAMES:
                     continue
                 ref = _user_ref_from_dict(raw_user)
                 key = ref.user_id or ref.username
@@ -1024,7 +1069,7 @@ def extract_ig_connections_from_payloads(
     for payload in payloads:
         for d in _walk_filtered_dicts(payload, _EXCLUDED_USER_LIST_CONTAINERS):
             user_dicts: list[dict[str, Any]] = []
-            if isinstance(d.get("users"), list):
+            if isinstance(d.get("users"), list) and not _is_direct_thread_dict(d):
                 user_dicts.extend(u for u in d["users"] if isinstance(u, dict))
             edge_key = "edge_followed_by" if relation == "follower" else "edge_follow"
             if isinstance(d.get(edge_key), dict):
@@ -1032,7 +1077,11 @@ def extract_ig_connections_from_payloads(
 
             for raw_user in user_dicts:
                 username = raw_user.get("username")
-                if not isinstance(username, str) or not username:
+                if (
+                    not isinstance(username, str)
+                    or not username
+                    or username.strip().lower() in _PLACEHOLDER_IG_USERNAMES
+                ):
                     continue
                 if exclude_norm and username.strip().lower() == exclude_norm:
                     continue
@@ -1081,6 +1130,35 @@ def _is_highlight_item(
     return True
 
 
+def _extract_highlight_cover_url(item: dict[str, Any]) -> str | None:
+    cover_media = item.get("cover_media")
+    if isinstance(cover_media, dict):
+        for key in ("cropped_image_version", "full_image_version"):
+            sub = cover_media.get(key)
+            if isinstance(sub, dict) and isinstance(sub.get("url"), str) and sub["url"]:
+                return sub["url"]
+        if isinstance(cover_media.get("thumbnail_src"), str) and cover_media["thumbnail_src"]:
+            return cover_media["thumbnail_src"]
+    return None
+
+
+def _collect_highlight_tray_entries(d: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:
+    entries: list[tuple[dict[str, Any], bool]] = [
+        (item, True) for item in _extract_edge_nodes(d.get("edge_highlight_reels"))
+    ]
+    if isinstance(d.get("tray"), list):
+        entries.extend((t, False) for t in d["tray"] if isinstance(t, dict))
+    for key, val in d.items():
+        if key == "edge_highlight_reels":
+            continue
+        if isinstance(val, dict) and isinstance(val.get("edges"), list):
+            for node in _extract_edge_nodes(val):
+                nid = str(node.get("id") or "")
+                if nid.startswith("highlight:") or str(node.get("reel_type") or "").lower() == "highlight_reel":
+                    entries.append((node, False))
+    return entries
+
+
 def extract_ig_highlight_tray_ids(
     payloads: Sequence[dict[str, Any]],
     *,
@@ -1091,12 +1169,7 @@ def extract_ig_highlight_tray_ids(
     ordered: list[str] = []
     for payload in payloads:
         for d in _walk_dicts(payload):
-            tray_entries: list[tuple[dict[str, Any], bool]] = [
-                (item, True) for item in _extract_edge_nodes(d.get("edge_highlight_reels"))
-            ]
-            if isinstance(d.get("tray"), list):
-                tray_entries.extend((t, False) for t in d["tray"] if isinstance(t, dict))
-            for item, from_edge in tray_entries:
+            for item, from_edge in _collect_highlight_tray_entries(d):
                 if not _is_highlight_item(
                     item,
                     from_edge_highlight_reels=from_edge,
@@ -1124,13 +1197,7 @@ def extract_ig_highlights_from_payloads(
     # Pass 1: collect all highlight group metadata (title, cover) regardless of JSON key order.
     for payload in payloads:
         for d in _walk_dicts(payload):
-            tray_entries: list[tuple[dict[str, Any], bool]] = [
-                (item, True) for item in _extract_edge_nodes(d.get("edge_highlight_reels"))
-            ]
-            if isinstance(d.get("tray"), list):
-                tray_entries.extend((t, False) for t in d["tray"] if isinstance(t, dict))
-
-            for item, from_edge in tray_entries:
+            for item, from_edge in _collect_highlight_tray_entries(d):
                 if not _is_highlight_item(
                     item,
                     from_edge_highlight_reels=from_edge,
@@ -1138,16 +1205,10 @@ def extract_ig_highlights_from_payloads(
                 ):
                     continue
                 hid = str(item.get("id") or "")
-                title = item.get("title") if isinstance(item.get("title"), str) else None
-                cover_url: str | None = None
-                cover_media = item.get("cover_media")
-                if isinstance(cover_media, dict):
-                    cropped = cover_media.get("cropped_image_version")
-                    if isinstance(cropped, dict) and isinstance(cropped.get("url"), str):
-                        cover_url = cropped["url"]
-                    elif isinstance(cover_media.get("thumbnail_src"), str):
-                        cover_url = cover_media["thumbnail_src"]
-                highlight_meta[hid] = (title, cover_url)
+                title = item.get("title") if isinstance(item.get("title"), str) and item["title"] else None
+                cover_url = _extract_highlight_cover_url(item)
+                prev_title, prev_cover = highlight_meta.get(hid, (None, None))
+                highlight_meta[hid] = (title or prev_title, cover_url or prev_cover)
 
     # Pass 2: extract highlight story items and join with collected highlight metadata.
     for payload in payloads:
@@ -1176,8 +1237,9 @@ def extract_ig_highlights_from_payloads(
                 title = group.get("title") if isinstance(group.get("title"), str) else None
                 meta_title, meta_cover = highlight_meta.get(hid, (None, None))
                 resolved_title = title or meta_title
-                if meta_cover:
-                    media_urls.setdefault(f"cover:{hid}", meta_cover)
+                resolved_cover = _extract_highlight_cover_url(group) or meta_cover
+                if resolved_cover:
+                    media_urls.setdefault(f"cover:{hid}", resolved_cover)
 
                 for raw_story in group.get("items", []):
                     if not isinstance(raw_story, dict):
@@ -1420,6 +1482,52 @@ class IgCollector:
             pass
         return []
 
+    def _harvest_dom_highlights(self) -> list[dict[str, Any]]:
+        try:
+            raw_items = self.page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href*="/stories/highlights/"]')).map(a => {
+                  const img = a.querySelector('img');
+                  return {
+                    href: a.getAttribute('href') || '',
+                    text: (a.innerText || '').trim(),
+                    imgSrc: img ? (img.getAttribute('src') || '') : '',
+                  };
+                })"""
+            )
+            if not isinstance(raw_items, list):
+                return []
+        except Exception:
+            return []
+
+        tray: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            href = item.get("href")
+            if not isinstance(href, str):
+                continue
+            m = _DOM_HIGHLIGHT_HREF_RE.search(href)
+            if not m:
+                continue
+            hid = f"highlight:{m.group(1)}"
+            if hid in seen:
+                continue
+            seen.add(hid)
+            entry: dict[str, Any] = {
+                "id": hid,
+                "reel_type": "highlight_reel",
+                "user": {"username": self.config.username},
+            }
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                entry["title"] = text.strip()
+            img_src = item.get("imgSrc")
+            if isinstance(img_src, str) and img_src.strip():
+                entry["cover_media"] = {"thumbnail_src": img_src.strip()}
+            tray.append(entry)
+        return tray
+
     def _visit_and_collect(self, url: str) -> list[dict[str, Any]]:
         self.collector.drain()
         self.page.goto(url, wait_until="domcontentloaded")
@@ -1449,12 +1557,16 @@ class IgCollector:
     ) -> list[dict[str, Any]]:
         collected: list[dict[str, Any]] = []
         last_height = -1
+        last_scroll_top = -1
+        last_links = -1
         stagnant = 0
+        max_stagnant = 4 if scroll_target == "dialog" else 2
 
         for _ in range(max_scrolls):
             self.collector.raise_if_unsafe()
             check_page_safety(str(getattr(self.page, "url", "")), self._safe_body_text())
-            for resp in self.collector.drain():
+            pre_drained = self.collector.drain()
+            for resp in pre_drained:
                 collected.extend(resp.payloads)
             if dom_shortcodes is not None:
                 for sc in self._harvest_dom_shortcodes():
@@ -1475,9 +1587,27 @@ class IgCollector:
                 if len(found) >= stop_count:
                     break
 
+            moved = False
+            scroll_top = -1
+            links_cnt = -1
             try:
                 if scroll_target == "dialog":
-                    height = self.page.evaluate(_DIALOG_SCROLL_JS)
+                    res = self.page.evaluate(_DIALOG_SCROLL_JS)
+                    if isinstance(res, dict):
+                        if res.get("hasDialog") is False:
+                            break
+                        height = int(res.get("height") or 0)
+                        scroll_top = int(res.get("scrollTop") or 0)
+                        moved = bool(res.get("moved"))
+                        links_cnt = int(res.get("links") or 0)
+                        mouse = getattr(self.page, "mouse", None)
+                        rx = res.get("x")
+                        ry = res.get("y")
+                        if mouse is not None and isinstance(rx, (int, float)) and isinstance(ry, (int, float)) and rx > 0 and ry > 0:
+                            mouse.move(float(rx), float(ry))
+                            mouse.wheel(0, 1500)
+                    else:
+                        height = int(res or 0)
                 else:
                     height = self.page.evaluate("() => document.body.scrollHeight")
                     self.page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
@@ -1485,13 +1615,31 @@ class IgCollector:
                 break
             self.config.cooldown.wait_step()
 
-            if height == last_height:
+            post_drained = self.collector.drain()
+            new_payloads_cnt = sum(len(r.payloads) for r in pre_drained) + sum(
+                len(r.payloads) for r in post_drained
+            )
+            for resp in post_drained:
+                collected.extend(resp.payloads)
+
+            progressed = (
+                height != last_height
+                or moved
+                or (scroll_top >= 0 and scroll_top != last_scroll_top)
+                or (links_cnt >= 0 and links_cnt != last_links)
+                or new_payloads_cnt > 0
+            )
+            if not progressed:
                 stagnant += 1
-                if stagnant >= 2:
+                if stagnant >= max_stagnant:
                     break
             else:
                 stagnant = 0
                 last_height = height
+                if scroll_top >= 0:
+                    last_scroll_top = scroll_top
+                if links_cnt >= 0:
+                    last_links = links_cnt
 
         for resp in self.collector.drain():
             collected.extend(resp.payloads)
@@ -1558,6 +1706,9 @@ class IgCollector:
                     stop_count=self.config.limit,
                     owner_username=self.config.username,
                 )
+                dom_highlights = self._harvest_dom_highlights()
+                if dom_highlights:
+                    profile_payloads.append({"tray": dom_highlights})
                 profile, avatar_url = extract_ig_profile_from_payloads(
                     profile_payloads,
                     target_username=self.config.username,
@@ -1772,9 +1923,18 @@ class IgCollector:
             summary.processed += 1
             try:
                 payloads = self._visit_and_collect(f"https://www.instagram.com/p/{sc}/liked_by/")
-                payloads.extend(
-                    self._scroll_and_collect(min(20, self.config.max_scrolls), scroll_target="dialog")
+                initial_users = extract_ig_likers_from_payloads(payloads)
+                has_more_likers = any(
+                    isinstance(d.get("likers_connection"), dict)
+                    and isinstance(d["likers_connection"].get("page_info"), dict)
+                    and bool(d["likers_connection"]["page_info"].get("has_next_page"))
+                    for p in payloads
+                    for d in _walk_dicts(p)
                 )
+                if not initial_users or has_more_likers:
+                    payloads.extend(
+                        self._scroll_and_collect(min(20, self.config.max_scrolls), scroll_target="window")
+                    )
                 users = extract_ig_likers_from_payloads(payloads)
 
                 expected_count: int | None = None
@@ -1808,6 +1968,50 @@ class IgCollector:
                 summary.failed += 1
         return summary
 
+    def _has_open_dialog(self) -> bool | None:
+        try:
+            res = self.page.evaluate(
+                "() => document.querySelectorAll('[role=\"dialog\"]').length > 0"
+            )
+            if isinstance(res, bool):
+                return res
+        except Exception:
+            pass
+        return None
+
+    def _click_connections_trigger(self, suffix: Literal["followers", "following"]) -> bool:
+        selectors = (
+            f'a[href*="/{self.config.username}/{suffix}/"]',
+            f'a[href*="/{suffix}/"]',
+            f'header a[href*="{suffix}"]',
+        )
+        loc_fn = getattr(self.page, "locator", None)
+        if callable(loc_fn):
+            for sel in selectors:
+                try:
+                    loc = loc_fn(sel).first
+                    if loc.count() > 0 and loc.is_visible():
+                        loc.click()
+                        return True
+                except Exception:
+                    continue
+
+        labels = (
+            ("팔로워", "followers")
+            if suffix == "followers"
+            else ("팔로우", "팔로잉", "following")
+        )
+        for label in labels:
+            for role in ("link", "button"):
+                try:
+                    loc = self.page.get_by_role(role, name=label)
+                    if loc.count() > 0 and loc.nth(0).is_visible():
+                        loc.nth(0).click()
+                        return True
+                except Exception:
+                    continue
+        return False
+
     def run_pass_connections(self) -> IgCollectSummary:
         """Pass 2 (optional): collect followers and following lists with optional avatars."""
         summary = IgCollectSummary(collect_pass="connections")
@@ -1819,7 +2023,19 @@ class IgCollector:
             try:
                 url = f"https://www.instagram.com/{self.config.username}/{suffix}/"
                 payloads = self._visit_and_collect(url)
+                if self._has_open_dialog() is False:
+                    clicked = self._click_connections_trigger(suffix)  # type: ignore[arg-type]
+                    if not clicked:
+                        profile_url = f"https://www.instagram.com/{self.config.username}/"
+                        payloads.extend(self._visit_and_collect(profile_url))
+                        clicked = self._click_connections_trigger(suffix)  # type: ignore[arg-type]
+                    if clicked:
+                        self.config.cooldown.wait_step()
+                        self.collector.raise_if_unsafe()
+                        for resp in self.collector.drain():
+                            payloads.extend(resp.payloads)
                 payloads.extend(self._scroll_and_collect(self.config.max_scrolls, scroll_target="dialog"))
+                _write_json_atomic(out / "raw" / "connections" / f"{suffix}.json", payloads)
                 conns, avatar_urls = extract_ig_connections_from_payloads(
                     payloads,
                     relation,  # type: ignore[arg-type]
@@ -1898,11 +2114,6 @@ class IgCollector:
                 summary.processed += 1
                 try:
                     post_payloads = self._visit_and_collect(f"https://www.instagram.com/p/{sc}/")
-                    expand_ig_comments(
-                        self.page,
-                        self.config.cooldown,
-                        max_clicks=self.config.max_expand_clicks,
-                    )
                     self.collector.raise_if_unsafe()
                     for resp in self.collector.drain():
                         post_payloads.extend(resp.payloads)
@@ -1914,6 +2125,8 @@ class IgCollector:
                     if post is None:
                         raise RuntimeError(f"Could not extract tagged post payload for shortcode {sc}")
                     post.post_type = "tagged"
+                    if (post.author.username or "").lower() != self.config.username.lower():
+                        post.comments = []
 
                     if self.request_context is not None and candidates:
                         saved_media = download_post_media(
