@@ -1749,6 +1749,146 @@ def test_fb_skips_and_strips_comments_on_non_owner_tagged_posts_and_supports_com
     assert [c["text"] for c in own_saved2["comments"]] == ["내 글 댓글은 보존"]
 
 
+def test_extract_fb_friends_supports_2026_comet_image_v2() -> None:
+    payload = {
+        "data": {
+            "node": {
+                "pageItems": {
+                    "edges": [
+                        {
+                            "node": {
+                                "__typename": "TimelineAppCollectionItem",
+                                "id": "app_item_1",
+                                "title": {"text": "이대봉"},
+                                "url": "https://www.facebook.com/daebong",
+                                "image_v2": {"uri": "https://scontent.fbcdn.net/v2_avatar.jpg"},
+                                "node": {"__typename": "User", "id": "10001"},
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    friends, avatars = extract_fb_friends_from_payloads([payload])
+    assert len(friends) == 1
+    assert friends[0].full_name == "이대봉"
+    assert avatars == {"app_item_1": "https://scontent.fbcdn.net/v2_avatar.jpg"}
+
+
+def test_extract_fb_posts_large_share_image_and_attached_story_thumb() -> None:
+    payloads = [
+        {
+            "data": {
+                "node": {
+                    "__typename": "Story",
+                    "post_id": "p_link_large",
+                    "creation_time": 1700000000,
+                    "attachments": [
+                        {
+                            "styles": {
+                                "attachment": {
+                                    "url": "https://l.facebook.com/l.php?u=https%3A%2F%2Fbrunch.co.kr%2F%40dev%2F1",
+                                    "title_with_entities": {"text": "좋은 글"},
+                                    "description": {"text": "요약 설명"},
+                                    "media": {
+                                        "__typename": "ExternalUrl",
+                                        "large_share_image": {
+                                            "uri": "https://external.fbcdn.net/emg1/large_og.jpg"
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    ],
+                }
+            }
+        },
+        {
+            "data": {
+                "node": {
+                    "__typename": "Story",
+                    "post_id": "p_attached_photo",
+                    "creation_time": 1700000100,
+                    "attached_story": {
+                        "permalink_url": "https://www.facebook.com/orig/posts/999",
+                        "actors": [
+                            {
+                                "name": "원작자",
+                                "profile_picture": {"uri": "https://scontent.fbcdn.net/actor_40x40.jpg"},
+                            }
+                        ],
+                        "message": {"text": "공유한 원글"},
+                        "comet_sections": {
+                            "attached_story_layout": {
+                                "story": {
+                                    "attachments": [
+                                        {
+                                            "styles": {
+                                                "attachment": {
+                                                    "media": {
+                                                        "photo_image": {
+                                                            "uri": "https://scontent.fbcdn.net/shared_photo.jpg"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                    },
+                }
+            }
+        },
+        {
+            "data": {
+                "node": {
+                    "__typename": "Story",
+                    "post_id": "p_attached_video",
+                    "creation_time": 1700000200,
+                    "attached_story": {
+                        "permalink_url": "https://www.facebook.com/orig/videos/888",
+                        "actors": [{"name": "영상페이지"}],
+                        "comet_sections": {
+                            "attached_story_layout": {
+                                "story": {
+                                    "attachments": [
+                                        {
+                                            "styles": {
+                                                "attachment": {
+                                                    "media": {
+                                                        "preferred_thumbnail": {
+                                                            "image": {
+                                                                "uri": "https://scontent.fbcdn.net/video_thumb.jpg"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                    },
+                }
+            }
+        },
+    ]
+
+    posts, candidates = extract_fb_posts_from_payloads(payloads)
+    assert len(posts) == 3
+    thumbs = {c.post_id: c.progressive_url for c in candidates if c.is_link_thumbnail}
+    assert thumbs == {
+        "p_link_large": "https://external.fbcdn.net/emg1/large_og.jpg",
+        "p_attached_photo": "https://scontent.fbcdn.net/shared_photo.jpg",
+        "p_attached_video": "https://scontent.fbcdn.net/video_thumb.jpg",
+    }
+
+
+
 
 
 

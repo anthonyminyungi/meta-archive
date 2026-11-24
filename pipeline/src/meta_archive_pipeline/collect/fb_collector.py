@@ -244,10 +244,15 @@ def extract_fb_friends_from_payloads(
             return
 
         avatar_url: str | None = None
-        for pic_key in ("image", "profile_picture", "profilePicture"):
-            pic_obj = inner.get(pic_key)
-            if isinstance(pic_obj, dict) and isinstance(pic_obj.get("uri"), str):
-                avatar_url = pic_obj["uri"]
+        for holder in (inner, nested):
+            if not isinstance(holder, dict):
+                continue
+            for pic_key in ("image_v2", "image", "profile_picture", "profilePicture"):
+                pic_obj = holder.get(pic_key)
+                if isinstance(pic_obj, dict) and isinstance(pic_obj.get("uri"), str) and pic_obj["uri"]:
+                    avatar_url = pic_obj["uri"]
+                    break
+            if avatar_url:
                 break
 
         key = uid or profile_url or full_name
@@ -498,6 +503,34 @@ def _extract_fb_media_from_attachment(
         )
 
 
+_SHARE_IMAGE_KEYS = (
+    "large_share_image",
+    "flexible_height_share_image",
+    "card_image",
+    "viewer_image",
+    "photo_image",
+    "preferred_thumbnail",
+    "thumbnailImage",
+    "image",
+)
+
+
+def _extract_media_image_uri(media_obj: Any) -> str | None:
+    """Extract a content thumbnail/image URI from a Comet attachment `media` dict."""
+    if not isinstance(media_obj, dict):
+        return None
+    for img_key in _SHARE_IMAGE_KEYS:
+        img = media_obj.get(img_key)
+        if not isinstance(img, dict):
+            continue
+        uri = img.get("uri")
+        if not (isinstance(uri, str) and uri) and isinstance(img.get("image"), dict):
+            uri = img["image"].get("uri")
+        if isinstance(uri, str) and uri.startswith(("http://", "https://")) and "rsrc.php" not in uri:
+            return uri
+    return None
+
+
 def _pick_fb_text(val: Any) -> str | None:
     if isinstance(val, str):
         return val.strip() or None
@@ -564,12 +597,7 @@ def _extract_link_card_from_attachment(
         source_name = source_name or _pick_fb_text(node.get("source"))
 
         if not thumb_url and isinstance(node.get("media"), dict):
-            m = node["media"]
-            for img_key in ("image", "photo_image", "viewer_image"):
-                img = m.get(img_key)
-                if isinstance(img, dict) and isinstance(img.get("uri"), str) and img["uri"]:
-                    thumb_url = img["uri"]
-                    break
+            thumb_url = _extract_media_image_uri(node["media"])
 
     if not clean_url:
         return None
@@ -657,16 +685,38 @@ def _merge_fb_reactions(summaries: Sequence[ReactionSummary]) -> ReactionSummary
     return ReactionSummary(total=total, by_type=by_type)
 
 
+def _extract_attached_story_thumb_url(holders: Sequence[dict[str, Any]]) -> str | None:
+    """Extract the primary shared content image/video thumbnail from an `attached_story`."""
+    for holder in holders:
+        for node in _walk_dicts(holder):
+            atts = node.get("attachments")
+            if not isinstance(atts, list):
+                continue
+            for att in atts:
+                if not isinstance(att, dict):
+                    continue
+                for sub in _walk_dicts(att):
+                    uri = _extract_media_image_uri(sub.get("media"))
+                    if uri:
+                        return uri
+    return None
+
+
 def _extract_attached_story_ref(
     d: dict[str, Any],
     content_story: dict[str, Any],
-) -> SharedPostRef | None:
+) -> tuple[SharedPostRef | None, str | None]:
     holders: list[dict[str, Any]] = []
     for cand in (d.get("attached_story"), content_story.get("attached_story")):
         if isinstance(cand, dict):
             holders.append(cand)
+    comet = d.get("comet_sections")
+    if isinstance(comet, dict):
+        att_sec = comet.get("attached_story")
+        if isinstance(att_sec, dict):
+            holders.append(att_sec)
     if not holders:
-        return None
+        return None, None
 
     att_url: str | None = None
     att_author: str | None = None
@@ -693,17 +743,25 @@ def _extract_attached_story_ref(
                 msg = node.get("message")
                 if isinstance(msg, dict) and isinstance(msg.get("text"), str) and msg["text"].strip():
                     att_text = msg["text"]
-            if not att_title and isinstance(node.get("title"), str) and node["title"].strip():
-                att_title = node["title"].strip()
+            if not att_title:
+                cand_title = _pick_fb_text(node.get("title_with_entities"))
+                if not cand_title and isinstance(node.get("title"), str):
+                    cand_title = node["title"].strip() or None
+                if cand_title:
+                    att_title = cand_title
 
+    thumb_url = _extract_attached_story_thumb_url(holders)
     if not any((att_url, att_author, att_text, att_title)):
-        return None
-    return SharedPostRef(
-        url=att_url,
-        author_name=att_author,
-        text=att_text,
-        title=att_title,
-        domain=extract_domain(att_url),
+        return None, None
+    return (
+        SharedPostRef(
+            url=att_url,
+            author_name=att_author,
+            text=att_text,
+            title=att_title,
+            domain=extract_domain(att_url),
+        ),
+        thumb_url,
     )
 
 
@@ -812,7 +870,7 @@ def extract_fb_posts_from_payloads(
                 d.get("album_name") if isinstance(d.get("album_name"), str) else None
             )
 
-            shared_post = _extract_attached_story_ref(d, content_story)
+            shared_post, attached_thumb_url = _extract_attached_story_ref(d, content_story)
 
             feedbacks = _find_story_feedbacks(d)
             reactions = _merge_fb_reactions([_extract_fb_reactions(fb) for fb in feedbacks])
@@ -902,6 +960,17 @@ def extract_fb_posts_from_payloads(
                             if len(post_candidates) > before:
                                 break
 
+            if attached_thumb_url and not any(c.is_link_thumbnail for c in post_candidates):
+                post_candidates.append(
+                    FbMediaDownloadCandidate(
+                        post_id=post_id,
+                        media_id=None,
+                        media_type="image",
+                        progressive_url=attached_thumb_url,
+                        is_link_thumbnail=True,
+                    )
+                )
+
             regular_candidates = [c for c in post_candidates if not c.is_link_thumbnail]
             if album_name:
                 post_type: Literal["post", "carousel", "reel", "album_photo", "shared", "other"] = "album_photo"
@@ -953,6 +1022,10 @@ def extract_fb_posts_from_payloads(
                 )
                 if not candidates_by_post[post_id] and post_candidates:
                     candidates_by_post[post_id] = post_candidates
+                elif not any(c.is_link_thumbnail for c in candidates_by_post[post_id]):
+                    extra_thumbs = [c for c in post_candidates if c.is_link_thumbnail]
+                    if extra_thumbs:
+                        candidates_by_post[post_id].extend(extra_thumbs)
 
     all_candidates: list[FbMediaDownloadCandidate] = []
     for pid in posts_by_id:
@@ -1720,6 +1793,11 @@ class FbCollector:
                     if avatar_url:
                         fname = f"{_safe_filename_stem(conn.user_id or str(idx))}.jpg"
                         dest = out / "media" / "avatars" / fname
+                        if dest.exists() and verify_image(dest).ok:
+                            conn.avatar_local_path = normalize_rel_path(
+                                f"media/facebook/avatars/{fname}"
+                            )
+                            continue
                         try:
                             download_media_via_context(
                                 self.request_context,
@@ -1727,12 +1805,16 @@ class FbCollector:
                                 dest,
                                 headers={"Referer": "https://www.facebook.com/"},
                             )
-                            conn.avatar_local_path = normalize_rel_path(
-                                f"media/facebook/avatars/{fname}"
-                            )
-                            summary.media_saved += 1
+                            if verify_image(dest).ok:
+                                conn.avatar_local_path = normalize_rel_path(
+                                    f"media/facebook/avatars/{fname}"
+                                )
+                                summary.media_saved += 1
+                            elif dest.exists():
+                                dest.unlink()
                         except Exception:
-                            pass
+                            if dest.exists():
+                                dest.unlink()
 
             _write_json_atomic(
                 out / "friends.json",
@@ -1852,6 +1934,37 @@ class FbCollector:
                         else post.author
                     )
                     merged_shared = _merge_shared_post_refs(prev.shared_post, post.shared_post)
+                    thumb_cands = [c for c in post_cands if c.is_link_thumbnail and c.progressive_url]
+                    if (
+                        self.request_context is not None
+                        and merged_shared is not None
+                        and not merged_shared.thumbnail_local_path
+                        and thumb_cands
+                        and thumb_cands[0].progressive_url
+                    ):
+                        stem = _safe_filename_stem(post.post_id)
+                        thumb_dest = out / "media" / "links" / f"{stem}_thumb.jpg"
+                        try:
+                            download_media_via_context(
+                                self.request_context,
+                                thumb_cands[0].progressive_url,
+                                thumb_dest,
+                                headers={"Referer": "https://www.facebook.com/"},
+                            )
+                            if verify_image(thumb_dest).ok:
+                                merged_shared = merged_shared.model_copy(
+                                    update={
+                                        "thumbnail_local_path": normalize_rel_path(
+                                            f"media/facebook/links/{stem}_thumb.jpg"
+                                        )
+                                    }
+                                )
+                                summary.media_saved += 1
+                            elif thumb_dest.exists():
+                                thumb_dest.unlink()
+                        except Exception:
+                            if thumb_dest.exists():
+                                thumb_dest.unlink()
                     changed = (
                         media_added
                         or comments_changed

@@ -213,6 +213,55 @@ def collect_fb_cmd(
         console.print(f"[yellow]안전 일시중지:[/yellow] {summary.paused_reason}")
 
 
+@app.command("enrich-fb")
+def enrich_fb_cmd(
+    collected_dir: Annotated[
+        Path,
+        typer.Option("--collected-dir", help="수집된 Facebook 디렉터리 (raw/ 포함)"),
+    ] = Path("workspace_data/collected/facebook"),
+    friends: Annotated[
+        bool,
+        typer.Option("--friends/--no-friends", help="raw/friends.json 기반 친구 프로필 사진 보강"),
+    ] = True,
+    links: Annotated[
+        bool,
+        typer.Option("--links/--no-links", help="raw/posts/ 및 외부 OG 기반 공유 썸네일 보강"),
+    ] = True,
+    external_og: Annotated[
+        bool,
+        typer.Option("--external-og/--no-external-og", help="CDN 누락/만료 시 외부 URL og:image 조회"),
+    ] = True,
+    concurrency: Annotated[
+        int,
+        typer.Option("--concurrency", help="동시 다운로드 워커 수"),
+    ] = 8,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="테스트용 항목 수 제한 (친구/링크 각각 적용)"),
+    ] = None,
+) -> None:
+    """Hydrate Facebook friend avatars and shared link/post thumbnails from raw payloads and OG tags."""
+    from meta_archive_pipeline.collect.fb_enricher import enrich_facebook_collected
+
+    summary = enrich_facebook_collected(
+        collected_dir=collected_dir,
+        enrich_friends=friends,
+        enrich_links=links,
+        fetch_external_og=external_og,
+        limit=limit,
+        concurrency=concurrency,
+    )
+    console.print(
+        f"[FB enrich-friends] 전체={summary.friends_total}, 신규다운로드={summary.friends_avatars_downloaded}, "
+        f"기존유지={summary.friends_avatars_skipped_existing}, 실패={summary.friends_avatars_failed}"
+    )
+    console.print(
+        f"[FB enrich-links] 스캔게시물={summary.posts_scanned}, "
+        f"원본CDN다운로드={summary.thumbs_from_raw_downloaded}, 외부OG다운로드={summary.thumbs_from_og_downloaded}, "
+        f"기존유지={summary.thumbs_skipped_existing}, 실패={summary.thumbs_failed}"
+    )
+
+
 @app.command()
 def verify(
     ig_official: Annotated[
