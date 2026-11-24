@@ -94,6 +94,129 @@ class ArchiveReader:
         self.db_path = self.archive_dir / "archive.sqlite"
         self._col_cache: dict[str, set[str]] = {}
         self._table_cache: set[str] | None = None
+        self._avatar_cache: dict[str, Any] | None = None
+
+    def _get_avatar_index(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        if self._avatar_cache is not None:
+            return self._avatar_cache
+
+        by_plat_user: dict[tuple[str, str], str] = {}
+        by_plat_name: dict[tuple[str, str], str] = {}
+        name_candidates: dict[str, set[str]] = {}
+        owner_names: dict[str, set[str]] = {}
+        owner_avatars: dict[str, str] = {}
+
+        if self._has_table(conn, "profiles"):
+            for r in conn.execute(
+                "SELECT platform, username, full_name, avatar_local_path FROM profiles"
+            ).fetchall():
+                plat = (r["platform"] or "").lower()
+                u = (r["username"] or "").strip().lower()
+                n = (r["full_name"] or "").strip().lower()
+                av = (r["avatar_local_path"] or "").strip()
+                if u:
+                    owner_names.setdefault(plat, set()).add(u)
+                if n:
+                    owner_names.setdefault(plat, set()).add(n)
+                if av:
+                    owner_avatars[plat] = av
+                    if u:
+                        by_plat_user[(plat, u)] = av
+                    if n:
+                        by_plat_name[(plat, n)] = av
+                        name_candidates.setdefault(n, set()).add(av)
+
+        if self._has_table(conn, "connections"):
+            for r in conn.execute(
+                "SELECT platform, username, full_name, avatar_local_path FROM connections "
+                "WHERE avatar_local_path IS NOT NULL AND avatar_local_path != ''"
+            ).fetchall():
+                plat = (r["platform"] or "").lower()
+                u = (r["username"] or "").strip().lower()
+                n = (r["full_name"] or "").strip().lower()
+                av = (r["avatar_local_path"] or "").strip()
+                if not av:
+                    continue
+                if u:
+                    by_plat_user.setdefault((plat, u), av)
+                if n:
+                    by_plat_name.setdefault((plat, n), av)
+                    name_candidates.setdefault(n, set()).add(av)
+
+        by_name_any = {
+            name: next(iter(avs)) for name, avs in name_candidates.items() if len(avs) == 1
+        }
+        self._avatar_cache = {
+            "by_plat_user": by_plat_user,
+            "by_plat_name": by_plat_name,
+            "by_name_any": by_name_any,
+            "owner_names": owner_names,
+            "owner_avatars": owner_avatars,
+        }
+        return self._avatar_cache
+
+    def _resolve_avatar(
+        self,
+        conn: sqlite3.Connection,
+        platform: str | None,
+        *,
+        username: str | None = None,
+        full_name: str | None = None,
+    ) -> str | None:
+        idx = self._get_avatar_index(conn)
+        plat = (platform or "").lower()
+        u = (username or "").strip().lower()
+        n = (full_name or "").strip().lower()
+        n_clean = n[:-1].strip() if n.endswith("님") and len(n) > 1 else n
+
+        if u and plat and (plat, u) in idx["by_plat_user"]:
+            return idx["by_plat_user"][(plat, u)]
+        if n and plat and (plat, n) in idx["by_plat_name"]:
+            return idx["by_plat_name"][(plat, n)]
+        if n_clean and plat and (plat, n_clean) in idx["by_plat_name"]:
+            return idx["by_plat_name"][(plat, n_clean)]
+        if u:
+            for (p, ku), av in idx["by_plat_user"].items():
+                if ku == u:
+                    return av
+        if n and n in idx["by_name_any"]:
+            return idx["by_name_any"][n]
+        if n_clean and n_clean in idx["by_name_any"]:
+            return idx["by_name_any"][n_clean]
+        return None
+
+    def _resolve_thread_avatar(
+        self,
+        conn: sqlite3.Connection,
+        platform: str,
+        existing_avatar: str | None,
+        title: str | None,
+        participants: list[dict[str, Any]],
+    ) -> str | None:
+        if existing_avatar:
+            return existing_avatar
+        idx = self._get_avatar_index(conn)
+        plat = (platform or "").lower()
+        owners = idx["owner_names"].get(plat, set())
+        non_owners: list[dict[str, Any]] = []
+        for p in participants:
+            if not isinstance(p, dict):
+                continue
+            u = (p.get("username") or "").strip().lower()
+            n = (p.get("full_name") or "").strip().lower()
+            if (u and u in owners) or (n and n in owners):
+                continue
+            non_owners.append(p)
+        if len(non_owners) == 1:
+            p = non_owners[0]
+            av = p.get("avatar_local_path") or self._resolve_avatar(
+                conn, plat, username=p.get("username"), full_name=p.get("full_name")
+            )
+            if av:
+                return av
+        if title and len(non_owners) <= 1:
+            return self._resolve_avatar(conn, plat, full_name=title)
+        return None
 
     def _has_table(self, conn: sqlite3.Connection, table: str) -> bool:
         if self._table_cache is None:
@@ -366,6 +489,12 @@ class ArchiveReader:
                 item = self._serialize_post_row(row)
                 item["media"] = media_map.get(row["post_id"], [])
                 item["comments_count"] = comment_counts.get(row["post_id"], 0)
+                item["author_avatar_local_path"] = self._resolve_avatar(
+                    conn,
+                    item["platform"],
+                    username=item["author_username"],
+                    full_name=item["author_name"],
+                )
                 items.append(item)
 
             return {
@@ -421,8 +550,28 @@ class ArchiveReader:
             ).fetchall()
 
             detail = self._serialize_post_row(row)
+            detail["author_avatar_local_path"] = self._resolve_avatar(
+                conn,
+                detail["platform"],
+                username=detail["author_username"],
+                full_name=detail["author_name"],
+            )
             detail["media"] = media_map.get(post_id, [])
-            detail["comments"] = _build_comment_tree(comment_rows)
+
+            def _attach_comment_avatars(nodes: list[dict[str, Any]]) -> None:
+                for node in nodes:
+                    node["author_avatar_local_path"] = self._resolve_avatar(
+                        conn,
+                        node.get("platform") or detail["platform"],
+                        username=node.get("author_username"),
+                        full_name=node.get("author_name"),
+                    )
+                    if node.get("replies"):
+                        _attach_comment_avatars(node["replies"])
+
+            comment_tree = _build_comment_tree(comment_rows)
+            _attach_comment_avatars(comment_tree)
+            detail["comments"] = comment_tree
             detail["comments_count"] = len(comment_rows)
             detail["likes_users"] = [
                 {
@@ -430,6 +579,12 @@ class ArchiveReader:
                     "username": lr["username"],
                     "full_name": lr["full_name"],
                     "profile_url": lr["profile_url"],
+                    "avatar_local_path": self._resolve_avatar(
+                        conn,
+                        detail["platform"],
+                        username=lr["username"],
+                        full_name=lr["full_name"],
+                    ),
                 }
                 for lr in like_rows
             ]
@@ -642,6 +797,7 @@ class ArchiveReader:
         self,
         platform: str | None = None,
         q: str | None = None,
+        sort: str = "recent",
         offset: int = 0,
         limit: int = 100,
     ) -> dict[str, Any]:
@@ -658,6 +814,12 @@ class ArchiveReader:
             )
             params.extend([needle, needle])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        if sort == "messages":
+            order_by = "COALESCE(message_count, 0) DESC, COALESCE(last_timestamp_unix, 0) DESC, thread_id ASC"
+        elif sort == "oldest":
+            order_by = "COALESCE(last_timestamp_unix, 0) ASC, thread_id ASC"
+        else:
+            order_by = "COALESCE(last_timestamp_unix, 0) DESC, thread_id ASC"
 
         with self._connect() as conn:
             self._read_schema_meta(conn)
@@ -672,25 +834,73 @@ class ArchiveReader:
                        is_e2ee, is_pending, message_count, last_timestamp_unix{av_col}
                 FROM message_threads
                 {where}
-                ORDER BY COALESCE(last_timestamp_unix, 0) DESC, thread_id ASC
+                ORDER BY {order_by}
                 LIMIT ? OFFSET ?
                 """,
                 [*params, limit, offset],
             ).fetchall()
+
+            thread_ids = [r["thread_id"] for r in rows]
+            preview_map: dict[str, str] = {}
+            if thread_ids:
+                ph = ",".join("?" for _ in thread_ids)
+                mcols = self._table_cols(conn, "messages")
+                missed_col = ", m.is_missed_call" if "is_missed_call" in mcols else ""
+                prev_rows = conn.execute(
+                    f"""
+                    SELECT m.thread_id, m.sender, m.text, m.shared_link, m.is_unsent, m.call_duration{missed_col}
+                    FROM messages m
+                    JOIN (
+                        SELECT thread_id, MAX(id) AS max_id
+                        FROM messages
+                        WHERE thread_id IN ({ph})
+                        GROUP BY thread_id
+                    ) latest ON m.id = latest.max_id
+                    """,
+                    thread_ids,
+                ).fetchall()
+                for pr in prev_rows:
+                    pkeys = pr.keys()
+                    txt = (pr["text"] or "").strip()
+                    if pr["is_unsent"]:
+                        snippet = "(전송 취소된 메시지)"
+                    elif txt:
+                        snippet = txt.replace("\n", " ")[:64]
+                    elif "is_missed_call" in pkeys and pr["is_missed_call"]:
+                        snippet = "📵 부재중 통화"
+                    elif pr["call_duration"]:
+                        snippet = "📞 통화"
+                    elif pr["shared_link"]:
+                        snippet = "🔗 링크 공유"
+                    else:
+                        snippet = "📎 미디어 첨부"
+                    sender_prefix = f"{pr['sender']}: " if pr["sender"] else ""
+                    preview_map[pr["thread_id"]] = f"{sender_prefix}{snippet}"
+
             items = []
             for row in rows:
                 rkeys = row.keys()
+                participants = _loads_json(row["participants_json"], [])
+                raw_av = row["avatar_local_path"] if "avatar_local_path" in rkeys else None
+                resolved_av = self._resolve_thread_avatar(
+                    conn,
+                    row["platform"],
+                    raw_av,
+                    row["title"],
+                    participants,
+                )
                 items.append(
                     {
                         "thread_id": row["thread_id"],
                         "platform": row["platform"],
                         "title": row["title"] or row["thread_id"],
-                        "avatar_local_path": row["avatar_local_path"] if "avatar_local_path" in rkeys else None,
-                        "participants": _loads_json(row["participants_json"], []),
+                        "avatar_local_path": resolved_av,
+                        "participants": participants,
                         "is_e2ee": bool(row["is_e2ee"]),
                         "is_pending": bool(row["is_pending"]),
                         "message_count": row["message_count"] or 0,
                         "last_timestamp_unix": row["last_timestamp_unix"],
+                        "last_message_preview": preview_map.get(row["thread_id"], ""),
                     }
                 )
             return {"total": total, "offset": offset, "limit": limit, "items": items}
@@ -703,6 +913,8 @@ class ArchiveReader:
         tail: bool = False,
         before_seq: int | None = None,
         around_ts: int | None = None,
+        q: str | None = None,
+        media_only: bool = False,
     ) -> dict[str, Any] | None:
         with self._connect() as conn:
             self._read_schema_meta(conn)
@@ -720,69 +932,112 @@ class ArchiveReader:
             if trow is None:
                 return None
 
-            total = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE thread_id = ?",
-                    (thread_id,),
-                ).fetchone()[0]
-            )
             mcols = self._table_cols(conn, "messages")
             extra_mcols = "".join(
                 f", {c}" for c in ("share_text", "share_owner", "is_missed_call") if c in mcols
             )
+            filter_q = q.strip() if q and q.strip() else None
 
-            eff_offset = offset
-            if before_seq is not None:
-                desc_rows = conn.execute(
-                    f"""
-                    SELECT id, thread_id, message_id, platform, seq, sender,
-                           timestamp_unix, timestamp_ms, created_at, text,
-                           reactions_json, reply_to_id, shared_link, is_unsent, call_duration{extra_mcols}
-                    FROM messages
-                    WHERE thread_id = ? AND seq < ?
-                    ORDER BY seq DESC, id DESC
-                    LIMIT ?
-                    """,
-                    (thread_id, before_seq, limit),
-                ).fetchall()
-                rows = list(reversed(desc_rows))
-                eff_offset = int(rows[0]["seq"]) if rows else 0
-            else:
-                if around_ts is not None and total > 0:
-                    near_row = conn.execute(
-                        """
-                        SELECT seq FROM messages
-                        WHERE thread_id = ?
-                        ORDER BY ABS(COALESCE(timestamp_unix, 0) - ?) ASC, seq ASC
-                        LIMIT 1
-                        """,
-                        (thread_id, around_ts),
-                    ).fetchone()
-                    if near_row is not None:
-                        eff_offset = max(0, int(near_row["seq"]) - limit // 2)
-                elif tail:
-                    eff_offset = max(0, total - limit)
-
+            if filter_q or media_only:
+                fclauses = ["thread_id = ?"]
+                fparams: list[Any] = [thread_id]
+                if filter_q:
+                    fclauses.append(
+                        "(instr(lower(COALESCE(text, '')), lower(?)) > 0 "
+                        "OR instr(lower(COALESCE(sender, '')), lower(?)) > 0)"
+                    )
+                    fparams.extend([filter_q, filter_q])
+                if media_only:
+                    fclauses.append(
+                        "EXISTS (SELECT 1 FROM media md WHERE md.owner_type = 'message' "
+                        "AND md.owner_id = messages.thread_id || '#' || messages.seq)"
+                    )
+                fwhere = " AND ".join(fclauses)
+                total = int(
+                    conn.execute(f"SELECT COUNT(*) FROM messages WHERE {fwhere}", fparams).fetchone()[0]
+                )
                 rows = conn.execute(
                     f"""
                     SELECT id, thread_id, message_id, platform, seq, sender,
                            timestamp_unix, timestamp_ms, created_at, text,
                            reactions_json, reply_to_id, shared_link, is_unsent, call_duration{extra_mcols}
                     FROM messages
-                    WHERE thread_id = ?
-                    ORDER BY COALESCE(timestamp_ms, timestamp_unix * 1000, 0) ASC, seq ASC, id ASC
+                    WHERE {fwhere}
+                    ORDER BY COALESCE(timestamp_ms, timestamp_unix * 1000, 0) DESC, seq DESC, id DESC
                     LIMIT ? OFFSET ?
                     """,
-                    (thread_id, limit, eff_offset),
+                    [*fparams, limit, offset],
                 ).fetchall()
+                eff_offset = offset
+                has_older = (offset + len(rows)) < total
+                has_newer = offset > 0
+            else:
+                total = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE thread_id = ?",
+                        (thread_id,),
+                    ).fetchone()[0]
+                )
+                eff_offset = offset
+                if before_seq is not None:
+                    desc_rows = conn.execute(
+                        f"""
+                        SELECT id, thread_id, message_id, platform, seq, sender,
+                               timestamp_unix, timestamp_ms, created_at, text,
+                               reactions_json, reply_to_id, shared_link, is_unsent, call_duration{extra_mcols}
+                        FROM messages
+                        WHERE thread_id = ? AND seq < ?
+                        ORDER BY seq DESC, id DESC
+                        LIMIT ?
+                        """,
+                        (thread_id, before_seq, limit),
+                    ).fetchall()
+                    rows = list(reversed(desc_rows))
+                    eff_offset = int(rows[0]["seq"]) if rows else 0
+                else:
+                    if around_ts is not None and total > 0:
+                        near_row = conn.execute(
+                            """
+                            SELECT seq FROM messages
+                            WHERE thread_id = ?
+                            ORDER BY ABS(COALESCE(timestamp_unix, 0) - ?) ASC, seq ASC
+                            LIMIT 1
+                            """,
+                            (thread_id, around_ts),
+                        ).fetchone()
+                        if near_row is not None:
+                            eff_offset = max(0, int(near_row["seq"]) - limit // 2)
+                    elif tail:
+                        eff_offset = max(0, total - limit)
+
+                    rows = conn.execute(
+                        f"""
+                        SELECT id, thread_id, message_id, platform, seq, sender,
+                               timestamp_unix, timestamp_ms, created_at, text,
+                               reactions_json, reply_to_id, shared_link, is_unsent, call_duration{extra_mcols}
+                        FROM messages
+                        WHERE thread_id = ?
+                        ORDER BY COALESCE(timestamp_ms, timestamp_unix * 1000, 0) ASC, seq ASC, id ASC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (thread_id, limit, eff_offset),
+                    ).fetchall()
+                has_older = bool(rows and int(rows[0]["seq"]) > 0)
+                has_newer = bool(rows and (int(rows[-1]["seq"]) + 1) < total)
 
             owner_ids = [f"{thread_id}#{row['seq']}" for row in rows]
             media_map = self._fetch_media_map(conn, "message", owner_ids)
+
+            plat = trow["platform"]
+            av_idx = self._get_avatar_index(conn)
+            owner_names = sorted(av_idx["owner_names"].get((plat or "").lower(), set()))
+            owner_avatar = av_idx["owner_avatars"].get((plat or "").lower())
 
             items = []
             for row in rows:
                 rkeys = row.keys()
                 owner_key = f"{thread_id}#{row['seq']}"
+                sender = row["sender"]
                 items.append(
                     {
                         "id": row["id"],
@@ -790,7 +1045,12 @@ class ArchiveReader:
                         "message_id": row["message_id"],
                         "platform": row["platform"],
                         "seq": row["seq"],
-                        "sender": row["sender"],
+                        "sender": sender,
+                        "sender_avatar_local_path": self._resolve_avatar(
+                            conn, plat, username=sender, full_name=sender
+                        )
+                        if sender
+                        else None,
                         "timestamp_unix": row["timestamp_unix"],
                         "timestamp_ms": row["timestamp_ms"],
                         "created_at": row["created_at"],
@@ -808,15 +1068,23 @@ class ArchiveReader:
                 )
 
             tkeys = trow.keys()
-            has_older = bool(items and int(items[0]["seq"]) > 0)
-            has_newer = bool(items and (int(items[-1]["seq"]) + 1) < total)
+            participants = _loads_json(trow["participants_json"], [])
+            for part in participants:
+                if isinstance(part, dict) and not part.get("avatar_local_path"):
+                    part["avatar_local_path"] = self._resolve_avatar(
+                        conn, plat, username=part.get("username"), full_name=part.get("full_name")
+                    )
+            raw_av = trow["avatar_local_path"] if "avatar_local_path" in tkeys else None
+            resolved_av = self._resolve_thread_avatar(conn, plat, raw_av, trow["title"], participants)
             return {
                 "thread": {
                     "thread_id": trow["thread_id"],
-                    "platform": trow["platform"],
+                    "platform": plat,
                     "title": trow["title"] or trow["thread_id"],
-                    "avatar_local_path": trow["avatar_local_path"] if "avatar_local_path" in tkeys else None,
-                    "participants": _loads_json(trow["participants_json"], []),
+                    "avatar_local_path": resolved_av,
+                    "participants": participants,
+                    "owner_names": owner_names,
+                    "owner_avatar_local_path": owner_avatar,
                     "is_e2ee": bool(trow["is_e2ee"]),
                     "is_pending": bool(trow["is_pending"]),
                     "message_count": trow["message_count"] or total,
@@ -1036,9 +1304,15 @@ class ArchiveReader:
                 [*alias_list, limit],
             ).fetchall()
 
+            conns_list = [dict(r) for r in conn_rows]
+            resolved_avatar = next(
+                (c["avatar_local_path"] for c in conns_list if c.get("avatar_local_path")),
+                None,
+            ) or self._resolve_avatar(conn, None, username=ident, full_name=ident)
             return {
                 "identifier": ident,
-                "connections": [dict(r) for r in conn_rows],
+                "avatar_local_path": resolved_avatar,
+                "connections": conns_list,
                 "comments": [dict(r) for r in comment_rows],
                 "liked_posts": [dict(r) for r in liked_rows],
                 "messages": [dict(r) for r in msg_rows],

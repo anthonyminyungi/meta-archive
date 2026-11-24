@@ -1,7 +1,7 @@
-/** Multi-media carousel component supporting photos, audio/video playback, and lightbox zoom. */
+/** Multi-media carousel component supporting photos, audio/video playback, counter badge, and lightbox zoom. */
 
-import { mediaUrl } from "../api.js";
-import { clear, el, isAudioMedia, isDocumentMedia, isVideoMedia } from "../dom.js";
+import { mediaUrl } from "../api.js?v=2";
+import { clear, el, isAudioMedia, isDocumentMedia, isVideoMedia } from "../dom.js?v=2";
 
 export function renderCarousel(mediaList, onOpenLightbox) {
   const playable = (mediaList || []).filter((m) => m && m.local_path && !m.is_carousel_cover);
@@ -21,13 +21,14 @@ export function renderCarousel(mediaList, onOpenLightbox) {
       if (isAudioMedia(current)) {
         stage.appendChild(el("audio", { src, controls: true, preload: "metadata" }));
       } else if (isVideoMedia(current)) {
-        const video = el("video", {
-          src,
-          controls: true,
-          playsinline: true,
-          preload: "metadata",
-        });
-        stage.appendChild(video);
+        stage.appendChild(
+          el("video", {
+            src,
+            controls: true,
+            playsinline: true,
+            preload: "metadata",
+          })
+        );
       } else if (isDocumentMedia(current)) {
         const fname = (current.local_path || "첨부파일").split("/").pop();
         stage.appendChild(
@@ -36,58 +37,57 @@ export function renderCarousel(mediaList, onOpenLightbox) {
             { style: "padding:24px;text-align:center;" },
             el(
               "a",
-              {
-                className: "btn",
-                href: src,
-                target: "_blank",
-                rel: "noopener noreferrer",
-              },
+              { className: "btn", href: src, target: "_blank", rel: "noopener noreferrer" },
               `📄 첨부 파일 열기 (${fname})`
             )
           )
         );
       } else {
-        const img = el("img", {
-          src,
-          alt: current.media_id || "post media",
-          loading: "lazy",
-          onClick: () => onOpenLightbox && onOpenLightbox(items, index),
-        });
-        stage.appendChild(img);
+        stage.appendChild(
+          el("img", {
+            src,
+            alt: current.media_id || "post media",
+            loading: "lazy",
+            onClick: () => onOpenLightbox && onOpenLightbox(items, index),
+          })
+        );
       }
     }
 
     if (items.length > 1) {
-      const prevBtn = el(
-        "button",
-        {
-          type: "button",
-          className: "carousel-nav carousel-prev",
-          "aria-label": "이전 미디어",
-          onClick: (ev) => {
-            ev.stopPropagation();
-            index = (index - 1 + items.length) % items.length;
-            renderSlide();
+      stage.appendChild(el("span", { className: "carousel-counter" }, `${index + 1} / ${items.length}`));
+      stage.appendChild(
+        el(
+          "button",
+          {
+            type: "button",
+            className: "carousel-nav carousel-prev",
+            "aria-label": "이전 미디어",
+            onClick: (ev) => {
+              ev.stopPropagation();
+              index = (index - 1 + items.length) % items.length;
+              renderSlide();
+            },
           },
-        },
-        "◀"
+          "‹"
+        )
       );
-      const nextBtn = el(
-        "button",
-        {
-          type: "button",
-          className: "carousel-nav carousel-next",
-          "aria-label": "다음 미디어",
-          onClick: (ev) => {
-            ev.stopPropagation();
-            index = (index + 1) % items.length;
-            renderSlide();
+      stage.appendChild(
+        el(
+          "button",
+          {
+            type: "button",
+            className: "carousel-nav carousel-next",
+            "aria-label": "다음 미디어",
+            onClick: (ev) => {
+              ev.stopPropagation();
+              index = (index + 1) % items.length;
+              renderSlide();
+            },
           },
-        },
-        "▶"
+          "›"
+        )
       );
-      stage.appendChild(prevBtn);
-      stage.appendChild(nextBtn);
     }
 
     if (dotsWrap) {
@@ -98,7 +98,8 @@ export function renderCarousel(mediaList, onOpenLightbox) {
             type: "button",
             className: `carousel-dot${i === index ? " active" : ""}`,
             "aria-label": `${i + 1}번째 미디어`,
-            onClick: () => {
+            onClick: (ev) => {
+              ev.stopPropagation();
               index = i;
               renderSlide();
             },

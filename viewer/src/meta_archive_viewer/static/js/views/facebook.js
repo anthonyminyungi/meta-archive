@@ -1,18 +1,21 @@
-/** Facebook archive view: timeline year/month jump, reactions & nested comments, albums, friends. */
+/** Facebook archive view: year-grouped timeline sidebar, authentic feed cards, rich OG cards, albums, friends. */
 
-import { api, mediaUrl } from "../api.js";
+import { api, mediaUrl } from "../api.js?v=2";
 import {
   avatarEl,
   clear,
   el,
   extractReactionEntries,
   formatDate,
+  formatReactionBadge,
+  formatShortDate,
   isVideoMedia,
   personButton,
+  renderCollapsibleText,
   renderSharedCard,
   safeExternalHref,
-} from "../dom.js";
-import { renderCarousel } from "../components/carousel.js";
+} from "../dom.js?v=2";
+import { renderCarousel } from "../components/carousel.js?v=2";
 
 export async function renderFacebookView(container, ctx) {
   clear(container);
@@ -28,12 +31,27 @@ export async function renderFacebookView(container, ctx) {
   const profile = profilesRes.items[0] || null;
   const fbStats = (overview.by_platform && overview.by_platform.facebook) || {};
 
+  // Group timeline months by year for compact accordion sidebar
+  const yearGroups = [];
+  const byYearMap = new Map();
+  for (const ym of timelineRes.items) {
+    let grp = byYearMap.get(ym.year);
+    if (!grp) {
+      grp = { year: ym.year, total: 0, months: [] };
+      byYearMap.set(ym.year, grp);
+      yearGroups.push(grp);
+    }
+    grp.total += ym.count;
+    grp.months.push(ym);
+  }
+
   const state = {
-    subtab: "timeline", // timeline | albums | friends
+    subtab: "timeline", // timeline | albums | friends | activities
     year: null,
     month: null,
+    expandedYear: yearGroups[0] ? yearGroups[0].year : null,
     album: null,
-    postTypeFilter: "", // "" | "original" | "shared"
+    postTypeFilter: "", // "" | "original" | "group_post" | "shared"
     offset: 0,
     limit: 25,
     total: 0,
@@ -47,8 +65,8 @@ export async function renderFacebookView(container, ctx) {
   const displayName = profile ? profile.full_name || profile.username || "Facebook" : "Facebook Archive";
   const tabTimelineBtn = el("button", { type: "button", className: "btn btn-primary" }, "타임라인");
   const tabAlbumsBtn = el("button", { type: "button", className: "btn" }, `사진 앨범 (${albumsRes.items.length})`);
-  const tabFriendsBtn = el("button", { type: "button", className: "btn" }, `친구·팔로잉 (${fbStats.connections || 0})`);
-  const tabActivitiesBtn = el("button", { type: "button", className: "btn" }, `내 댓글·저장됨 (${fbStats.activities || 0})`);
+  const tabFriendsBtn = el("button", { type: "button", className: "btn" }, `친구·팔로잉 (${(fbStats.connections || 0).toLocaleString()})`);
+  const tabActivitiesBtn = el("button", { type: "button", className: "btn" }, `내 댓글·저장됨 (${(fbStats.activities || 0).toLocaleString()})`);
 
   function openFbStoriesModal() {
     ctx.modal.openCustom("Facebook 보관 스토리", async (body) => {
@@ -58,28 +76,36 @@ export async function renderFacebookView(container, ctx) {
         body.appendChild(el("div", { className: "empty-box" }, "보관된 Facebook 스토리가 없습니다."));
         return;
       }
-      const list = el("div", { className: "feed-list" });
+      const allMedia = res.items.map((s) => s.media).filter((m) => m && m.local_path);
+      const grid = el("div", { className: "story-grid" });
       for (const s of res.items) {
         const src = s.media ? mediaUrl(s.media.local_path) : null;
-        list.appendChild(
+        const lbIdx = s.media ? allMedia.indexOf(s.media) : -1;
+        grid.appendChild(
           el(
             "div",
-            { className: "card" },
+            { className: "card story-card" },
             el(
               "div",
-              { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
-              el("span", { className: "pill pill-accent" }, formatDate(s.created_at, s.timestamp_unix))
+              { className: "post-meta-row", style: "margin-top:0;font-size:0.75rem;" },
+              el("span", { className: "pill pill-fb" }, formatDate(s.created_at, s.timestamp_unix))
             ),
             src
               ? isVideoMedia(s.media)
-                ? el("video", { src, controls: true, playsinline: true, style: "max-width:100%;max-height:420px;border-radius:8px;" })
-                : el("img", { src, alt: "story", loading: "lazy", style: "max-width:100%;max-height:420px;border-radius:8px;cursor:zoom-in;", onClick: () => ctx.openLightbox([s.media], 0) })
+                ? el("video", { src, controls: true, playsinline: true, preload: "metadata" })
+                : el("img", {
+                    src,
+                    alt: "story",
+                    loading: "lazy",
+                    style: "cursor:zoom-in;",
+                    onClick: () => ctx.openLightbox(allMedia, Math.max(0, lbIdx)),
+                  })
               : null,
-            s.caption ? el("div", { className: "post-caption" }, s.caption) : null
+            s.caption ? el("div", { style: "font-size:0.84rem;white-space:pre-wrap;" }, s.caption) : null
           )
         );
       }
-      body.appendChild(list);
+      body.appendChild(grid);
     });
   }
 
@@ -87,7 +113,7 @@ export async function renderFacebookView(container, ctx) {
     el(
       "section",
       { className: "card profile-header" },
-      avatarEl(profile ? profile.avatar_local_path : null, displayName, true),
+      avatarEl(profile ? profile.avatar_local_path : null, displayName, "lg"),
       el(
         "div",
         { className: "profile-meta" },
@@ -95,10 +121,10 @@ export async function renderFacebookView(container, ctx) {
           "div",
           { className: "profile-title-row" },
           el("h1", null, displayName),
-          el("span", { className: "pill pill-accent" }, `게시물 ${fbStats.posts || 0}`),
-          el("span", { className: "pill" }, `댓글 ${fbStats.comments || 0}`),
+          el("span", { className: "pill pill-fb" }, `게시물 ${(fbStats.posts || 0).toLocaleString()}`),
+          el("span", { className: "pill" }, `댓글 ${(fbStats.comments || 0).toLocaleString()}`),
           (fbStats.stories || 0) > 0
-            ? el("button", { type: "button", className: "btn", onClick: openFbStoriesModal }, `보관 스토리 (${fbStats.stories})`)
+            ? el("button", { type: "button", className: "btn btn-sm", onClick: openFbStoriesModal }, `보관 스토리 (${fbStats.stories})`)
             : null
         ),
         profile && profile.bio ? el("p", { className: "profile-bio" }, profile.bio) : null,
@@ -124,7 +150,7 @@ export async function renderFacebookView(container, ctx) {
     const layout = el("div", { className: "fb-layout" }, sidebar, mainCol);
     contentHost.appendChild(layout);
 
-    sidebar.appendChild(el("h3", { style: "margin:0 0 10px;font-size:0.98rem;" }, "연 / 월 이동"));
+    sidebar.appendChild(el("h3", { style: "margin:0 0 10px;font-size:0.95rem;" }, "연도 / 월 이동"));
     const tmList = el("div", { className: "timeline-list" });
     sidebar.appendChild(tmList);
 
@@ -142,7 +168,7 @@ export async function renderFacebookView(container, ctx) {
           "button",
           {
             type: "button",
-            className: `timeline-btn${!state.year && !state.month ? " active" : ""}`,
+            className: `year-header-btn${!state.year && !state.month ? " active" : ""}`,
             onClick: () => {
               state.year = null;
               state.month = null;
@@ -150,27 +176,56 @@ export async function renderFacebookView(container, ctx) {
             },
           },
           el("span", null, "전체 기간"),
-          el("span", null, String(fbStats.posts || 0))
+          el("span", { style: "font-weight:500;font-size:0.8rem;" }, (fbStats.posts || 0).toLocaleString())
         )
       );
-      for (const ym of timelineRes.items) {
-        const isActive = state.year === ym.year && state.month === ym.month;
-        tmList.appendChild(
-          el(
-            "button",
-            {
-              type: "button",
-              className: `timeline-btn${isActive ? " active" : ""}`,
-              onClick: () => {
-                state.year = ym.year;
-                state.month = ym.month;
-                loadTimelinePosts(true);
-              },
+
+      for (const grp of yearGroups) {
+        const isYearSelected = state.year === grp.year && !state.month;
+        const isExpanded = state.expandedYear === grp.year || state.year === grp.year;
+
+        const yearHeader = el(
+          "button",
+          {
+            type: "button",
+            className: `year-header-btn${isYearSelected ? " active" : ""}`,
+            onClick: () => {
+              state.expandedYear = state.expandedYear === grp.year && state.year === grp.year ? null : grp.year;
+              state.year = grp.year;
+              state.month = null;
+              loadTimelinePosts(true);
             },
-            el("span", null, `${ym.year}년 ${String(ym.month).padStart(2, "0")}월`),
-            el("span", null, String(ym.count))
-          )
+          },
+          el("span", null, `${isExpanded ? "▾" : "▸"} ${grp.year}년`),
+          el("span", { style: "font-weight:500;font-size:0.8rem;color:var(--text-muted);" }, String(grp.total))
         );
+
+        const monthsWrap = isExpanded
+          ? el(
+              "div",
+              { className: "year-months" },
+              grp.months.map((ym) => {
+                const isActive = state.year === ym.year && state.month === ym.month;
+                return el(
+                  "button",
+                  {
+                    type: "button",
+                    className: `timeline-btn${isActive ? " active" : ""}`,
+                    onClick: () => {
+                      state.year = ym.year;
+                      state.month = ym.month;
+                      state.expandedYear = ym.year;
+                      loadTimelinePosts(true);
+                    },
+                  },
+                  el("span", null, `${String(ym.month).padStart(2, "0")}월`),
+                  el("span", null, String(ym.count))
+                );
+              })
+            )
+          : null;
+
+        tmList.appendChild(el("div", { className: "year-group" }, yearHeader, monthsWrap));
       }
     }
 
@@ -183,15 +238,15 @@ export async function renderFacebookView(container, ctx) {
 
       const typeButtons = [
         ["", "전체"],
-        ["original", "내 글·사진만"],
+        ["original", "내 글·사진"],
         ["group_post", "그룹 글"],
-        ["shared", "공유 글만"],
+        ["shared", "공유 글"],
       ].map(([val, label]) =>
         el(
           "button",
           {
             type: "button",
-            className: `btn${state.postTypeFilter === val ? " btn-primary" : ""}`,
+            className: `btn btn-sm${state.postTypeFilter === val ? " btn-primary" : ""}`,
             onClick: () => {
               state.postTypeFilter = val;
               loadTimelinePosts(true);
@@ -205,14 +260,14 @@ export async function renderFacebookView(container, ctx) {
         el(
           "div",
           { className: "toolbar-group" },
-          el("span", { className: "pill pill-accent" }, chips.length ? chips.join(" · ") : "전체 기간"),
-          el("span", { className: "pill" }, `${state.items.length} / ${state.total}건`),
+          el("span", { className: "pill pill-fb" }, chips.length ? chips.join(" · ") : "전체 기간"),
+          el("span", { className: "pill" }, `${state.items.length.toLocaleString()} / ${state.total.toLocaleString()}건`),
           chips.length
             ? el(
                 "button",
                 {
                   type: "button",
-                  className: "btn",
+                  className: "btn btn-sm",
                   onClick: () => {
                     state.year = null;
                     state.month = null;
@@ -220,7 +275,7 @@ export async function renderFacebookView(container, ctx) {
                     loadTimelinePosts(true);
                   },
                 },
-                "기간/앨범 초기화"
+                "초기화"
               )
             : null
         )
@@ -237,49 +292,65 @@ export async function renderFacebookView(container, ctx) {
       for (const post of state.items) {
         const carousel = renderCarousel(post.media, ctx.openLightbox);
         const reactionPills = [];
-        if (post.reactions_total > 0) {
-          reactionPills.push(el("span", { className: "pill pill-accent" }, `반응 ${post.reactions_total}`));
-        }
-        for (const [k, v] of extractReactionEntries(post.reactions)) {
-          reactionPills.push(el("span", { className: "pill" }, `${k} ${v}`));
+        const entries = extractReactionEntries(post.reactions);
+        if (entries.length > 0) {
+          for (const [k, v] of entries) {
+            reactionPills.push(el("span", { className: "pill" }, formatReactionBadge(k, v)));
+          }
+        } else if (post.reactions_total > 0) {
+          reactionPills.push(el("span", { className: "pill pill-fb" }, `👍 반응 ${post.reactions_total}`));
         }
 
         const sharedNode = renderSharedCard(post.shared_post, ctx.openLightbox);
+        const authorLabel = post.author_name || post.author_username || displayName;
 
         feedHost.appendChild(
           el(
             "article",
-            { className: "card" },
+            { className: "card feed-card" },
             el(
               "div",
               { className: "post-card-head" },
               el(
                 "div",
                 { className: "post-author-block" },
-                personButton(post.author_username, post.author_name, ctx.openPerson),
-                post.post_type === "shared" ? el("span", { className: "pill pill-warn" }, "공유") : null,
-                post.post_type === "group_post"
-                  ? el("span", { className: "pill pill-accent" }, post.group_name ? `그룹: ${post.group_name}` : "그룹 글")
-                  : null,
-                post.album_name ? el("span", { className: "pill" }, `앨범: ${post.album_name}`) : null,
-                post.audience ? el("span", { className: "pill" }, post.audience) : null
-              ),
-              el("span", { style: "font-size:0.82rem;color:var(--text-muted);" }, formatDate(post.created_at, post.timestamp_unix))
+                avatarEl(post.author_avatar_local_path, authorLabel, "md"),
+                el(
+                  "div",
+                  { className: "post-author-meta" },
+                  el(
+                    "div",
+                    { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap;" },
+                    personButton(post.author_username, post.author_name || displayName, ctx.openPerson),
+                    post.post_type === "shared" ? el("span", { className: "pill pill-warn" }, "공유") : null,
+                    post.post_type === "group_post"
+                      ? el("span", { className: "pill pill-fb" }, post.group_name ? `그룹: ${post.group_name}` : "그룹 글")
+                      : null,
+                    post.album_name ? el("span", { className: "pill" }, `📁 ${post.album_name}`) : null
+                  ),
+                  el(
+                    "div",
+                    { className: "post-author-sub" },
+                    el("span", null, formatDate(post.created_at, post.timestamp_unix)),
+                    post.audience ? el("span", null, `· ${post.audience}`) : null
+                  )
+                )
+              )
             ),
             !post.caption && post.activity_title
               ? el("div", { style: "font-size:0.86rem;color:var(--text-muted);margin-bottom:6px;" }, post.activity_title)
               : null,
-            post.caption ? el("div", { className: "post-caption" }, post.caption) : null,
+            post.caption ? renderCollapsibleText(post.caption, { maxChars: 340, maxLines: 6 }) : null,
             sharedNode,
             carousel,
             el(
               "div",
-              { className: "post-meta-row" },
-              reactionPills,
+              { className: "post-footer-bar" },
+              el("div", { className: "toolbar-group" }, reactionPills),
               el(
                 "button",
-                { type: "button", className: "btn", onClick: () => ctx.openPost(post.post_id) },
-                `상세 & 댓글 ${post.comments_count} 보기`
+                { type: "button", className: "btn btn-sm", onClick: () => ctx.openPost(post.post_id) },
+                `💬 상세 & 댓글 ${post.comments_count}`
               )
             )
           )
@@ -343,8 +414,8 @@ export async function renderFacebookView(container, ctx) {
           el(
             "div",
             { className: "album-info" },
-            el("div", { style: "font-weight:600;" }, alb.album_name),
-            el("div", { style: "font-size:0.82rem;color:var(--text-muted);" }, `${alb.count}개 항목`)
+            el("div", { style: "font-weight:700;" }, alb.album_name),
+            el("div", { style: "font-size:0.8rem;color:var(--text-muted);margin-top:2px;" }, `${alb.count}개 항목`)
           )
         )
       );
@@ -354,21 +425,22 @@ export async function renderFacebookView(container, ctx) {
 
   async function renderFriends() {
     clear(contentHost);
-    let relation = "";
+    let relation = "friend";
     const relSelect = el(
       "select",
       { className: "select", "aria-label": "관계 필터" },
-      el("option", { value: "" }, "전체 (친구 + 팔로잉)"),
-      el("option", { value: "friend" }, "친구 (Friends)"),
-      el("option", { value: "following" }, "팔로잉 (Following)")
+      el("option", { value: "friend", selected: true }, "친구 (Friends)"),
+      el("option", { value: "following" }, "팔로잉 (Following)"),
+      el("option", { value: "" }, "전체 (친구 + 팔로잉)")
     );
     const searchInput = el("input", {
       type: "search",
       className: "input",
       placeholder: "Facebook 친구·팔로잉 이름 검색...",
     });
+    const countPill = el("span", { className: "pill" }, "");
     const grid = el("div", { className: "connections-grid" });
-    contentHost.append(el("div", { className: "search-bar" }, relSelect, searchInput), grid);
+    contentHost.append(el("div", { className: "search-bar" }, relSelect, searchInput, countPill), grid);
 
     async function load(q = "") {
       clear(grid);
@@ -376,8 +448,9 @@ export async function renderFacebookView(container, ctx) {
         platform: "facebook",
         relation: relation || undefined,
         q: q || undefined,
-        limit: 300,
+        limit: 500,
       });
+      countPill.textContent = `${res.items.length.toLocaleString()} / ${res.total.toLocaleString()}명`;
       clear(grid);
       if (res.items.length === 0) {
         grid.appendChild(el("div", { className: "empty-box" }, "표시할 친구·팔로잉 목록이 없습니다."));
@@ -388,15 +461,15 @@ export async function renderFacebookView(container, ctx) {
           el(
             "div",
             { className: "person-row" },
-            avatarEl(f.avatar_local_path, f.full_name || f.username || "?"),
+            avatarEl(f.avatar_local_path, f.full_name || f.username || "?", "md"),
             el(
               "div",
               { style: "min-width:0;flex:1;" },
               personButton(f.username, f.full_name, ctx.openPerson),
               el(
                 "div",
-                { style: "font-size:0.78rem;color:var(--text-muted);" },
-                `${f.relation}${f.connected_at ? ` · ${formatDate(f.connected_at, f.timestamp_unix)}` : ""}`
+                { style: "font-size:0.76rem;color:var(--text-muted);margin-top:2px;" },
+                `${f.relation === "friend" ? "친구" : f.relation}${f.connected_at ? ` · ${formatShortDate(f.connected_at, f.timestamp_unix)}` : ""}`
               )
             )
           )
@@ -464,7 +537,7 @@ export async function renderFacebookView(container, ctx) {
       });
       actTotal = res.total;
       actOffset += res.items.length;
-      countPill.textContent = `${actOffset} / ${actTotal}건`;
+      countPill.textContent = `${actOffset.toLocaleString()} / ${actTotal.toLocaleString()}건`;
       moreWrap.classList.toggle("hidden", actOffset >= actTotal);
       moreBtn.disabled = false;
 
@@ -488,7 +561,7 @@ export async function renderFacebookView(container, ctx) {
             el(
               "div",
               { className: "post-meta-row", style: "margin-top:0;margin-bottom:6px;" },
-              el("span", { className: "pill pill-accent" }, a.kind),
+              el("span", { className: "pill pill-fb" }, a.kind),
               el("span", { className: "pill" }, formatDate(a.created_at, a.timestamp_unix)),
               a.group_name ? el("span", { className: "pill" }, `그룹: ${a.group_name}`) : null,
               a.target_author ? el("span", { className: "pill" }, `대상: ${a.target_author}`) : null
@@ -496,7 +569,7 @@ export async function renderFacebookView(container, ctx) {
             a.title ? el("div", { style: "font-size:0.84rem;color:var(--text-muted);margin-bottom:6px;" }, a.title) : null,
             a.text ? el("div", { className: "post-caption" }, a.text) : null,
             mediaNodes.length > 0 ? el("div", { style: "display:flex;gap:8px;margin-top:6px;" }, mediaNodes) : null,
-            href ? el("a", { href, target: "_blank", rel: "noopener noreferrer" }, a.url) : null
+            href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", style: "font-size:0.8rem;word-break:break-all;" }, a.url) : null
           )
         );
       }

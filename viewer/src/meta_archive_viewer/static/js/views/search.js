@@ -1,7 +1,7 @@
-/** Hybrid Korean Search view (1-2 char INSTR fallback + 3+ char FTS5 trigram). */
+/** Hybrid Korean Search view with safe <mark> keyword highlighting. */
 
-import { api, mediaUrl } from "../api.js";
-import { clear, el, formatDate, isVideoMedia, safeExternalHref } from "../dom.js";
+import { api, mediaUrl } from "../api.js?v=2";
+import { clear, el, formatDate, highlightTextNodes, isVideoMedia, safeExternalHref } from "../dom.js?v=2";
 
 const TYPE_LABELS = {
   post: "게시물",
@@ -19,7 +19,7 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
     type: "search",
     className: "input",
     value: initialQuery,
-    placeholder: "한국어/영문 검색어 입력 (1~2글자 '제주' 및 3글자 이상 FTS5 모두 지원)...",
+    placeholder: "한국어/영문 검색어 입력 (단축키 '/' · 1~2글자 및 3글자+ FTS5 모두 지원)...",
   });
   const platformSelect = el(
     "select",
@@ -39,7 +39,7 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
     el("option", { value: "activity" }, "내 활동 (댓글·저장)"),
     el("option", { value: "connection" }, "인물")
   );
-  const submitBtn = el("button", { type: "submit", className: "btn btn-primary" }, "검색");
+  const submitBtn = el("button", { type: "submit", className: "btn btn-primary" }, "🔍 검색");
 
   const statusRow = el("div", { className: "post-meta-row", style: "margin-bottom:12px;" });
   const resultsEl = el("div", { className: "feed-list" });
@@ -73,9 +73,9 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
 
     clear(statusRow);
     const modeLabel =
-      res.mode === "fts5_trigram" ? "FTS5 Trigram (3글자 이상 고속 검색)" : "INSTR 폴백 (1~2글자 완전 일치)";
+      res.mode === "fts5_trigram" ? "FTS5 Trigram (3글자 이상)" : "INSTR 폴백 (1~2글자)";
     statusRow.append(
-      el("span", { className: "pill pill-accent" }, `검색 결과 ${res.total}건`),
+      el("span", { className: "pill pill-accent" }, `검색 결과 ${res.total.toLocaleString()}건`),
       el("span", { className: "pill" }, modeLabel)
     );
 
@@ -86,6 +86,9 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
     }
 
     for (const item of res.items) {
+      const platCls = item.platform === "instagram" ? "pill-ig" : "pill-fb";
+      const snippet = (item.body || item.entity_id || "").slice(0, 320);
+
       const card = el(
         "button",
         {
@@ -114,13 +117,13 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
                     el(
                       "div",
                       { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
-                      el("span", { className: "pill pill-accent" }, formatDate(s.created_at, s.timestamp_unix)),
+                      el("span", { className: `pill ${platCls}` }, formatDate(s.created_at, s.timestamp_unix)),
                       s.highlight_title ? el("span", { className: "pill" }, s.highlight_title) : null
                     ),
                     src
                       ? isVideoMedia(s.media)
                         ? el("video", { src, controls: true, playsinline: true, style: "max-width:100%;max-height:460px;border-radius:8px;" })
-                        : el("img", { src, alt: "story", style: "max-width:100%;max-height:460px;border-radius:8px;" })
+                        : el("img", { src, alt: "story", style: "max-width:100%;max-height:460px;border-radius:8px;cursor:zoom-in;", onClick: () => ctx.openLightbox([s.media], 0) })
                       : null,
                     s.caption ? el("div", { className: "post-caption" }, s.caption) : null
                   )
@@ -143,14 +146,14 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
                     el(
                       "div",
                       { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
-                      el("span", { className: "pill pill-accent" }, a.kind),
+                      el("span", { className: `pill ${platCls}` }, a.kind),
                       el("span", { className: "pill" }, formatDate(a.created_at, a.timestamp_unix)),
                       a.target_author ? el("span", { className: "pill" }, `대상: ${a.target_author}`) : null,
                       a.group_name ? el("span", { className: "pill" }, `그룹: ${a.group_name}`) : null
                     ),
                     a.title ? el("div", { style: "font-size:0.86rem;color:var(--text-muted);margin-bottom:6px;" }, a.title) : null,
                     a.text ? el("div", { className: "post-caption" }, a.text) : null,
-                    href ? el("a", { href, target: "_blank", rel: "noopener noreferrer" }, a.url) : null
+                    href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", style: "font-size:0.82rem;word-break:break-all;" }, a.url) : null
                   )
                 );
               });
@@ -163,11 +166,11 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
           "div",
           { className: "post-meta-row", style: "margin-top:0;margin-bottom:6px;" },
           el("span", { className: "pill pill-accent" }, TYPE_LABELS[item.entity_type] || item.entity_type),
-          el("span", { className: "pill" }, item.platform),
-          item.author ? el("strong", null, item.author) : null,
+          el("span", { className: `pill ${platCls}` }, item.platform),
+          item.author ? el("strong", null, highlightTextNodes(item.author, q)) : null,
           item.timestamp_unix ? el("span", null, formatDate(null, item.timestamp_unix)) : null
         ),
-        el("div", { style: "white-space:pre-wrap;" }, item.body || item.entity_id)
+        el("div", { style: "white-space:pre-wrap;font-size:0.92rem;" }, highlightTextNodes(snippet, q))
       );
       resultsEl.appendChild(card);
     }
@@ -180,5 +183,6 @@ export async function renderSearchView(container, ctx, initialQuery = "") {
   platformSelect.addEventListener("change", runSearch);
   entitySelect.addEventListener("change", runSearch);
 
+  requestAnimationFrame(() => queryInput.focus());
   await runSearch();
 }

@@ -154,6 +154,15 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
     fastapi_app.state.archive_dir = resolved_archive
     fastapi_app.state.reader = reader
 
+    @fastapi_app.middleware("http")
+    async def _static_no_cache_middleware(request: Request, call_next: Any) -> Response:
+        response: Response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
     @fastapi_app.exception_handler(ArchiveNotReadyError)
     async def _not_ready_handler(_req: Request, exc: ArchiveNotReadyError) -> JSONResponse:
         return JSONResponse(status_code=503, content={"detail": str(exc)})
@@ -269,10 +278,11 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
     def api_threads(
         platform: str | None = None,
         q: str | None = None,
+        sort: str = "recent",
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=500),
     ) -> dict[str, Any]:
-        return reader.list_threads(platform=platform, q=q, offset=offset, limit=limit)
+        return reader.list_threads(platform=platform, q=q, sort=sort, offset=offset, limit=limit)
 
     @fastapi_app.get("/api/threads/{thread_id:path}/messages")
     def api_thread_messages(
@@ -282,6 +292,8 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
         tail: bool = False,
         before_seq: int | None = None,
         around_ts: int | None = None,
+        q: str | None = None,
+        media_only: bool = False,
     ) -> dict[str, Any]:
         data = reader.get_thread_messages(
             thread_id,
@@ -290,6 +302,8 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
             tail=tail,
             before_seq=before_seq,
             around_ts=around_ts,
+            q=q,
+            media_only=media_only,
         )
         if data is None:
             raise HTTPException(status_code=404, detail="Thread not found")

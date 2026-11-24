@@ -1101,3 +1101,44 @@ def test_extensionless_magic_mime_activities_tail_messages_group_posts_and_js_fi
     assert "r.reaction" in messages_js
     dom_js = (js_dir / "dom.js").read_text(encoding="utf-8")
     assert 'media.media_type === "audio"' in dom_js
+
+
+def test_avatar_enrichment_thread_sorting_preview_in_thread_search_and_media_only(
+    sample_archive: Path,
+) -> None:
+    app = create_app(sample_archive)
+    with TestClient(app) as client:
+        # 1. Post list and detail include resolved author/comment/like avatars
+        posts = client.get("/api/posts", params={"platform": "instagram"}).json()
+        assert posts["items"][0]["author_avatar_local_path"] == "media/instagram/profile/me.jpg"
+
+        detail = client.get("/api/posts/ig:AAA111").json()
+        assert detail["author_avatar_local_path"] == "media/instagram/profile/me.jpg"
+        assert detail["comments"][0]["author_avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
+        assert detail["likes_users"][0]["avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
+
+        # 2. Thread list resolves partner avatar, last_message_preview, and sort=messages
+        threads = client.get("/api/threads", params={"sort": "messages"}).json()
+        assert threads["total"] >= 2
+        ig_thread = next(t for t in threads["items"] if t["thread_id"] == "ig_dm_1")
+        assert ig_thread["avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
+        assert "민수" in ig_thread["last_message_preview"] or "제주" in ig_thread["last_message_preview"]
+
+        # 3. Thread messages include owner_names, sender_avatar_local_path, in-thread q, and media_only
+        msgs = client.get("/api/threads/ig_dm_1/messages").json()
+        assert "홍길동" in msgs["thread"]["owner_names"]
+        assert "my_ig" in msgs["thread"]["owner_names"]
+        partner_msg = next(m for m in msgs["items"] if m["sender"] == "김민수")
+        assert partner_msg["sender_avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
+
+        q_res = client.get("/api/threads/ig_dm_1/messages", params={"q": "제주"}).json()
+        assert q_res["total"] >= 1
+        assert all("제주" in (m["text"] + " " + (m["sender"] or "")) for m in q_res["items"])
+
+        media_res = client.get("/api/threads/ig_dm_1/messages", params={"media_only": "true"}).json()
+        assert all(len(m["media"]) > 0 for m in media_res["items"])
+
+        # 4. Person activity includes resolved avatar_local_path
+        person = client.get("/api/people/minsu").json()
+        assert person["avatar_local_path"] == "media/instagram/avatars/minsu.jpg"
+

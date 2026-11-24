@@ -1,14 +1,14 @@
 /** Main SPA hash router & shared controllers for Meta Archive viewer. */
 
-import { api } from "./api.js";
-import { clear, el } from "./dom.js";
-import { createLightbox } from "./components/lightbox.js";
-import { createPersonDrawer } from "./components/person_drawer.js";
-import { createPostModal } from "./components/post_modal.js";
-import { renderFacebookView } from "./views/facebook.js";
-import { renderInstagramView } from "./views/instagram.js";
-import { renderMessagesView } from "./views/messages.js";
-import { renderSearchView } from "./views/search.js";
+import { api } from "./api.js?v=2";
+import { clear, el } from "./dom.js?v=2";
+import { createLightbox } from "./components/lightbox.js?v=2";
+import { createPersonDrawer } from "./components/person_drawer.js?v=2";
+import { createPostModal } from "./components/post_modal.js?v=2";
+import { renderFacebookView } from "./views/facebook.js?v=2";
+import { renderInstagramView } from "./views/instagram.js?v=2";
+import { renderMessagesView } from "./views/messages.js?v=2";
+import { renderSearchView } from "./views/search.js?v=2";
 
 const mainEl = document.getElementById("app-main");
 const modalRoot = document.getElementById("modal-root");
@@ -23,7 +23,9 @@ let postModal = null;
 let personDrawer = null;
 
 function navigateThread(threadId, ts = null) {
-  const qs = ts ? `thread=${encodeURIComponent(threadId)}&ts=${encodeURIComponent(ts)}` : `thread=${encodeURIComponent(threadId)}`;
+  const qs = ts
+    ? `thread=${encodeURIComponent(threadId)}&ts=${encodeURIComponent(ts)}`
+    : `thread=${encodeURIComponent(threadId)}`;
   window.location.hash = `#/messages?${qs}`;
 }
 
@@ -37,6 +39,35 @@ postModal = createPostModal(modalRoot, {
   onOpenPerson: (ident) => personDrawer.open(ident),
 });
 
+// Centralized Escape priority: Lightbox -> Drawer -> Modal (never closes two layers at once)
+window.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") {
+    if (!lightboxRoot.classList.contains("hidden")) {
+      lightbox.close();
+      return;
+    }
+    if (!drawerRoot.classList.contains("hidden")) {
+      personDrawer.close();
+      return;
+    }
+    if (!modalRoot.classList.contains("hidden")) {
+      postModal.close();
+      return;
+    }
+  } else if (ev.key === "/" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
+      ev.preventDefault();
+      if (!window.location.hash.startsWith("#/search")) {
+        window.location.hash = "#/search";
+      } else {
+        const searchInput = mainEl.querySelector('input[type="search"]');
+        if (searchInput) searchInput.focus();
+      }
+    }
+  }
+});
+
 const ctx = {
   modal: postModal,
   openPost: (postId) => postModal.open(postId),
@@ -45,16 +76,28 @@ const ctx = {
   navigateThread,
 };
 
+function currentEffectiveTheme() {
+  const explicit = document.documentElement.dataset.theme;
+  if (explicit === "dark" || explicit === "light") return explicit;
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function updateThemeButton() {
+  const isDark = currentEffectiveTheme() === "dark";
+  themeBtn.textContent = isDark ? "☀️ 라이트" : "🌙 다크";
+}
+
 function initTheme() {
   const saved = localStorage.getItem("meta-archive-theme");
   if (saved === "dark" || saved === "light") {
     document.documentElement.dataset.theme = saved;
   }
+  updateThemeButton();
   themeBtn.addEventListener("click", () => {
-    const cur = document.documentElement.dataset.theme;
-    const next = cur === "dark" ? "light" : "dark";
+    const next = currentEffectiveTheme() === "dark" ? "light" : "dark";
     document.documentElement.dataset.theme = next;
     localStorage.setItem("meta-archive-theme", next);
+    updateThemeButton();
   });
 }
 
@@ -76,7 +119,7 @@ async function refreshHeaderStats() {
   try {
     const ov = await api.overview();
     const t = ov.totals || {};
-    overviewBadge.textContent = `게시물 ${t.posts || 0} · 스토리 ${t.stories || 0} · 메시지 ${t.messages || 0}`;
+    overviewBadge.textContent = `게시물 ${(t.posts || 0).toLocaleString()} · 스토리 ${(t.stories || 0).toLocaleString()} · 메시지 ${(t.messages || 0).toLocaleString()}`;
   } catch (err) {
     overviewBadge.textContent = `오프라인 (${err.message})`;
   }

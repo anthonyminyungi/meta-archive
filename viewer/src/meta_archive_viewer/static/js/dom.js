@@ -1,6 +1,6 @@
 /** Safe DOM builders and formatting helpers (strictly textContent, zero unescaped innerHTML). */
 
-import { mediaUrl } from "./api.js";
+import { mediaUrl } from "./api.js?v=2";
 
 export function el(tag, attrs = null, ...children) {
   const node = document.createElement(tag);
@@ -43,16 +43,20 @@ export function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
-export function formatDate(createdAt, timestampUnix) {
-  let d = null;
+function parseDateObj(createdAt, timestampUnix) {
   if (createdAt) {
     const parsed = new Date(createdAt);
-    if (!Number.isNaN(parsed.getTime())) d = parsed;
+    if (!Number.isNaN(parsed.getTime())) return parsed;
   }
-  if (!d && timestampUnix) {
+  if (timestampUnix) {
     const parsed = new Date(Number(timestampUnix) * 1000);
-    if (!Number.isNaN(parsed.getTime())) d = parsed;
+    if (!Number.isNaN(parsed.getTime())) return parsed;
   }
+  return null;
+}
+
+export function formatDate(createdAt, timestampUnix) {
+  const d = parseDateObj(createdAt, timestampUnix);
   if (!d) return "날짜 정보 없음";
   return new Intl.DateTimeFormat("ko-KR", {
     year: "numeric",
@@ -60,6 +64,42 @@ export function formatDate(createdAt, timestampUnix) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+  }).format(d);
+}
+
+export function formatShortDate(createdAt, timestampUnix) {
+  const d = parseDateObj(createdAt, timestampUnix);
+  if (!d) return "";
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "2-digit",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+export function formatTimeOnly(createdAt, timestampUnix) {
+  const d = parseDateObj(createdAt, timestampUnix);
+  if (!d) return "";
+  return new Intl.DateTimeFormat("ko-KR", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
+}
+
+export function formatDayKey(createdAt, timestampUnix) {
+  const d = parseDateObj(createdAt, timestampUnix);
+  if (!d) return "";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+export function formatDayLabel(createdAt, timestampUnix) {
+  const d = parseDateObj(createdAt, timestampUnix);
+  if (!d) return "날짜 정보 없음";
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "short",
   }).format(d);
 }
 
@@ -105,23 +145,37 @@ export function isDocumentMedia(media) {
   );
 }
 
-export function avatarEl(localPath, label = "?", large = false) {
-  const cls = large ? "avatar avatar-lg" : "avatar";
+function hashColorIndex(label) {
+  const str = String(label || "?");
+  let h = 0;
+  for (let i = 0; i < str.length; i += 1) {
+    h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  }
+  return h % 8;
+}
+
+export function avatarEl(localPath, label = "?", sizeOrLarge = false) {
+  let sizeCls = "avatar-md";
+  if (sizeOrLarge === true || sizeOrLarge === "lg") sizeCls = "avatar-lg";
+  else if (sizeOrLarge === "sm") sizeCls = "avatar-sm";
+  const cls = `avatar ${sizeCls}`;
   const src = mediaUrl(localPath);
   if (src) {
     return el("img", { className: cls, src, alt: label, loading: "lazy" });
   }
   const initial = (String(label || "?").trim().slice(0, 1) || "?").toUpperCase();
-  return el("span", { className: `${cls} avatar-fallback` }, initial);
+  const colorCls = `av-c${hashColorIndex(label)}`;
+  return el("span", { className: `${cls} avatar-fallback ${colorCls}`, "aria-hidden": "true" }, initial);
 }
 
 export function personButton(username, fullName, onOpenPerson) {
-  const label = fullName && username && fullName !== username
-    ? `${fullName} (@${username})`
-    : fullName || (username ? `@${username}` : "알 수 없음");
+  const label =
+    fullName && username && fullName !== username
+      ? `${fullName} (@${username})`
+      : fullName || (username ? `@${username}` : "알 수 없음");
   const identifier = username || fullName;
   if (!identifier || !onOpenPerson) {
-    return el("span", null, label);
+    return el("span", { style: "font-weight:600;" }, label);
   }
   return el(
     "button",
@@ -154,17 +208,96 @@ export function extractReactionEntries(reactions) {
   return Object.entries(map);
 }
 
+const REACTION_EMOJI_MAP = {
+  LIKE: "👍",
+  "좋아요": "👍",
+  LOVE: "❤️",
+  "최고예요": "❤️",
+  HAHA: "😆",
+  "웃겨요": "😆",
+  WOW: "😮",
+  "멋져요": "😮",
+  SAD: "😢",
+  "슬퍼요": "😢",
+  ANGRY: "😠",
+  "화나요": "😠",
+  CARE: "🤗",
+  "힘내요": "🤗",
+};
+
+export function formatReactionBadge(rtype, count) {
+  const emoji = REACTION_EMOJI_MAP[rtype] || REACTION_EMOJI_MAP[String(rtype).toUpperCase()] || "👍";
+  return `${emoji} ${rtype} ${count}`;
+}
+
+export function renderCollapsibleText(text, { maxChars = 320, maxLines = 6, className = "post-caption" } = {}) {
+  if (!text) return null;
+  const lines = String(text).split("\n");
+  const needsClamp = text.length > maxChars || lines.length > maxLines;
+  if (!needsClamp) {
+    return el("div", { className }, text);
+  }
+  const truncated =
+    lines.length > maxLines
+      ? `${lines.slice(0, maxLines).join("\n").slice(0, maxChars)}…`
+      : `${text.slice(0, maxChars)}…`;
+
+  let expanded = false;
+  const textNode = el("div", { className, style: "margin-bottom:4px;" }, truncated);
+  const toggleBtn = el(
+    "button",
+    {
+      type: "button",
+      className: "btn-link caption-toggle-btn",
+      onClick: (ev) => {
+        ev.stopPropagation();
+        expanded = !expanded;
+        textNode.textContent = expanded ? text : truncated;
+        toggleBtn.textContent = expanded ? "접기" : "더 보기";
+      },
+    },
+    "더 보기"
+  );
+  return el("div", null, textNode, toggleBtn);
+}
+
+export function highlightTextNodes(text, query) {
+  const src = String(text || "");
+  const q = String(query || "").trim();
+  if (!q) return [document.createTextNode(src)];
+  const lowerSrc = src.toLowerCase();
+  const lowerQ = q.toLowerCase();
+  const nodes = [];
+  let pos = 0;
+  while (pos < src.length) {
+    const idx = lowerSrc.indexOf(lowerQ, pos);
+    if (idx === -1) {
+      nodes.push(document.createTextNode(src.slice(pos)));
+      break;
+    }
+    if (idx > pos) {
+      nodes.push(document.createTextNode(src.slice(pos, idx)));
+    }
+    nodes.push(el("mark", { className: "search-mark" }, src.slice(idx, idx + q.length)));
+    pos = idx + q.length;
+  }
+  return nodes;
+}
+
 export function renderSharedCard(sharedPost, onOpenLightbox) {
   if (!sharedPost) return null;
   const thumbSrc = mediaUrl(sharedPost.thumbnail_local_path);
   const thumbEl = thumbSrc
     ? el("img", {
-        className: "shared-card-thumb",
+        className: "shared-card-banner",
         src: thumbSrc,
         alt: sharedPost.title || sharedPost.domain || "shared link thumbnail",
         loading: "lazy",
         onClick: onOpenLightbox
-          ? () => onOpenLightbox([{ local_path: sharedPost.thumbnail_local_path, media_type: "image" }], 0)
+          ? (ev) => {
+              ev.stopPropagation();
+              onOpenLightbox([{ local_path: sharedPost.thumbnail_local_path, media_type: "image" }], 0);
+            }
           : undefined,
       })
     : null;
@@ -174,7 +307,7 @@ export function renderSharedCard(sharedPost, onOpenLightbox) {
       ? el(
           "div",
           { className: "shared-card-meta" },
-          sharedPost.domain ? el("span", { className: "pill" }, sharedPost.domain) : null,
+          sharedPost.domain ? el("span", { className: "shared-card-domain" }, `🔗 ${sharedPost.domain}`) : null,
           sharedPost.author_name ? el("span", { className: "pill" }, `원작자: ${sharedPost.author_name}`) : null
         )
       : null;
@@ -195,16 +328,24 @@ export function renderSharedCard(sharedPost, onOpenLightbox) {
       : el("div", { className: "shared-card-url" }, sharedPost.url)
     : null;
 
+  const descNode = sharedPost.text
+    ? renderCollapsibleText(sharedPost.text, {
+        maxChars: 260,
+        maxLines: 5,
+        className: "shared-card-desc",
+      })
+    : null;
+
   return el(
     "div",
-    { className: "shared-card" },
+    { className: `shared-card${thumbEl ? "" : " shared-card-no-thumb"}` },
     thumbEl,
     el(
       "div",
       { className: "shared-card-body" },
       metaRow,
       sharedPost.title ? el("div", { className: "shared-card-title" }, sharedPost.title) : null,
-      sharedPost.text ? el("div", { className: "shared-card-desc" }, sharedPost.text) : null,
+      descNode,
       urlNode
     )
   );

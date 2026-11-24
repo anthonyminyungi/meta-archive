@@ -1,10 +1,13 @@
-/** Full-screen media lightbox overlay. */
+/** Full-screen media lightbox overlay with keyboard ArrowLeft/ArrowRight navigation. */
 
-import { mediaUrl } from "../api.js";
-import { clear, el, isAudioMedia, isDocumentMedia, isVideoMedia } from "../dom.js";
+import { mediaUrl } from "../api.js?v=2";
+import { clear, el, isAudioMedia, isDocumentMedia, isVideoMedia } from "../dom.js?v=2";
 
 export function createLightbox(hostEl) {
+  let activeNav = null;
+
   function close() {
+    activeNav = null;
     clear(hostEl);
     hostEl.classList.add("hidden");
   }
@@ -14,8 +17,13 @@ export function createLightbox(hostEl) {
   });
 
   window.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && !hostEl.classList.contains("hidden")) {
-      close();
+    if (hostEl.classList.contains("hidden") || !activeNav) return;
+    if (ev.key === "ArrowLeft") {
+      ev.preventDefault();
+      activeNav(-1);
+    } else if (ev.key === "ArrowRight") {
+      ev.preventDefault();
+      activeNav(1);
     }
   });
 
@@ -25,6 +33,14 @@ export function createLightbox(hostEl) {
 
     const stage = el("div", { className: "lightbox-stage" });
 
+    function step(delta) {
+      if (mediaList.length <= 1) return;
+      idx = (idx + delta + mediaList.length) % mediaList.length;
+      render();
+    }
+
+    activeNav = step;
+
     function render() {
       clear(stage);
       const item = mediaList[idx];
@@ -32,16 +48,14 @@ export function createLightbox(hostEl) {
 
       const topBar = el(
         "div",
-        { style: "display:flex;gap:12px;align-items:center;color:#fff;" },
-        mediaList.length > 1
-          ? el("span", null, `${idx + 1} / ${mediaList.length}`)
-          : null,
-        item.taken_at_exif ? el("span", null, `EXIF: ${item.taken_at_exif}`) : null,
+        { style: "display:flex;gap:12px;align-items:center;color:#fff;font-size:0.88rem;" },
+        mediaList.length > 1 ? el("span", { style: "font-weight:600;" }, `${idx + 1} / ${mediaList.length}`) : null,
+        item.taken_at_exif ? el("span", { style: "opacity:0.8;" }, `EXIF: ${item.taken_at_exif}`) : null,
         el(
           "button",
           {
             type: "button",
-            className: "btn",
+            className: "btn btn-sm",
             style: "background:#222;color:#fff;border-color:#444;",
             onClick: close,
           },
@@ -77,30 +91,26 @@ export function createLightbox(hostEl) {
         mediaList.length > 1
           ? el(
               "div",
-              { style: "display:flex;gap:10px;" },
+              { style: "display:flex;gap:10px;align-items:center;" },
               el(
                 "button",
                 {
                   type: "button",
-                  className: "btn",
-                  onClick: () => {
-                    idx = (idx - 1 + mediaList.length) % mediaList.length;
-                    render();
-                  },
+                  className: "btn btn-sm",
+                  style: "background:#222;color:#fff;border-color:#444;",
+                  onClick: () => step(-1),
                 },
-                "◀ 이전"
+                "◀ 이전 (←)"
               ),
               el(
                 "button",
                 {
                   type: "button",
-                  className: "btn",
-                  onClick: () => {
-                    idx = (idx + 1) % mediaList.length;
-                    render();
-                  },
+                  className: "btn btn-sm",
+                  style: "background:#222;color:#fff;border-color:#444;",
+                  onClick: () => step(1),
                 },
-                "다음 ▶"
+                "다음 (→) ▶"
               )
             )
           : null;

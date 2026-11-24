@@ -1,8 +1,18 @@
-/** Instagram archive view: profile header, connections modal, highlights/stories, 3-col grid & feed toggle. */
+/** Instagram archive view: gradient profile/highlights, 3-col hover grid, feed cards, stories grid. */
 
-import { api, mediaUrl } from "../api.js";
-import { avatarEl, clear, el, formatDate, isVideoMedia, personButton, safeExternalHref } from "../dom.js";
-import { renderCarousel } from "../components/carousel.js";
+import { api, mediaUrl } from "../api.js?v=2";
+import {
+  avatarEl,
+  clear,
+  el,
+  formatDate,
+  formatShortDate,
+  isVideoMedia,
+  personButton,
+  renderCollapsibleText,
+  safeExternalHref,
+} from "../dom.js?v=2";
+import { renderCarousel } from "../components/carousel.js?v=2";
 
 export async function renderInstagramView(container, ctx) {
   clear(container);
@@ -63,7 +73,7 @@ export async function renderInstagramView(container, ctx) {
             el(
               "div",
               { className: "person-row" },
-              avatarEl(c.avatar_local_path, c.username || c.full_name || "?"),
+              avatarEl(c.avatar_local_path, c.username || c.full_name || "?", "md"),
               el(
                 "div",
                 { style: "min-width:0;flex:1;" },
@@ -73,8 +83,8 @@ export async function renderInstagramView(container, ctx) {
                 }),
                 el(
                   "div",
-                  { style: "font-size:0.78rem;color:var(--text-muted);" },
-                  `${c.relation}${c.connected_at ? ` · ${formatDate(c.connected_at, c.timestamp_unix)}` : ""}`
+                  { style: "font-size:0.76rem;color:var(--text-muted);" },
+                  `${c.relation}${c.connected_at ? ` · ${formatShortDate(c.connected_at, c.timestamp_unix)}` : ""}`
                 )
               )
             )
@@ -100,42 +110,41 @@ export async function renderInstagramView(container, ctx) {
         body.appendChild(el("div", { className: "empty-box" }, "저장된 스토리가 없습니다."));
         return;
       }
-      const list = el("div", { className: "feed-list" });
+      const allMedia = res.items.map((s) => s.media).filter((m) => m && m.local_path);
+      const grid = el("div", { className: "story-grid" });
       for (const s of res.items) {
         const src = s.media ? mediaUrl(s.media.local_path) : null;
+        const lbIdx = s.media ? allMedia.indexOf(s.media) : -1;
         let mediaEl = null;
         if (src) {
           mediaEl = isVideoMedia(s.media)
-            ? el("video", { src, controls: true, playsinline: true, preload: "metadata", style: "max-width:100%;max-height:420px;border-radius:8px;" })
+            ? el("video", { src, controls: true, playsinline: true, preload: "metadata" })
             : el("img", {
                 src,
                 alt: s.highlight_title || "story",
                 loading: "lazy",
-                style: "max-width:100%;max-height:420px;border-radius:8px;cursor:zoom-in;",
-                onClick: () => ctx.openLightbox([s.media], 0),
+                style: "cursor:zoom-in;",
+                onClick: () => ctx.openLightbox(allMedia, Math.max(0, lbIdx)),
               });
         }
-        list.appendChild(
+        grid.appendChild(
           el(
             "div",
-            { className: "card" },
+            { className: "card story-card" },
             el(
               "div",
-              { className: "post-meta-row", style: "margin-top:0;margin-bottom:8px;" },
-              el("span", { className: "pill pill-accent" }, formatDate(s.created_at, s.timestamp_unix)),
+              { className: "post-meta-row", style: "margin-top:0;font-size:0.75rem;" },
+              el("span", { className: "pill pill-ig" }, formatDate(s.created_at, s.timestamp_unix)),
               s.highlight_title ? el("span", { className: "pill" }, s.highlight_title) : null,
               s.location_name ? el("span", { className: "pill" }, `📍 ${s.location_name}`) : null,
               s.likes_count > 0 ? el("span", { className: "pill" }, `♥ ${s.likes_count}`) : null
             ),
             mediaEl,
-            s.caption ? el("div", { className: "post-caption" }, s.caption) : null,
-            s.stickers && s.stickers.length > 0
-              ? el("div", { className: "post-meta-row" }, s.stickers.map((st) => el("span", { className: "pill" }, st)))
-              : null
+            s.caption ? el("div", { style: "font-size:0.84rem;white-space:pre-wrap;" }, s.caption) : null
           )
         );
       }
-      body.appendChild(list);
+      body.appendChild(grid);
     });
   }
 
@@ -179,12 +188,12 @@ export async function renderInstagramView(container, ctx) {
               el(
                 "div",
                 { className: "post-meta-row", style: "margin-top:0;margin-bottom:6px;" },
-                el("span", { className: "pill pill-accent" }, a.kind),
+                el("span", { className: "pill pill-ig" }, a.kind),
                 el("span", { className: "pill" }, formatDate(a.created_at, a.timestamp_unix)),
                 a.target_author ? el("span", { className: "pill" }, `@${a.target_author}`) : null
               ),
               a.text ? el("div", { className: "post-caption" }, a.text) : null,
-              href ? el("a", { href, target: "_blank", rel: "noopener noreferrer" }, a.url) : null
+              href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", style: "font-size:0.82rem;word-break:break-all;" }, a.url) : null
             )
           );
         }
@@ -213,7 +222,7 @@ export async function renderInstagramView(container, ctx) {
     el(
       "section",
       { className: "card profile-header" },
-      avatarEl(profile ? profile.avatar_local_path : null, displayTitle, true),
+      el("div", { className: "avatar-ring-ig" }, avatarEl(profile ? profile.avatar_local_path : null, displayTitle, "lg")),
       el(
         "div",
         { className: "profile-meta" },
@@ -221,13 +230,13 @@ export async function renderInstagramView(container, ctx) {
           "div",
           { className: "profile-title-row" },
           el("h1", null, displayTitle),
-          el("span", { className: "pill pill-accent" }, `스토리 ${igStats.stories || 0}`),
+          el("span", { className: "pill pill-ig" }, `스토리 ${igStats.stories || 0}`),
           el("span", { className: "pill" }, `댓글 ${igStats.comments || 0}`)
         ),
         el(
           "div",
           { className: "profile-stats" },
-          el("span", null, `게시물 ${igStats.posts || 0}`),
+          el("span", null, "게시물", el("span", { className: "profile-stat-val" }, String(igStats.posts || 0))),
           el(
             "button",
             { type: "button", className: "btn-link", onClick: () => openConnectionsModal("follower") },
@@ -262,7 +271,7 @@ export async function renderInstagramView(container, ctx) {
           className: "highlight-btn",
           onClick: () => openStoriesModal(null, "전체 스토리"),
         },
-        el("span", { className: "highlight-ring" }, el("strong", null, "ALL")),
+        el("span", { className: "highlight-ring" }, el("span", { className: "highlight-ring-inner" }, el("strong", null, "ALL"))),
         el("span", { className: "highlight-label" }, `스토리 (${igStats.stories || 0})`)
       )
     );
@@ -279,9 +288,13 @@ export async function renderInstagramView(container, ctx) {
           el(
             "span",
             { className: "highlight-ring" },
-            coverSrc
-              ? el("img", { src: coverSrc, alt: h.highlight_title, loading: "lazy" })
-              : el("strong", null, (h.highlight_title || "HL").slice(0, 2))
+            el(
+              "span",
+              { className: "highlight-ring-inner" },
+              coverSrc
+                ? el("img", { src: coverSrc, alt: h.highlight_title, loading: "lazy" })
+                : el("strong", null, (h.highlight_title || "HL").slice(0, 2))
+            )
           ),
           el("span", { className: "highlight-label", title: h.highlight_title }, `${h.highlight_title} (${h.count})`)
         )
@@ -346,11 +359,11 @@ export async function renderInstagramView(container, ctx) {
           thumb = el("div", { className: "ig-tile-text-only" }, (post.caption || post.post_id).slice(0, 60));
         }
 
-        const badge =
+        const rightBadge =
           (post.media || []).length > 1
             ? el("span", { className: "tile-badge" }, `❐ ${post.media.length}`)
             : isVideoMedia(primary)
-              ? el("span", { className: "tile-badge" }, "▶ 영상")
+              ? el("span", { className: "tile-badge" }, "▶")
               : null;
 
         grid.appendChild(
@@ -364,9 +377,15 @@ export async function renderInstagramView(container, ctx) {
             thumb,
             el(
               "div",
-              { className: "ig-tile-overlay" },
+              { className: "ig-tile-top-badges" },
               post.is_archived ? el("span", { className: "tile-badge" }, "보관") : el("span"),
-              badge || el("span", { className: "tile-badge" }, `♥ ${post.likes_count} · 💬 ${post.comments_count}`)
+              rightBadge
+            ),
+            el(
+              "div",
+              { className: "ig-tile-hover" },
+              el("span", null, `♥ ${post.likes_count}   💬 ${post.comments_count}`),
+              el("small", null, formatShortDate(post.created_at, post.timestamp_unix))
             )
           )
         );
@@ -378,31 +397,45 @@ export async function renderInstagramView(container, ctx) {
     const feed = el("div", { className: "feed-list" });
     for (const post of state.items) {
       const carousel = renderCarousel(post.media, ctx.openLightbox);
+      const authorLabel = post.author_name || post.author_username || "Instagram";
       feed.appendChild(
         el(
           "article",
-          { className: "card" },
+          { className: "card feed-card" },
           el(
             "div",
             { className: "post-card-head" },
             el(
               "div",
               { className: "post-author-block" },
-              personButton(post.author_username, post.author_name, ctx.openPerson),
-              post.is_archived ? el("span", { className: "pill pill-warn" }, "보관됨") : null,
-              post.location && post.location.name ? el("span", { className: "pill" }, `📍 ${post.location.name}`) : null
-            ),
-            el("span", { style: "font-size:0.82rem;color:var(--text-muted);" }, formatDate(post.created_at, post.timestamp_unix))
+              avatarEl(post.author_avatar_local_path, authorLabel, "md"),
+              el(
+                "div",
+                { className: "post-author-meta" },
+                el(
+                  "div",
+                  { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap;" },
+                  personButton(post.author_username, post.author_name, ctx.openPerson),
+                  post.is_archived ? el("span", { className: "pill pill-warn" }, "보관됨") : null
+                ),
+                el(
+                  "div",
+                  { className: "post-author-sub" },
+                  el("span", null, formatDate(post.created_at, post.timestamp_unix)),
+                  post.location && post.location.name ? el("span", null, `· 📍 ${post.location.name}`) : null
+                )
+              )
+            )
           ),
           carousel,
-          post.caption ? el("div", { className: "post-caption" }, post.caption) : null,
+          post.caption ? renderCollapsibleText(post.caption, { maxChars: 280, maxLines: 5 }) : null,
           el(
             "div",
-            { className: "post-meta-row" },
-            el("span", { className: "pill" }, `좋아요 ${post.likes_count}`),
+            { className: "post-footer-bar" },
+            el("span", { className: "pill pill-ig" }, `♥ 좋아요 ${post.likes_count}`),
             el(
               "button",
-              { type: "button", className: "btn", onClick: () => ctx.openPost(post.post_id) },
+              { type: "button", className: "btn btn-sm", onClick: () => ctx.openPost(post.post_id) },
               `상세 & 댓글 ${post.comments_count} 보기`
             )
           )
