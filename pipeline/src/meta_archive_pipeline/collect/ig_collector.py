@@ -880,8 +880,9 @@ def extract_ig_post_from_payloads(
     if sidecar_nodes or carousel_nodes:
         post_type: Literal["post", "carousel", "reel", "album_photo", "shared", "other"] = "carousel"
         children = sidecar_nodes or carousel_nodes
-        for idx, child in enumerate(children):
-            candidates.append(_media_candidate_from_node(child, is_carousel_cover=(idx == 0)))
+        for child in children:
+            # Every child in sidecar/carousel_media is an actual slide (not a duplicate cover).
+            candidates.append(_media_candidate_from_node(child, is_carousel_cover=False))
     else:
         cand = _media_candidate_from_node(primary, is_carousel_cover=False)
         candidates.append(cand)

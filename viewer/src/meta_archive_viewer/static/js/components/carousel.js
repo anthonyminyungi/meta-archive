@@ -9,8 +9,15 @@ function isPlainImage(item) {
 }
 
 export function renderCarousel(mediaList, onOpenLightbox, { eager = false } = {}) {
-  const playable = (mediaList || []).filter((m) => m && m.local_path && !m.is_carousel_cover);
-  const items = playable.length > 0 ? playable : (mediaList || []).filter((m) => m && m.local_path);
+  const valid = (mediaList || []).filter((m) => m && m.local_path);
+  // Only hide an `is_carousel_cover` entry when it is a true duplicate (same sha256) of a slide.
+  const nonCoverShas = new Set(
+    valid.filter((m) => !m.is_carousel_cover && m.sha256).map((m) => m.sha256)
+  );
+  const deduped = valid.filter(
+    (m) => !m.is_carousel_cover || !m.sha256 || !nonCoverShas.has(m.sha256)
+  );
+  const items = deduped.length > 0 ? deduped : valid;
   if (items.length === 0) return null;
 
   let index = 0;

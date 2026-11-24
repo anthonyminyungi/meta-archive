@@ -422,6 +422,27 @@ def _score_post_pair(
     if off_url_key and pw_url_key and off_url_key == pw_url_key:
         score += 3.0
 
+    # Meta official FB exports strip the body/URL of shared FB posts, leaving an empty
+    # share stub ("~님이 게시물을 공유했습니다.") with identical timestamp (±60s) to the rich Playwright share.
+    off_is_share_stub = (
+        off.platform == "facebook"
+        and off_cnt == 0
+        and pw_cnt == 0
+        and not off_cap
+        and not pw_cap
+        and not off_url_key
+        and (
+            off.post_type == "shared"
+            or "공유" in (off.activity_title or "")
+            or "shared" in (off.activity_title or "").lower()
+        )
+        and (pw.post_type == "shared" or pw.shared_post is not None)
+    )
+    if off_is_share_stub and ts_delta is not None and ts_delta <= 60:
+        score += 1.5
+        if ts_delta <= 2:
+            score += 1.5
+
     if score < 2.5:
         return None
 

@@ -554,3 +554,60 @@ def test_materialize_avif_jpeg_noext_collision_hash_stickers_taken_unix_and_vide
     assert v_amb == []
     assert len(v_merged) == 1
     assert v_merged[0].source == "merged"
+
+
+def test_fb_official_duplicate_empty_share_stubs_dedup_and_merge_with_playwright(
+    tmp_path: Path,
+) -> None:
+    from meta_archive_pipeline.official.fb_parser import parse_fb_official_export
+
+    fb_dir = tmp_path / "fb_export"
+    posts_dir = fb_dir / "your_facebook_activity" / "posts"
+    posts_dir.mkdir(parents=True)
+    # Two identical empty share stubs at the exact same timestamp (common in FB official exports)
+    raw_entries = [
+        {
+            "timestamp": 1738604126,
+            "title": "민윤기님이 게시물을 공유했습니다.",
+            "attachments": [{"data": [{"external_context": {}}]}],
+        },
+        {
+            "timestamp": 1738604126,
+            "title": "민윤기님이 게시물을 공유했습니다.",
+            "attachments": [{"data": [{"external_context": {}}]}],
+        },
+    ]
+    (posts_dir / "your_posts_1.json").write_text(
+        json.dumps(raw_entries, ensure_ascii=False), encoding="utf-8"
+    )
+
+    bundle = parse_fb_official_export(fb_dir)
+    assert len(bundle.posts) == 1
+    off_stub = bundle.posts[0]
+    assert off_stub.post_type == "shared"
+    assert off_stub.shared_post is None
+
+    pw_post = Post(
+        platform="facebook",
+        post_id="3361571257310715",
+        post_type="shared",
+        timestamp_unix=1738604127,  # ±1s skew
+        caption="",
+        shared_post=SharedPostRef(
+            url="https://www.facebook.com/groups/550/posts/1792/",
+            author_name="임진호",
+            text="원글 본문",
+            domain="facebook.com",
+            thumbnail_local_path="media/facebook/links/3361571257310715_thumb.jpg",
+        ),
+        source="playwright",
+    )
+    merged_posts, amb = merge_posts([off_stub], [pw_post])
+    assert amb == []
+    assert len(merged_posts) == 1
+    assert merged_posts[0].source == "merged"
+    assert merged_posts[0].post_id == "3361571257310715"
+    assert merged_posts[0].activity_title == "민윤기님이 게시물을 공유했습니다."
+    assert merged_posts[0].shared_post is not None
+    assert merged_posts[0].shared_post.author_name == "임진호"
+    assert merged_posts[0].shared_post.thumbnail_local_path == "media/facebook/links/3361571257310715_thumb.jpg"

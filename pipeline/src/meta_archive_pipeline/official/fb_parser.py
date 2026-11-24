@@ -206,14 +206,17 @@ def _extract_fb_entry_attachments(
                 clean_url = clean_fb_external_url(
                     ext.get("url") if isinstance(ext.get("url"), str) else None
                 )
-                desc = ext.get("description") if isinstance(ext.get("description"), str) else None
-                src_name = ext.get("source") if isinstance(ext.get("source"), str) else None
-                shared_post = SharedPostRef(
-                    url=clean_url,
-                    title=ext.get("name") if isinstance(ext.get("name"), str) else None,
-                    text=desc,
-                    domain=extract_domain(clean_url) or src_name,
-                )
+                title = ext.get("name") if isinstance(ext.get("name"), str) and ext["name"].strip() else None
+                desc = ext.get("description") if isinstance(ext.get("description"), str) and ext["description"].strip() else None
+                src_name = ext.get("source") if isinstance(ext.get("source"), str) and ext["source"].strip() else None
+                dom = extract_domain(clean_url) or src_name
+                if any((clean_url, title, desc, dom)):
+                    shared_post = SharedPostRef(
+                        url=clean_url,
+                        title=title,
+                        text=desc,
+                        domain=dom,
+                    )
             elif isinstance(adata.get("place"), dict) and location is None:
                 pl = adata["place"]
                 coord = pl.get("coordinate") if isinstance(pl.get("coordinate"), dict) else {}
@@ -280,9 +283,13 @@ def _parse_fb_posts(export_root: Path) -> list[Post]:
             if not caption and life_event_title:
                 caption = life_event_title
 
+            is_share_title = bool(
+                activity_title
+                and ("공유" in activity_title or "shared" in activity_title.lower())
+            )
             post_type = (
                 "shared"
-                if shared_post is not None and not media_items
+                if (shared_post is not None or is_share_title) and not media_items
                 else ("carousel" if len(media_items) > 1 else "post")
             )
             first_id = media_items[0].media_id if media_items and media_items[0].media_id else str(idx)
@@ -303,7 +310,25 @@ def _parse_fb_posts(export_root: Path) -> list[Post]:
                     source="official_export",
                 )
             )
-    return posts
+
+    # Deduplicate identical stub entries that Facebook repeats across/within your_posts_*.json
+    deduped: list[Post] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    for p in posts:
+        dedup_key = (
+            p.timestamp_unix,
+            " ".join(p.caption.split()),
+            p.activity_title or "",
+            tuple(m.local_path or m.original_uri or "" for m in p.media),
+            p.shared_post.url if p.shared_post else None,
+            p.shared_post.title if p.shared_post else None,
+        )
+        if p.timestamp_unix is not None and dedup_key in seen_keys:
+            continue
+        if p.timestamp_unix is not None:
+            seen_keys.add(dedup_key)
+        deduped.append(p)
+    return deduped
 
 
 def _merge_fb_albums(export_root: Path, posts: list[Post]) -> list[Post]:

@@ -238,7 +238,7 @@ def test_extract_profile_shortcodes_and_post_carousel_dash_and_comments() -> Non
     assert post.likes.count == 42
     assert post.is_collab is True
     assert len(candidates) == 2
-    assert candidates[0].is_carousel_cover is True
+    assert candidates[0].is_carousel_cover is False
     assert candidates[0].progressive_url == "https://cdn.example.com/slide1.jpg"
     assert candidates[1].media_type == "video"
     assert candidates[1].dash_video_url == "https://cdn.example.com/dash_v.mp4"
