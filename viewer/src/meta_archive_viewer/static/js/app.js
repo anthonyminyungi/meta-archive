@@ -1,13 +1,14 @@
 /** Main SPA hash router & shared controllers for Meta Archive viewer. */
 
-import { api } from "./api.js?v=3";
+import { api } from "./api.js?v=4";
 import { clear, el } from "./dom.js?v=3";
-import { icon } from "./icons.js?v=3";
+import { icon } from "./icons.js?v=4";
 import { createLightbox } from "./components/lightbox.js?v=3";
 import { createPersonDrawer } from "./components/person_drawer.js?v=3";
 import { createPostModal } from "./components/post_modal.js?v=3";
 import { renderFacebookView } from "./views/facebook.js?v=3";
 import { renderInstagramView } from "./views/instagram.js?v=3";
+import { renderMemoriesView } from "./views/memories.js?v=4";
 import { renderMessagesView } from "./views/messages.js?v=3";
 import { renderSearchView } from "./views/search.js?v=3";
 
@@ -107,9 +108,9 @@ function initTheme() {
 }
 
 function parseHash() {
-  const raw = (window.location.hash || "#/instagram").replace(/^#\/?/, "");
+  const raw = (window.location.hash || "#/memories").replace(/^#\/?/, "");
   const [routePart, qs] = raw.split("?", 2);
-  const route = routePart || "instagram";
+  const route = routePart || "memories";
   const params = new URLSearchParams(qs || "");
   return { route, params };
 }
@@ -135,15 +136,17 @@ async function routeNow() {
   setActiveTab(route);
 
   try {
-    if (route === "facebook") {
+    if (route === "instagram") {
+      await renderInstagramView(mainEl, ctx);
+    } else if (route === "facebook") {
       await renderFacebookView(mainEl, ctx);
     } else if (route === "messages") {
       await renderMessagesView(mainEl, ctx, params.get("thread"), params.get("ts"));
     } else if (route === "search") {
       await renderSearchView(mainEl, ctx, params.get("q") || "");
     } else {
-      setActiveTab("instagram");
-      await renderInstagramView(mainEl, ctx);
+      setActiveTab("memories");
+      await renderMemoriesView(mainEl, ctx, params);
     }
   } catch (err) {
     clear(mainEl);

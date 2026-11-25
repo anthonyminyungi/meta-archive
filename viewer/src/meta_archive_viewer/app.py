@@ -332,6 +332,55 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         return reader.get_person_activity(identifier=identifier, limit=limit)
 
+    @fastapi_app.get("/api/memories/on-this-day")
+    def api_memories_on_this_day(
+        month: int | None = Query(default=None, ge=1, le=12),
+        day: int | None = Query(default=None, ge=1, le=31),
+        include_shared: bool = False,
+        random_day: bool = False,
+    ) -> dict[str, Any]:
+        return reader.get_memories_on_this_day(
+            month=month,
+            day=day,
+            include_shared=include_shared,
+            random_day=random_day,
+        )
+
+    @fastapi_app.get("/api/memories/yearbook")
+    def api_memories_yearbook(
+        year: int | None = Query(default=None, ge=2000, le=2100),
+    ) -> dict[str, Any]:
+        return reader.get_memories_yearbook(year=year)
+
+    @fastapi_app.get("/api/memories/people")
+    def api_memories_people(
+        limit: int = Query(default=24, ge=1, le=100),
+    ) -> dict[str, Any]:
+        return reader.get_memories_inner_circle(limit=limit)
+
+    @fastapi_app.get("/api/memories/photos")
+    def api_memories_photos(
+        year: int | None = Query(default=None, ge=2000, le=2100),
+        platform: str | None = None,
+        place: str | None = None,
+        sort: str = "recent",
+        media_ids: str | None = None,
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=60, ge=1, le=200),
+    ) -> dict[str, Any]:
+        parsed_ids: list[int] | None = None
+        if media_ids is not None:
+            parsed_ids = [int(tok) for tok in media_ids.split(",") if tok.strip().isdigit()]
+        return reader.list_memories_photos(
+            year=year,
+            platform=platform,
+            place=place,
+            sort=sort,
+            media_ids=parsed_ids,
+            offset=offset,
+            limit=limit,
+        )
+
     @fastapi_app.api_route("/media/{rel_path:path}", methods=["GET", "HEAD"])
     def serve_media(rel_path: str, request: Request) -> Response:
         target = _resolve_media_file(resolved_archive, rel_path)

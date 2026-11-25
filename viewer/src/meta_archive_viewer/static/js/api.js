@@ -130,4 +130,10 @@ export const api = {
   search: (params) => getJson(`/api/search${buildQuery(params)}`),
   person: (identifier, limit = 50) =>
     getJson(`/api/people/${encodeURIComponent(identifier)}${buildQuery({ limit })}`),
+  memoriesOnThisDay: (params = {}) =>
+    getJson(`/api/memories/on-this-day${buildQuery(params)}`, { cache: !params.random_day }),
+  memoriesYearbook: (params = {}) => getJson(`/api/memories/yearbook${buildQuery(params)}`),
+  memoriesPeople: (params = {}) => getJson(`/api/memories/people${buildQuery(params)}`),
+  memoriesPhotos: (params = {}) =>
+    getJson(`/api/memories/photos${buildQuery(params)}`, { cache: params.sort !== "random" }),
 };

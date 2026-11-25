@@ -4,23 +4,34 @@ from __future__ import annotations
 
 import contextlib
 import json
+import random
 import sqlite3
 import urllib.parse
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 SUPPORTED_SCHEMA_VERSION = "1"
+_KST = timezone(timedelta(hours=9))
 
 _YEAR_EXPR = (
-    "CASE WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' "
-    "THEN CAST(substr(created_at, 1, 4) AS INTEGER) "
-    "ELSE CAST(strftime('%Y', timestamp_unix, 'unixepoch', '+9 hours') AS INTEGER) END"
+    "CASE WHEN timestamp_unix IS NOT NULL AND timestamp_unix > 0 "
+    "THEN CAST(strftime('%Y', timestamp_unix, 'unixepoch', '+9 hours') AS INTEGER) "
+    "WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' "
+    "THEN CAST(substr(created_at, 1, 4) AS INTEGER) ELSE NULL END"
 )
 _MONTH_EXPR = (
-    "CASE WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' "
-    "THEN CAST(substr(created_at, 6, 2) AS INTEGER) "
-    "ELSE CAST(strftime('%m', timestamp_unix, 'unixepoch', '+9 hours') AS INTEGER) END"
+    "CASE WHEN timestamp_unix IS NOT NULL AND timestamp_unix > 0 "
+    "THEN CAST(strftime('%m', timestamp_unix, 'unixepoch', '+9 hours') AS INTEGER) "
+    "WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' "
+    "THEN CAST(substr(created_at, 6, 2) AS INTEGER) ELSE NULL END"
+)
+_DAY_EXPR = (
+    "CASE WHEN timestamp_unix IS NOT NULL AND timestamp_unix > 0 "
+    "THEN CAST(strftime('%d', timestamp_unix, 'unixepoch', '+9 hours') AS INTEGER) "
+    "WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
+    "THEN CAST(substr(created_at, 9, 2) AS INTEGER) ELSE NULL END"
 )
 
 
@@ -1316,4 +1327,763 @@ class ArchiveReader:
                 "comments": [dict(r) for r in comment_rows],
                 "liked_posts": [dict(r) for r in liked_rows],
                 "messages": [dict(r) for r in msg_rows],
+            }
+
+    @staticmethod
+    def _clean_person_key(name: str | None) -> str:
+        s = " ".join((name or "").split()).strip()
+        if s.endswith("님") and len(s) >= 2:
+            s = s[:-1].strip()
+        return s.lower()
+
+    def _owner_name_set(self, conn: sqlite3.Connection) -> set[str]:
+        idx = self._get_avatar_index(conn)
+        out: set[str] = set()
+        for names in idx["owner_names"].values():
+            for n in names:
+                out.add(self._clean_person_key(n))
+        return out
+
+    def get_memories_on_this_day(
+        self,
+        *,
+        month: int | None = None,
+        day: int | None = None,
+        include_shared: bool = False,
+        random_day: bool = False,
+    ) -> dict[str, Any]:
+        """Return posts, stories, and active message highlights for a given KST month/day across all years."""
+        with self._connect() as conn:
+            self._read_schema_meta(conn)
+            if random_day:
+                day_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT m, d FROM (
+                        SELECT {_MONTH_EXPR} AS m, {_DAY_EXPR} AS d
+                        FROM posts
+                        WHERE NOT (platform = 'facebook' AND post_type = 'shared')
+                        UNION
+                        SELECT {_MONTH_EXPR} AS m, {_DAY_EXPR} AS d
+                        FROM stories
+                    )
+                    WHERE m IS NOT NULL AND d IS NOT NULL
+                    """
+                ).fetchall()
+                if day_rows:
+                    chosen = random.choice(day_rows)
+                    month, day = int(chosen["m"]), int(chosen["d"])
+
+            if month is None or day is None:
+                now_kst = datetime.now(_KST)
+                month = now_kst.month if month is None else month
+                day = now_kst.day if day is None else day
+
+            post_cols = self._table_cols(conn, "posts")
+            extra_title = "activity_title," if "activity_title" in post_cols else "NULL AS activity_title,"
+            shared_filter = "" if include_shared else "AND NOT (platform = 'facebook' AND post_type = 'shared')"
+            post_rows = conn.execute(
+                f"""
+                SELECT post_id, platform, shortcode, url, post_type,
+                       author_username, author_name, created_at, timestamp_unix,
+                       caption, {extra_title} location_name, likes_count,
+                       reactions_total, reactions_json, shared_post_json, is_archived,
+                       {_YEAR_EXPR} AS year
+                FROM posts
+                WHERE {_MONTH_EXPR} = ? AND {_DAY_EXPR} = ? {shared_filter}
+                ORDER BY COALESCE(timestamp_unix, 0) DESC, post_id DESC
+                LIMIT 100
+                """,
+                (month, day),
+            ).fetchall()
+
+            post_ids = [r["post_id"] for r in post_rows]
+            media_by_post: dict[str, list[dict[str, Any]]] = {}
+            cmt_count_by_post: dict[str, int] = {}
+            if post_ids:
+                ph = ",".join("?" for _ in post_ids)
+                for mrow in conn.execute(
+                    f"""
+                    SELECT id, owner_id, seq, media_type, local_path, width, height,
+                           duration_sec, has_audio, is_carousel_cover
+                    FROM media
+                    WHERE owner_type = 'post' AND owner_id IN ({ph})
+                      AND local_path IS NOT NULL AND local_path != ''
+                    ORDER BY seq ASC, id ASC
+                    """,
+                    post_ids,
+                ).fetchall():
+                    media_by_post.setdefault(mrow["owner_id"], []).append(dict(mrow))
+                for crow in conn.execute(
+                    f"SELECT post_id, COUNT(*) AS cnt FROM comments WHERE post_id IN ({ph}) GROUP BY post_id",
+                    post_ids,
+                ).fetchall():
+                    cmt_count_by_post[crow["post_id"]] = int(crow["cnt"])
+
+            posts_out: list[dict[str, Any]] = []
+            for r in post_rows:
+                raw_media = media_by_post.get(r["post_id"], [])
+                non_cover = [m for m in raw_media if not m.get("is_carousel_cover")]
+                posts_out.append(
+                    {
+                        "post_id": r["post_id"],
+                        "platform": r["platform"],
+                        "post_type": r["post_type"],
+                        "created_at": r["created_at"],
+                        "timestamp_unix": r["timestamp_unix"],
+                        "year": r["year"],
+                        "caption": r["caption"] or "",
+                        "activity_title": r["activity_title"],
+                        "location_name": r["location_name"],
+                        "likes_count": r["likes_count"] or 0,
+                        "reactions_total": r["reactions_total"] or 0,
+                        "comment_count": cmt_count_by_post.get(r["post_id"], 0),
+                        "shared_post": _loads_json(r["shared_post_json"], None),
+                        "is_archived": bool(r["is_archived"]),
+                        "media": non_cover or raw_media,
+                    }
+                )
+
+            story_cols = self._table_cols(conn, "stories")
+            cap_col = "caption," if "caption" in story_cols else "'' AS caption,"
+            story_rows = conn.execute(
+                f"""
+                SELECT story_id, platform, created_at, timestamp_unix, {cap_col}
+                       highlight_title, location_name, {_YEAR_EXPR} AS year
+                FROM stories
+                WHERE {_MONTH_EXPR} = ? AND {_DAY_EXPR} = ?
+                ORDER BY COALESCE(timestamp_unix, 0) DESC, story_id DESC
+                LIMIT 60
+                """,
+                (month, day),
+            ).fetchall()
+
+            story_ids = [r["story_id"] for r in story_rows]
+            media_by_story: dict[str, dict[str, Any]] = {}
+            if story_ids:
+                ph = ",".join("?" for _ in story_ids)
+                for mrow in conn.execute(
+                    f"""
+                    SELECT id, owner_id, media_type, local_path, width, height, duration_sec, has_audio
+                    FROM media
+                    WHERE owner_type = 'story' AND owner_id IN ({ph})
+                      AND local_path IS NOT NULL AND local_path != ''
+                    ORDER BY seq ASC, id ASC
+                    """,
+                    story_ids,
+                ).fetchall():
+                    media_by_story.setdefault(mrow["owner_id"], dict(mrow))
+
+            stories_out: list[dict[str, Any]] = []
+            for r in story_rows:
+                stories_out.append(
+                    {
+                        "story_id": r["story_id"],
+                        "platform": r["platform"],
+                        "created_at": r["created_at"],
+                        "timestamp_unix": r["timestamp_unix"],
+                        "year": r["year"],
+                        "caption": r["caption"] or "",
+                        "highlight_title": r["highlight_title"],
+                        "location_name": r["location_name"],
+                        "media": media_by_story.get(r["story_id"]),
+                    }
+                )
+
+            # Message highlights active on this month/day (grouped by year + thread)
+            mt_cols = self._table_cols(conn, "message_threads")
+            av_col = "mt.avatar_local_path" if "avatar_local_path" in mt_cols else "NULL AS avatar_local_path"
+            msg_rows = conn.execute(
+                f"""
+                SELECT m.thread_id, m.platform,
+                       {_YEAR_EXPR.replace('timestamp_unix', 'm.timestamp_unix').replace('created_at', 'm.created_at')} AS year,
+                       COUNT(*) AS msg_count,
+                       MIN(m.timestamp_unix) AS first_ts,
+                       MAX(m.timestamp_unix) AS last_ts,
+                       MAX(CASE WHEN m.text IS NOT NULL AND trim(m.text) != ''
+                                 AND m.text NOT LIKE '%sent an attachment%'
+                                 AND m.text NOT LIKE '%첨부 파일을 보냈습니다%'
+                            THEN m.sender || ': ' || substr(trim(m.text), 1, 90) END) AS snippet,
+                       mt.title, {av_col}, mt.participants_json
+                FROM messages m
+                JOIN message_threads mt ON mt.thread_id = m.thread_id
+                WHERE {_MONTH_EXPR.replace('timestamp_unix', 'm.timestamp_unix').replace('created_at', 'm.created_at')} = ?
+                  AND {_DAY_EXPR.replace('timestamp_unix', 'm.timestamp_unix').replace('created_at', 'm.created_at')} = ?
+                GROUP BY year, m.thread_id
+                ORDER BY year DESC, msg_count DESC
+                LIMIT 40
+                """,
+                (month, day),
+            ).fetchall()
+
+            msg_highlights: list[dict[str, Any]] = []
+            for r in msg_rows:
+                participants = _loads_json(r["participants_json"], [])
+                av = self._resolve_thread_avatar(
+                    conn, r["platform"], r["avatar_local_path"], r["title"], participants
+                )
+                msg_highlights.append(
+                    {
+                        "thread_id": r["thread_id"],
+                        "platform": r["platform"],
+                        "title": r["title"] or r["thread_id"],
+                        "avatar_local_path": av,
+                        "year": r["year"],
+                        "message_count": int(r["msg_count"]),
+                        "jump_ts": r["first_ts"] or r["last_ts"],
+                        "snippet": r["snippet"] or "",
+                    }
+                )
+
+            years_active = sorted(
+                {
+                    *(p["year"] for p in posts_out if p["year"]),
+                    *(s["year"] for s in stories_out if s["year"]),
+                    *(m["year"] for m in msg_highlights if m["year"]),
+                },
+                reverse=True,
+            )
+
+            return {
+                "month": month,
+                "day": day,
+                "include_shared": include_shared,
+                "years_active": years_active,
+                "posts": posts_out,
+                "stories": stories_out,
+                "message_highlights": msg_highlights,
+            }
+
+    def get_memories_yearbook(self, *, year: int | None = None) -> dict[str, Any]:
+        """Return 14-year index plus a cross-platform Yearbook page for the selected year."""
+        with self._connect() as conn:
+            self._read_schema_meta(conn)
+            by_year: dict[int, dict[str, int]] = {}
+
+            def _ensure(y: int | None) -> dict[str, int] | None:
+                if y is None or y < 2000 or y > 2100:
+                    return None
+                return by_year.setdefault(
+                    int(y),
+                    {
+                        "year": int(y),
+                        "ig_posts": 0,
+                        "fb_orig": 0,
+                        "fb_shared": 0,
+                        "stories": 0,
+                        "messages": 0,
+                        "comments": 0,
+                    },
+                )
+
+            for r in conn.execute(
+                f"""
+                SELECT {_YEAR_EXPR} AS y, platform,
+                       CASE WHEN platform = 'facebook' AND post_type = 'shared' THEN 'fb_shared'
+                            WHEN platform = 'facebook' THEN 'fb_orig'
+                            ELSE 'ig_posts' END AS bucket,
+                       COUNT(*) AS cnt
+                FROM posts
+                WHERE {_YEAR_EXPR} IS NOT NULL
+                GROUP BY y, bucket
+                """
+            ).fetchall():
+                slot = _ensure(r["y"])
+                if slot is not None:
+                    slot[r["bucket"]] += int(r["cnt"])
+
+            for r in conn.execute(
+                f"SELECT {_YEAR_EXPR} AS y, COUNT(*) AS cnt FROM stories WHERE {_YEAR_EXPR} IS NOT NULL GROUP BY y"
+            ).fetchall():
+                slot = _ensure(r["y"])
+                if slot is not None:
+                    slot["stories"] += int(r["cnt"])
+
+            for r in conn.execute(
+                f"SELECT {_YEAR_EXPR} AS y, COUNT(*) AS cnt FROM messages WHERE {_YEAR_EXPR} IS NOT NULL GROUP BY y"
+            ).fetchall():
+                slot = _ensure(r["y"])
+                if slot is not None:
+                    slot["messages"] += int(r["cnt"])
+
+            for r in conn.execute(
+                f"SELECT {_YEAR_EXPR} AS y, COUNT(*) AS cnt FROM comments WHERE {_YEAR_EXPR} IS NOT NULL GROUP BY y"
+            ).fetchall():
+                slot = _ensure(r["y"])
+                if slot is not None:
+                    slot["comments"] += int(r["cnt"])
+
+            years_list = sorted(by_year.values(), key=lambda x: x["year"], reverse=True)
+            for item in years_list:
+                item["total_memories"] = item["ig_posts"] + item["fb_orig"] + item["stories"]
+
+            selected_year = year
+            if selected_year is None:
+                with_posts = [y["year"] for y in years_list if y["total_memories"] > 0]
+                selected_year = with_posts[0] if with_posts else (years_list[0]["year"] if years_list else datetime.now(_KST).year)
+
+            selected_stats = next(
+                (y for y in years_list if y["year"] == selected_year),
+                {
+                    "year": selected_year,
+                    "ig_posts": 0,
+                    "fb_orig": 0,
+                    "fb_shared": 0,
+                    "stories": 0,
+                    "messages": 0,
+                    "comments": 0,
+                    "total_memories": 0,
+                },
+            )
+
+            # Photos & videos from that year (posts + stories, skip carousel covers)
+            photo_rows = conn.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT m.id, m.owner_type, m.owner_id, m.platform, m.media_type, m.local_path,
+                           m.width, m.height, m.duration_sec,
+                           p.created_at, p.timestamp_unix, p.caption, p.location_name
+                    FROM media m
+                    JOIN posts p ON m.owner_type = 'post' AND m.owner_id = p.post_id
+                    WHERE {_YEAR_EXPR.replace('timestamp_unix', 'p.timestamp_unix').replace('created_at', 'p.created_at')} = ?
+                      AND COALESCE(m.is_carousel_cover, 0) = 0
+                      AND m.media_type IN ('image', 'video')
+                      AND m.local_path IS NOT NULL AND m.local_path != ''
+                    UNION ALL
+                    SELECT m.id, m.owner_type, m.owner_id, m.platform, m.media_type, m.local_path,
+                           m.width, m.height, m.duration_sec,
+                           s.created_at, s.timestamp_unix, COALESCE(s.highlight_title, '') AS caption, s.location_name
+                    FROM media m
+                    JOIN stories s ON m.owner_type = 'story' AND m.owner_id = s.story_id
+                    WHERE {_YEAR_EXPR.replace('timestamp_unix', 's.timestamp_unix').replace('created_at', 's.created_at')} = ?
+                      AND m.media_type IN ('image', 'video')
+                      AND m.local_path IS NOT NULL AND m.local_path != ''
+                )
+                ORDER BY COALESCE(timestamp_unix, 0) DESC, id DESC
+                LIMIT 48
+                """,
+                (selected_year, selected_year),
+            ).fetchall()
+            photos = [dict(r) for r in photo_rows]
+
+            # Original posts (IG + FB non-shared) from that year
+            post_rows = conn.execute(
+                f"""
+                SELECT post_id, platform, post_type, created_at, timestamp_unix,
+                       caption, location_name, likes_count, reactions_total, is_archived
+                FROM posts
+                WHERE {_YEAR_EXPR} = ?
+                  AND NOT (platform = 'facebook' AND post_type = 'shared')
+                ORDER BY COALESCE(timestamp_unix, 0) DESC, post_id DESC
+                LIMIT 40
+                """,
+                (selected_year,),
+            ).fetchall()
+            pids = [r["post_id"] for r in post_rows]
+            media_by_p: dict[str, list[dict[str, Any]]] = {}
+            cmt_by_p: dict[str, int] = {}
+            if pids:
+                ph = ",".join("?" for _ in pids)
+                for mr in conn.execute(
+                    f"""
+                    SELECT id, owner_id, media_type, local_path, width, height, duration_sec, is_carousel_cover
+                    FROM media
+                    WHERE owner_type = 'post' AND owner_id IN ({ph})
+                      AND local_path IS NOT NULL AND local_path != ''
+                    ORDER BY seq ASC, id ASC
+                    """,
+                    pids,
+                ).fetchall():
+                    media_by_p.setdefault(mr["owner_id"], []).append(dict(mr))
+                for cr in conn.execute(
+                    f"SELECT post_id, COUNT(*) AS cnt FROM comments WHERE post_id IN ({ph}) GROUP BY post_id",
+                    pids,
+                ).fetchall():
+                    cmt_by_p[cr["post_id"]] = int(cr["cnt"])
+
+            posts_out: list[dict[str, Any]] = []
+            for r in post_rows:
+                raw_m = media_by_p.get(r["post_id"], [])
+                non_c = [m for m in raw_m if not m.get("is_carousel_cover")]
+                posts_out.append(
+                    {
+                        "post_id": r["post_id"],
+                        "platform": r["platform"],
+                        "post_type": r["post_type"],
+                        "created_at": r["created_at"],
+                        "timestamp_unix": r["timestamp_unix"],
+                        "caption": r["caption"] or "",
+                        "location_name": r["location_name"],
+                        "likes_count": r["likes_count"] or 0,
+                        "reactions_total": r["reactions_total"] or 0,
+                        "comment_count": cmt_by_p.get(r["post_id"], 0),
+                        "is_archived": bool(r["is_archived"]),
+                        "media": non_c or raw_m,
+                    }
+                )
+
+            # Places visited in selected year
+            place_rows = conn.execute(
+                f"""
+                SELECT location_name, COUNT(*) AS cnt
+                FROM posts
+                WHERE {_YEAR_EXPR} = ? AND location_name IS NOT NULL AND trim(location_name) != ''
+                GROUP BY location_name
+                ORDER BY cnt DESC, location_name ASC
+                LIMIT 20
+                """,
+                (selected_year,),
+            ).fetchall()
+            places = [{"name": r["location_name"], "count": int(r["cnt"])} for r in place_rows]
+
+            # Top people (commenters + active threads) in selected year
+            owners = self._owner_name_set(conn)
+            top_commenters: list[dict[str, Any]] = []
+            for r in conn.execute(
+                f"""
+                SELECT COALESCE(NULLIF(trim(author_name), ''), author_username) AS label,
+                       author_username, author_name, platform, COUNT(*) AS cnt
+                FROM comments
+                WHERE {_YEAR_EXPR} = ?
+                  AND COALESCE(NULLIF(trim(author_name), ''), author_username) IS NOT NULL
+                GROUP BY lower(label)
+                ORDER BY cnt DESC
+                LIMIT 15
+                """,
+                (selected_year,),
+            ).fetchall():
+                if self._clean_person_key(r["label"]) in owners:
+                    continue
+                top_commenters.append(
+                    {
+                        "label": r["label"],
+                        "identifier": r["author_username"] or r["author_name"] or r["label"],
+                        "platform": r["platform"],
+                        "comment_count": int(r["cnt"]),
+                        "avatar_local_path": self._resolve_avatar(
+                            conn, r["platform"], username=r["author_username"], full_name=r["author_name"]
+                        ),
+                    }
+                )
+                if len(top_commenters) >= 8:
+                    break
+
+            mt_cols = self._table_cols(conn, "message_threads")
+            av_col = "mt.avatar_local_path" if "avatar_local_path" in mt_cols else "NULL AS avatar_local_path"
+            top_threads: list[dict[str, Any]] = []
+            for r in conn.execute(
+                f"""
+                SELECT m.thread_id, m.platform, mt.title, {av_col}, mt.participants_json,
+                       COUNT(*) AS cnt, MAX(m.timestamp_unix) AS last_ts
+                FROM messages m
+                JOIN message_threads mt ON mt.thread_id = m.thread_id
+                WHERE {_YEAR_EXPR.replace('timestamp_unix', 'm.timestamp_unix').replace('created_at', 'm.created_at')} = ?
+                GROUP BY m.thread_id
+                ORDER BY cnt DESC
+                LIMIT 8
+                """,
+                (selected_year,),
+            ).fetchall():
+                participants = _loads_json(r["participants_json"], [])
+                av = self._resolve_thread_avatar(
+                    conn, r["platform"], r["avatar_local_path"], r["title"], participants
+                )
+                top_threads.append(
+                    {
+                        "thread_id": r["thread_id"],
+                        "platform": r["platform"],
+                        "title": r["title"] or r["thread_id"],
+                        "message_count": int(r["cnt"]),
+                        "jump_ts": r["last_ts"],
+                        "avatar_local_path": av,
+                    }
+                )
+
+            return {
+                "selected_year": selected_year,
+                "years": years_list,
+                "stats": selected_stats,
+                "photos": photos,
+                "posts": posts_out,
+                "places": places,
+                "top_commenters": top_commenters,
+                "top_threads": top_threads,
+            }
+
+    def get_memories_inner_circle(self, *, limit: int = 24) -> dict[str, Any]:
+        """Return cross-platform Inner Circle people (merged FB+IG) and top group chats."""
+        with self._connect() as conn:
+            self._read_schema_meta(conn)
+            owners = self._owner_name_set(conn)
+            ignored_keys = {"", "instagram user", "instagram 사용자", "facebook user", "facebook 사용자"}
+
+            # Map username <-> full_name from connections so IG username & FB/Korean full_name unify
+            alias_to_canon: dict[str, str] = {}
+            canon_display: dict[str, str] = {}
+            canon_username: dict[str, str] = {}
+            for r in conn.execute(
+                "SELECT platform, username, full_name FROM connections"
+            ).fetchall():
+                fn = (r["full_name"] or "").strip()
+                un = (r["username"] or "").strip()
+                fn_k = self._clean_person_key(fn)
+                un_k = self._clean_person_key(un)
+                if fn_k and fn_k not in ignored_keys:
+                    canon = fn_k
+                    canon_display.setdefault(canon, fn[:-1].strip() if fn.endswith("님") and len(fn) >= 2 else fn)
+                    alias_to_canon[fn_k] = canon
+                    if un_k:
+                        alias_to_canon.setdefault(un_k, canon)
+                        canon_username.setdefault(canon, un)
+                elif un_k and un_k not in ignored_keys:
+                    alias_to_canon.setdefault(un_k, un_k)
+                    canon_display.setdefault(un_k, un)
+                    canon_username.setdefault(un_k, un)
+
+            people: dict[str, dict[str, Any]] = {}
+
+            def _get_person(raw_name: str | None, raw_user: str | None = None) -> dict[str, Any] | None:
+                nk = self._clean_person_key(raw_name)
+                uk = self._clean_person_key(raw_user)
+                if nk in owners or uk in owners:
+                    return None
+                canon = alias_to_canon.get(nk) or alias_to_canon.get(uk) or nk or uk
+                if not canon or canon in owners or canon in ignored_keys:
+                    return None
+                entry = people.get(canon)
+                if entry is None:
+                    raw_label = (raw_name or raw_user or canon).strip()
+                    if raw_label.endswith("님") and len(raw_label) >= 2:
+                        raw_label = raw_label[:-1].strip()
+                    entry = {
+                        "key": canon,
+                        "display_name": canon_display.get(canon) or raw_label,
+                        "username": canon_username.get(canon) or (raw_user or None),
+                        "platforms": set(),
+                        "message_count": 0,
+                        "comment_count": 0,
+                        "like_count": 0,
+                        "first_ts": None,
+                        "last_ts": None,
+                        "threads": [],
+                    }
+                    people[canon] = entry
+                elif raw_user and not entry["username"]:
+                    entry["username"] = raw_user
+                return entry
+
+            def _bump_span(entry: dict[str, Any], ts: int | None) -> None:
+                if not ts or ts <= 0:
+                    return
+                if entry["first_ts"] is None or ts < entry["first_ts"]:
+                    entry["first_ts"] = ts
+                if entry["last_ts"] is None or ts > entry["last_ts"]:
+                    entry["last_ts"] = ts
+
+            for r in conn.execute(
+                """
+                SELECT platform, author_username, author_name,
+                       COUNT(*) AS cnt, MIN(timestamp_unix) AS min_ts, MAX(timestamp_unix) AS max_ts
+                FROM comments
+                GROUP BY platform, lower(COALESCE(NULLIF(trim(author_name), ''), author_username, ''))
+                """
+            ).fetchall():
+                entry = _get_person(r["author_name"], r["author_username"])
+                if entry is None:
+                    continue
+                entry["comment_count"] += int(r["cnt"])
+                entry["platforms"].add(r["platform"])
+                _bump_span(entry, r["min_ts"])
+                _bump_span(entry, r["max_ts"])
+
+            for r in conn.execute(
+                """
+                SELECT platform, username, full_name, COUNT(*) AS cnt
+                FROM likes
+                GROUP BY platform, lower(COALESCE(NULLIF(trim(full_name), ''), username, ''))
+                """
+            ).fetchall():
+                entry = _get_person(r["full_name"], r["username"])
+                if entry is None:
+                    continue
+                entry["like_count"] += int(r["cnt"])
+                entry["platforms"].add(r["platform"])
+
+            mt_cols = self._table_cols(conn, "message_threads")
+            av_col = "mt.avatar_local_path" if "avatar_local_path" in mt_cols else "NULL AS avatar_local_path"
+            group_threads: list[dict[str, Any]] = []
+            for r in conn.execute(
+                f"""
+                SELECT mt.thread_id, mt.platform, mt.title, {av_col},
+                       mt.participants_json, mt.message_count, mt.last_timestamp_unix,
+                       (SELECT MIN(m.timestamp_unix) FROM messages m WHERE m.thread_id = mt.thread_id AND m.timestamp_unix > 0) AS first_ts
+                FROM message_threads mt
+                WHERE COALESCE(mt.message_count, 0) > 0
+                ORDER BY mt.message_count DESC
+                """
+            ).fetchall():
+                participants = _loads_json(r["participants_json"], [])
+                non_owners = [
+                    p
+                    for p in participants
+                    if isinstance(p, dict)
+                    and self._clean_person_key(p.get("full_name") or p.get("username")) not in owners
+                ]
+                is_group = len(non_owners) > 1 or "," in (r["title"] or "") or " and " in (r["title"] or "") or " 외 " in (r["title"] or "")
+                if is_group:
+                    group_threads.append(
+                        {
+                            "thread_id": r["thread_id"],
+                            "platform": r["platform"],
+                            "title": r["title"] or r["thread_id"],
+                            "message_count": int(r["message_count"] or 0),
+                            "participant_count": len(participants),
+                            "first_ts": r["first_ts"],
+                            "last_ts": r["last_timestamp_unix"],
+                            "avatar_local_path": r["avatar_local_path"],
+                        }
+                    )
+                else:
+                    other_name = r["title"]
+                    other_user = None
+                    if len(non_owners) == 1:
+                        other_name = non_owners[0].get("full_name") or other_name
+                        other_user = non_owners[0].get("username")
+                    entry = _get_person(other_name, other_user)
+                    if entry is None:
+                        continue
+                    entry["message_count"] += int(r["message_count"] or 0)
+                    entry["platforms"].add(r["platform"])
+                    _bump_span(entry, r["first_ts"])
+                    _bump_span(entry, r["last_timestamp_unix"])
+                    entry["threads"].append(
+                        {
+                            "thread_id": r["thread_id"],
+                            "platform": r["platform"],
+                            "message_count": int(r["message_count"] or 0),
+                        }
+                    )
+
+            ranked: list[dict[str, Any]] = []
+            for entry in people.values():
+                # Weighted closeness score blending conversations, comments, and likes
+                score = entry["message_count"] + entry["comment_count"] * 12 + entry["like_count"] * 3
+                if score <= 0:
+                    continue
+                av = self._resolve_avatar(
+                    conn,
+                    None,
+                    username=entry["username"],
+                    full_name=entry["display_name"],
+                )
+                ranked.append(
+                    {
+                        "display_name": entry["display_name"],
+                        "username": entry["username"],
+                        "identifier": entry["username"] or entry["display_name"],
+                        "avatar_local_path": av,
+                        "platforms": sorted(entry["platforms"]),
+                        "message_count": entry["message_count"],
+                        "comment_count": entry["comment_count"],
+                        "like_count": entry["like_count"],
+                        "first_ts": entry["first_ts"],
+                        "last_ts": entry["last_ts"],
+                        "primary_thread_id": entry["threads"][0]["thread_id"] if entry["threads"] else None,
+                        "threads": entry["threads"],
+                        "score": score,
+                    }
+                )
+            ranked.sort(key=lambda x: (-x["score"], x["display_name"]))
+            return {
+                "people": ranked[:limit],
+                "groups": group_threads[:12],
+            }
+
+    def list_memories_photos(
+        self,
+        *,
+        year: int | None = None,
+        platform: str | None = None,
+        place: str | None = None,
+        sort: str = "recent",
+        media_ids: list[int] | None = None,
+        offset: int = 0,
+        limit: int = 60,
+    ) -> dict[str, Any]:
+        """Unified cross-platform photo/video wall across IG posts, FB posts, and stories."""
+        with self._connect() as conn:
+            self._read_schema_meta(conn)
+            base_union = f"""
+                SELECT m.id, m.owner_type, m.owner_id, m.platform, m.media_type,
+                       m.local_path, m.width, m.height, m.duration_sec,
+                       p.created_at, p.timestamp_unix,
+                       {_YEAR_EXPR.replace('timestamp_unix', 'p.timestamp_unix').replace('created_at', 'p.created_at')} AS year,
+                       COALESCE(p.caption, '') AS caption,
+                       p.location_name
+                FROM media m
+                JOIN posts p ON m.owner_type = 'post' AND m.owner_id = p.post_id
+                WHERE COALESCE(m.is_carousel_cover, 0) = 0
+                  AND m.media_type IN ('image', 'video')
+                  AND m.local_path IS NOT NULL AND m.local_path != ''
+                UNION ALL
+                SELECT m.id, m.owner_type, m.owner_id, m.platform, m.media_type,
+                       m.local_path, m.width, m.height, m.duration_sec,
+                       s.created_at, s.timestamp_unix,
+                       {_YEAR_EXPR.replace('timestamp_unix', 's.timestamp_unix').replace('created_at', 's.created_at')} AS year,
+                       COALESCE(s.highlight_title, '') AS caption,
+                       s.location_name
+                FROM media m
+                JOIN stories s ON m.owner_type = 'story' AND m.owner_id = s.story_id
+                WHERE m.media_type IN ('image', 'video')
+                  AND m.local_path IS NOT NULL AND m.local_path != ''
+            """
+            clauses: list[str] = []
+            params: list[Any] = []
+            if year is not None:
+                clauses.append("year = ?")
+                params.append(year)
+            if platform in ("instagram", "facebook"):
+                clauses.append("platform = ?")
+                params.append(platform)
+            if place:
+                clauses.append("location_name = ?")
+                params.append(place)
+            if media_ids is not None:
+                if not media_ids:
+                    return {"total": 0, "offset": offset, "limit": limit, "items": [], "places": []}
+                ph = ",".join("?" for _ in media_ids)
+                clauses.append(f"id IN ({ph})")
+                params.extend(media_ids)
+
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            order_sql = (
+                "ORDER BY RANDOM()"
+                if sort == "random"
+                else ("ORDER BY COALESCE(timestamp_unix, 0) ASC, id ASC" if sort == "oldest" else "ORDER BY COALESCE(timestamp_unix, 0) DESC, id DESC")
+            )
+
+            total = int(
+                conn.execute(f"SELECT COUNT(*) FROM ({base_union}) u {where_sql}", params).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"SELECT * FROM ({base_union}) u {where_sql} {order_sql} LIMIT ? OFFSET ?",
+                [*params, limit, offset],
+            ).fetchall()
+
+            place_rows = conn.execute(
+                f"""
+                SELECT location_name, COUNT(*) AS cnt
+                FROM ({base_union}) u
+                WHERE location_name IS NOT NULL AND trim(location_name) != ''
+                GROUP BY location_name
+                ORDER BY cnt DESC, location_name ASC
+                LIMIT 30
+                """
+            ).fetchall()
+
+            return {
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "items": [dict(r) for r in rows],
+                "places": [{"name": r["location_name"], "count": int(r["cnt"])} for r in place_rows],
             }

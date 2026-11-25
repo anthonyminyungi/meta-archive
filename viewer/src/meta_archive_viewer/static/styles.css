@@ -2242,6 +2242,769 @@ select {
 }
 
 /* ==========================================================================
+   Memories View — Editorial Time Machine, Yearbook, Inner Circle & Photo Wall
+   ========================================================================== */
+.mem-root {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.mem-hero {
+  padding: 20px 22px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.mem-hero-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.mem-hero-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.mem-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.mem-title {
+  margin: 0;
+  font-size: 1.32rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.mem-hero-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+
+.mem-dot {
+  color: var(--text-muted);
+}
+
+.mem-subnav {
+  align-self: flex-start;
+  flex-wrap: wrap;
+}
+
+.mem-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.plat-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.5;
+}
+
+.plat-pill.ig {
+  background: rgba(214, 41, 118, 0.12);
+  color: var(--ig-color);
+}
+
+.plat-pill.fb {
+  background: rgba(24, 119, 242, 0.12);
+  color: var(--fb-color);
+}
+
+.mem-date-muted {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+.mem-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mem-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.mem-section-title {
+  margin: 0;
+  font-size: 1.12rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+
+.mem-h3 {
+  margin: 0;
+  font-size: 0.96rem;
+  font-weight: 650;
+  color: var(--text);
+}
+
+/* On This Day bar */
+.mem-otd-bar {
+  padding: 14px 18px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mem-otd-date-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mem-otd-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mem-otd-sub {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.mem-otd-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.mem-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  margin-left: 4px;
+}
+
+.mem-otd-years {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.mem-year-block {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mem-year-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mem-year-num {
+  font-size: 1.15rem;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+/* Editorial Post Cards */
+.mem-post-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.mem-post-card {
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+  padding: 0;
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.14s ease, border-color 0.14s ease;
+}
+
+.mem-post-card:hover {
+  border-color: var(--text-muted);
+  transform: translateY(-1px);
+}
+
+.mem-post-thumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  background: var(--surface-alt);
+  overflow: hidden;
+}
+
+.mem-post-thumb img,
+.mem-post-thumb video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.mem-media-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(9, 9, 11, 0.72);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.mem-media-badge.right {
+  left: auto;
+  right: 8px;
+}
+
+.mem-post-body {
+  padding: 13px 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+
+.mem-post-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mem-post-text {
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.mem-post-foot {
+  margin-top: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+/* Story strip in On This Day */
+.mem-story-strip {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.mem-story-chip-card {
+  position: relative;
+  flex: 0 0 112px;
+  height: 176px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  padding: 0;
+  cursor: pointer;
+}
+
+.mem-story-chip-card img,
+.mem-story-chip-card video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.mem-story-empty {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.mem-story-caption {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 16px 8px 6px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.75), transparent);
+  color: #fff;
+  font-size: 0.72rem;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Message highlight strip */
+.mem-msg-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 8px;
+}
+
+.mem-msg-pill {
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.13s ease;
+}
+
+.mem-msg-pill:hover {
+  border-color: var(--text-muted);
+}
+
+.mem-msg-pill-body {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mem-msg-pill-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.84rem;
+}
+
+.mem-msg-pill-top strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mem-msg-snippet {
+  font-size: 0.77rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Yearbook 14-year strip */
+.mem-year-strip {
+  padding: 14px 16px;
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+}
+
+.mem-year-pill {
+  flex: 1 0 54px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: background 0.13s ease, border-color 0.13s ease;
+}
+
+.mem-year-pill:hover {
+  background: var(--surface-alt);
+}
+
+.mem-year-pill.active {
+  background: var(--surface-alt);
+  border-color: var(--text);
+  color: var(--text);
+}
+
+.mem-year-bar-track {
+  width: 14px;
+  height: 44px;
+  border-radius: 999px;
+  background: var(--border-subtle);
+  display: flex;
+  align-items: flex-end;
+  overflow: hidden;
+  padding: 2px;
+}
+
+.mem-year-bar-fill {
+  width: 100%;
+  border-radius: 999px;
+  background: var(--text-muted);
+  transition: height 0.2s ease, background 0.15s ease;
+}
+
+.mem-year-pill.active .mem-year-bar-fill {
+  background: var(--text);
+}
+
+.mem-year-pill-label {
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+
+.mem-yb-head {
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mem-yb-head-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.mem-yb-year {
+  margin: 0;
+  font-size: 1.65rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+.mem-yb-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mem-places-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.mem-places-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-right: 4px;
+}
+
+.mem-place-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-size: 0.77rem;
+  cursor: pointer;
+  transition: border-color 0.13s ease, background 0.13s ease;
+}
+
+.mem-place-chip:hover {
+  border-color: var(--text-muted);
+  color: var(--text);
+}
+
+.mem-place-chip.active {
+  background: var(--primary);
+  color: var(--primary-fg);
+  border-color: var(--primary);
+}
+
+.mem-place-cnt {
+  font-size: 0.7rem;
+  opacity: 0.72;
+}
+
+.mem-yb-people-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.mem-yb-col {
+  padding: 15px 16px;
+}
+
+.mem-mini-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mem-mini-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.mem-mini-row:hover {
+  background: var(--surface-alt);
+}
+
+.mem-mini-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.85rem;
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Inner Circle */
+.mem-people-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: 12px;
+}
+
+.mem-person-card,
+.mem-group-card {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: left;
+}
+
+.mem-group-card {
+  cursor: pointer;
+  transition: border-color 0.13s ease;
+}
+
+.mem-group-card:hover {
+  border-color: var(--text-muted);
+}
+
+.mem-person-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.mem-person-ident {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mem-person-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 0.94rem;
+}
+
+.mem-person-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mem-person-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: auto;
+}
+
+/* Unified Photo Wall */
+.mem-photo-toolbar {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mem-photo-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.mem-photo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+  gap: 6px;
+}
+
+.mem-photo-grid.compact {
+  grid-template-columns: repeat(auto-fill, minmax(145px, 1fr));
+}
+
+.mem-photo-tile {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--surface-alt);
+  cursor: pointer;
+}
+
+.mem-photo-tile img,
+.mem-photo-tile video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.22s ease;
+}
+
+.mem-photo-tile:hover img,
+.mem-photo-tile:hover video {
+  transform: scale(1.03);
+}
+
+.mem-tile-vid-badge {
+  position: absolute;
+  top: 7px;
+  left: 7px;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: rgba(9, 9, 11, 0.72);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mem-star-btn,
+.mem-tile-post-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: none;
+  background: rgba(9, 9, 11, 0.62);
+  color: rgba(255, 255, 255, 0.9);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.14s ease, transform 0.14s ease, color 0.14s ease;
+}
+
+.mem-tile-post-btn {
+  right: 38px;
+}
+
+.mem-photo-tile:hover .mem-star-btn,
+.mem-photo-tile:hover .mem-tile-post-btn,
+.mem-star-btn.active {
+  opacity: 1;
+}
+
+.mem-star-btn.active {
+  color: #fbbf24;
+  background: rgba(9, 9, 11, 0.78);
+}
+
+.mem-photo-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 20px 8px 6px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.72), transparent);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.7rem;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.mem-photo-tile:hover .mem-photo-overlay {
+  opacity: 1;
+}
+
+.mem-photo-date {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mem-photo-place {
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ==========================================================================
    Responsive Breakpoints
    ========================================================================== */
 @media (max-width: 900px) {

@@ -1172,3 +1172,54 @@ def test_avatar_enrichment_thread_sorting_preview_in_thread_search_and_media_onl
         person = client.get("/api/people/friend_one").json()
         assert person["avatar_local_path"] == "media/instagram/avatars/friend_one.jpg"
 
+
+def test_memories_on_this_day_yearbook_inner_circle_and_photo_wall(tmp_path: Path) -> None:
+    archive_dir = _build_fixture_archive(tmp_path / "memories_api")
+    with TestClient(create_app(archive_dir)) as client:
+        # 1. On This Day (May 10 matches ig:AAA111 in KST)
+        otd = client.get("/api/memories/on-this-day", params={"month": 5, "day": 10}).json()
+        assert otd["month"] == 5 and otd["day"] == 10
+        assert any(p["post_id"] == "ig:AAA111" for p in otd["posts"])
+        assert 2025 in otd["years_active"]
+
+        rand_otd = client.get("/api/memories/on-this-day", params={"random_day": "true"}).json()
+        assert 1 <= rand_otd["month"] <= 12
+        assert 1 <= rand_otd["day"] <= 31
+
+        # 2. Yearbook (2025 chapter)
+        yb = client.get("/api/memories/yearbook", params={"year": 2025}).json()
+        assert yb["selected_year"] == 2025
+        assert any(y["year"] == 2025 for y in yb["years"])
+        assert len(yb["photos"]) >= 1
+        assert any(pl["name"] == "제주 함덕" for pl in yb["places"])
+        assert any(c["identifier"] == "friend_one" for c in yb["top_commenters"])
+
+        # 3. Inner Circle (cross-platform unified people & groups)
+        ic = client.get("/api/memories/people", params={"limit": 10}).json()
+        assert len(ic["people"]) >= 1
+        assert any(p["display_name"] == "김철수" for p in ic["people"])
+
+        # 4. Photo Wall + place filter + media_ids keepsake filter
+        wall = client.get("/api/memories/photos", params={"limit": 20}).json()
+        assert wall["total"] >= 3
+        assert any(pl["name"] == "제주 함덕" for pl in wall["places"])
+
+        by_place = client.get("/api/memories/photos", params={"place": "제주 함덕"}).json()
+        assert by_place["total"] >= 1
+        assert all(item["location_name"] == "제주 함덕" for item in by_place["items"])
+
+        first_id = wall["items"][0]["id"]
+        favs = client.get("/api/memories/photos", params={"media_ids": str(first_id)}).json()
+        assert favs["total"] == 1
+        assert favs["items"][0]["id"] == first_id
+
+        empty_favs = client.get("/api/memories/photos", params={"media_ids": ""}).json()
+        assert empty_favs["total"] == 0
+
+    # Verify static Memories SPA assets exist and avoid innerHTML
+    static_dir = Path(__file__).resolve().parents[1] / "src" / "meta_archive_viewer" / "static"
+    memories_js = (static_dir / "js" / "views" / "memories.js").read_text(encoding="utf-8")
+    assert "innerHTML" not in memories_js
+    assert "renderMemoriesView" in memories_js
+
+
