@@ -1,7 +1,7 @@
 /** Safe DOM builders, cached date formatters, skeletons, and shared cards (zero innerHTML). */
 
-import { mediaUrl } from "./api.js?v=3";
-import { icon } from "./icons.js?v=3";
+import { mediaUrl } from "./api.js?v=5";
+import { icon } from "./icons.js?v=5";
 
 const DATE_FMT = new Intl.DateTimeFormat("ko-KR", {
   year: "numeric",
@@ -290,25 +290,32 @@ export function renderCollapsibleText(text, { maxChars = 320, maxLines = 6, clas
 
 export function highlightTextNodes(text, query) {
   const src = String(text || "");
-  const q = String(query || "").trim();
-  if (!q) return [document.createTextNode(src)];
-  const lowerSrc = src.toLowerCase();
-  const lowerQ = q.toLowerCase();
+  const tokens = Array.from(
+    new Set(
+      String(query || "")
+        .normalize("NFC")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+    )
+  ).sort((a, b) => b.length - a.length);
+  if (tokens.length === 0) return [document.createTextNode(src)];
+  const escaped = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const re = new RegExp(`(${escaped.join("|")})`, "gi");
   const nodes = [];
-  let pos = 0;
-  while (pos < src.length) {
-    const idx = lowerSrc.indexOf(lowerQ, pos);
-    if (idx === -1) {
-      nodes.push(document.createTextNode(src.slice(pos)));
-      break;
+  let lastIdx = 0;
+  for (const match of src.matchAll(re)) {
+    const idx = match.index ?? 0;
+    if (idx > lastIdx) {
+      nodes.push(document.createTextNode(src.slice(lastIdx, idx)));
     }
-    if (idx > pos) {
-      nodes.push(document.createTextNode(src.slice(pos, idx)));
-    }
-    nodes.push(el("mark", { className: "search-mark" }, src.slice(idx, idx + q.length)));
-    pos = idx + q.length;
+    nodes.push(el("mark", { className: "search-mark" }, match[0]));
+    lastIdx = idx + match[0].length;
   }
-  return nodes;
+  if (lastIdx < src.length) {
+    nodes.push(document.createTextNode(src.slice(lastIdx)));
+  }
+  return nodes.length > 0 ? nodes : [document.createTextNode(src)];
 }
 
 export function skeletonGrid(count = 9) {

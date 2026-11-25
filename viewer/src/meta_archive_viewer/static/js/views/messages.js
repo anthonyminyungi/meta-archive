@@ -1,6 +1,6 @@
 /** Authentic Messenger / IG DM inbox and chat viewer with left/right bubbles, avatars, in-thread search, and media gallery. */
 
-import { api, mediaUrl } from "../api.js?v=3";
+import { api, mediaUrl } from "../api.js?v=5";
 import {
   avatarEl,
   clear,
@@ -17,8 +17,8 @@ import {
   isVideoMedia,
   personButton,
   safeExternalHref,
-} from "../dom.js?v=3";
-import { icon } from "../icons.js?v=3";
+} from "../dom.js?v=5";
+import { icon } from "../icons.js?v=5";
 
 export async function renderMessagesView(container, ctx, initialThreadId = null, initialTs = null) {
   clear(container);
@@ -84,7 +84,11 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
   );
   container.appendChild(shell);
 
+  let threadsListSeq = 0;
+  let threadLoadSeq = 0;
+
   async function loadThreads() {
+    const seq = ++threadsListSeq;
     clear(threadsListEl);
     threadsListEl.appendChild(el("div", { className: "loading-box", style: "border:none;" }, "대화 목록 불러오는 중..."));
     const res = await api.threads({
@@ -93,6 +97,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
       q: state.q || undefined,
       limit: 300,
     });
+    if (seq !== threadsListSeq) return;
     threadsCountEl.textContent = `대화방 ${res.total.toLocaleString()}개`;
     clear(threadsListEl);
     if (res.items.length === 0) {
@@ -277,66 +282,102 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
       const galHost = el("div", { style: "font-size:0.82rem;color:var(--text-muted);" }, "불러오는 중...");
       hostEl.append(headerRow, galHost);
 
-      api.threadMessages(threadId, { media_only: true, limit: 150 }).then((res) => {
-        clear(galHost);
-        const allMedia = [];
-        for (const m of res.items) {
-          for (const med of m.media || []) {
-            if (med && med.local_path) {
-              allMedia.push({ ...med, _msg_ts: m.timestamp_unix });
+      let mediaOffset = 0;
+      const mediaLimit = 120;
+      let mediaTotalMsgs = 0;
+      const allMedia = [];
+      const lightboxItems = [];
+      const countLine = el("div", { className: "tabular", style: "font-size:0.76rem;color:var(--text-muted);margin-bottom:6px;" }, "");
+      const grid = el("div", { className: "chat-media-gallery" });
+      const moreWrap = el("div", { className: "load-more-wrap hidden", style: "margin-top:8px;" });
+      const moreBtn = el("button", { type: "button", className: "btn btn-sm" }, "미디어 더 보기");
+      moreWrap.appendChild(moreBtn);
+      let galInit = false;
+
+      async function loadMediaPage() {
+        moreBtn.disabled = true;
+        try {
+          const res = await api.threadMessages(threadId, { media_only: true, offset: mediaOffset, limit: mediaLimit });
+          if (state.selectedThreadId !== threadId || state.activeSubpanel !== "media") return;
+          mediaTotalMsgs = res.total;
+          mediaOffset += res.items.length;
+          const newMedia = [];
+          for (const m of res.items) {
+            for (const med of m.media || []) {
+              if (med && med.local_path) {
+                const entry = { ...med, _msg_ts: m.timestamp_unix };
+                allMedia.push(entry);
+                newMedia.push(entry);
+                if (!isAudioMedia(entry) && !isDocumentMedia(entry)) {
+                  lightboxItems.push(entry);
+                }
+              }
             }
           }
-        }
-        if (allMedia.length === 0) {
-          galHost.textContent = "이 대화방에 저장된 미디어가 없습니다.";
-          return;
-        }
-        const grid = el("div", { className: "chat-media-gallery" });
-        const lightboxItems = allMedia.filter((m) => !isAudioMedia(m) && !isDocumentMedia(m));
-        for (const med of allMedia) {
-          const src = mediaUrl(med.local_path);
-          if (!src) continue;
-          if (isAudioMedia(med)) {
-            grid.appendChild(el("audio", { src, controls: true, preload: "metadata", style: "grid-column:span 2;width:100%;" }));
-          } else if (isDocumentMedia(med)) {
-            const fname = (med.local_path || "파일").split("/").pop();
-            grid.appendChild(
-              el("a", { className: "meta-chip", href: src, target: "_blank", rel: "noopener noreferrer" }, icon("file", 12), fname)
-            );
-          } else if (isVideoMedia(med)) {
-            const idx = lightboxItems.indexOf(med);
-            grid.appendChild(
-              el("video", {
-                className: "chat-media-thumb",
-                src,
-                muted: true,
-                preload: "metadata",
-                onClick: () => ctx.openLightbox(lightboxItems, Math.max(0, idx)),
-              })
-            );
-          } else {
-            const idx = lightboxItems.indexOf(med);
-            grid.appendChild(
-              el("img", {
-                className: "chat-media-thumb",
-                src,
-                alt: "shared photo",
-                loading: "lazy",
-                decoding: "async",
-                onClick: () => ctx.openLightbox(lightboxItems, Math.max(0, idx)),
-              })
-            );
+          if (!galInit) {
+            galInit = true;
+            clear(galHost);
+            if (allMedia.length === 0) {
+              galHost.textContent = "이 대화방에 저장된 미디어가 없습니다.";
+              return;
+            }
+            galHost.append(countLine, grid, moreWrap);
+          }
+          for (const med of newMedia) {
+            const src = mediaUrl(med.local_path);
+            if (!src) continue;
+            if (isAudioMedia(med)) {
+              grid.appendChild(el("audio", { src, controls: true, preload: "metadata", style: "grid-column:span 2;width:100%;" }));
+            } else if (isDocumentMedia(med)) {
+              const fname = (med.local_path || "파일").split("/").pop();
+              grid.appendChild(
+                el("a", { className: "meta-chip", href: src, target: "_blank", rel: "noopener noreferrer" }, icon("file", 12), fname)
+              );
+            } else if (isVideoMedia(med)) {
+              const idx = lightboxItems.indexOf(med);
+              grid.appendChild(
+                el("video", {
+                  className: "chat-media-thumb",
+                  src,
+                  muted: true,
+                  preload: "metadata",
+                  onClick: () => ctx.openLightbox(lightboxItems, Math.max(0, idx)),
+                })
+              );
+            } else {
+              const idx = lightboxItems.indexOf(med);
+              grid.appendChild(
+                el("img", {
+                  className: "chat-media-thumb",
+                  src,
+                  alt: "shared photo",
+                  loading: "lazy",
+                  decoding: "async",
+                  onClick: () => ctx.openLightbox(lightboxItems, Math.max(0, idx)),
+                })
+              );
+            }
+          }
+          countLine.textContent = `첨부 메시지 ${mediaOffset.toLocaleString()} / ${mediaTotalMsgs.toLocaleString()}건 (${allMedia.length.toLocaleString()}개 파일)`;
+          moreBtn.disabled = false;
+          moreBtn.textContent = `미디어 더 보기 (${mediaOffset.toLocaleString()} / ${mediaTotalMsgs.toLocaleString()})`;
+          moreWrap.classList.toggle("hidden", mediaOffset >= mediaTotalMsgs || res.items.length === 0);
+        } catch (err) {
+          moreBtn.disabled = false;
+          if (!galInit) {
+            clear(galHost);
+            galHost.textContent = `미디어 불러오기 실패: ${err.message}`;
           }
         }
-        galHost.append(
-          el("div", { className: "tabular", style: "font-size:0.76rem;color:var(--text-muted);margin-bottom:6px;" }, `최근 첨부 메시지 ${res.items.length} / ${res.total}건 (${allMedia.length}개 파일)`),
-          grid
-        );
-      });
+      }
+
+      moreBtn.addEventListener("click", loadMediaPage);
+      loadMediaPage();
     }
   }
 
   async function loadThreadMessages(threadId, mode = "tail") {
+    const seq = ++threadLoadSeq;
     const prevScroll = chatPane.querySelector(".chat-scroll");
     const prevScrollHeight = prevScroll ? prevScroll.scrollHeight : 0;
 
@@ -357,6 +398,7 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
     }
 
     const res = await api.threadMessages(threadId, queryParams);
+    if (seq !== threadLoadSeq) return;
     state.total = res.total;
     if (mode === "older") {
       state.messages = [...res.items, ...state.messages];
@@ -584,6 +626,12 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
           .filter(Boolean)
           .join(" ");
 
+        const hasCallDuration =
+          m.call_duration !== null && m.call_duration !== undefined && m.call_duration > 0;
+        const hasVisibleContent = Boolean(
+          m.is_unsent || m.text || m.is_missed_call || hasCallDuration || shareBlock || mediaGrid
+        );
+
         const bubbleEl = el(
           "div",
           { className: bubbleClasses, title: formatDate(m.created_at, m.timestamp_unix) },
@@ -595,11 +643,14 @@ export async function renderMessagesView(container, ctx, initialThreadId = null,
           m.is_missed_call
             ? el("div", { className: "inline-meta", style: "margin-top:4px;font-size:0.82rem;opacity:0.85;" }, icon("phoneMissed", 13), "부재중 통화")
             : null,
-          m.call_duration !== null && m.call_duration !== undefined && m.call_duration > 0
+          hasCallDuration
             ? el("div", { className: "inline-meta tabular", style: "margin-top:4px;font-size:0.82rem;opacity:0.85;" }, icon("phone", 13), `통화 ${formatDuration(m.call_duration)}`)
             : null,
           shareBlock,
-          mediaGrid
+          mediaGrid,
+          !hasVisibleContent
+            ? el("div", { className: "msg-unsent" }, "(만료되었거나 표시할 수 없는 콘텐츠)")
+            : null
         );
 
         const timeLabel = !nextSameSender

@@ -1,6 +1,6 @@
 /** Memories view: On This Day time machine, 2012-2026 Yearbook, Inner Circle (IG+FB), and Unified Photo Wall + Keepsakes. */
 
-import { api, mediaUrl } from "../api.js?v=4";
+import { api, mediaUrl } from "../api.js?v=5";
 import {
   avatarEl,
   clear,
@@ -10,8 +10,8 @@ import {
   isVideoMedia,
   skeletonCards,
   skeletonGrid,
-} from "../dom.js?v=3";
-import { icon } from "../icons.js?v=4";
+} from "../dom.js?v=5";
+import { icon } from "../icons.js?v=5";
 
 const KEEPSAKES_KEY = "meta-archive-keepsakes-v1";
 const DAYS_IN_MONTH = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -91,6 +91,7 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
     photoTotal: 0,
     photoItems: [],
     photoPlaces: [],
+    photoYears: [],
   };
 
   const [profilesRes, overview] = await Promise.all([
@@ -154,7 +155,7 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
   const tabBtns = new Map();
   const subnav = el(
     "div",
-    { className: "seg-group mem-subnav", role: "tablist" },
+    { className: "segmented-control mem-subnav", role: "tablist" },
     tabDefs.map((td) => {
       const btn = el(
         "button",
@@ -174,6 +175,19 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
 
   const stageEl = el("div", { className: "mem-stage" });
   root.append(hero, subnav, stageEl);
+
+  let subtabSeq = 0;
+  let photoGridEl = null;
+  let photoLbMedia = [];
+  let photoFavBtn = null;
+  let photoMoreBtn = null;
+
+  function renderStageError(err) {
+    clear(stageEl);
+    stageEl.appendChild(
+      el("div", { className: "error-box" }, `추억 데이터를 불러오지 못했습니다: ${err.message}`)
+    );
+  }
 
   function switchSubtab(nextTab) {
     state.subtab = nextTab;
@@ -327,18 +341,21 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
   // Subtab 1: On This Day + Time Machine
   // ------------------------------------------------------------------------
   async function renderOnThisDay(randomDay = false) {
+    const seq = ++subtabSeq;
     clear(stageEl);
     stageEl.appendChild(skeletonCards(3));
 
-    const data = await api.memoriesOnThisDay(
-      randomDay
-        ? { random_day: true, include_shared: state.includeShared }
-        : { month: state.month, day: state.day, include_shared: state.includeShared }
-    );
-    state.month = data.month;
-    state.day = data.day;
+    try {
+      const data = await api.memoriesOnThisDay(
+        randomDay
+          ? { random_day: true, include_shared: state.includeShared }
+          : { month: state.month, day: state.day, include_shared: state.includeShared }
+      );
+      if (seq !== subtabSeq) return;
+      state.month = data.month;
+      state.day = data.day;
 
-    clear(stageEl);
+      clear(stageEl);
 
     const monthSelect = el(
       "select",
@@ -592,19 +609,26 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
     }
 
     stageEl.appendChild(timelineWrap);
+    } catch (err) {
+      if (seq !== subtabSeq) return;
+      renderStageError(err);
+    }
   }
 
   // ------------------------------------------------------------------------
   // Subtab 2: Yearbook (2012 - 2026)
   // ------------------------------------------------------------------------
   async function renderYearbook() {
+    const seq = ++subtabSeq;
     clear(stageEl);
     stageEl.appendChild(skeletonCards(3));
 
-    const data = await api.memoriesYearbook(state.year ? { year: state.year } : {});
-    state.year = data.selected_year;
+    try {
+      const data = await api.memoriesYearbook(state.year ? { year: state.year } : {});
+      if (seq !== subtabSeq) return;
+      state.year = data.selected_year;
 
-    clear(stageEl);
+      clear(stageEl);
 
     // 14-year interactive activity strip
     const maxWeight = Math.max(
@@ -687,6 +711,7 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
 
     // Year photo filmstrip
     if (data.photos && data.photos.length > 0) {
+      const photosTotal = data.photos_total ?? data.photos.length;
       const lbMedia = data.photos.map((p) => ({
         local_path: p.local_path,
         media_type: p.media_type,
@@ -698,7 +723,7 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
           el(
             "div",
             { className: "mem-section-head" },
-            el("h3", { className: "mem-h3" }, `${data.selected_year}년의 장면들 (${data.photos.length})`),
+            el("h3", { className: "mem-h3" }, `${data.selected_year}년의 장면들 (${photosTotal.toLocaleString()})`),
             el(
               "button",
               {
@@ -783,20 +808,62 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
       );
     }
 
-    // Original posts of that year
+    // Original posts of that year (with incremental Load More when > 40)
     if (data.posts && data.posts.length > 0) {
-      stageEl.appendChild(
-        el(
-          "section",
-          { className: "mem-section" },
-          el("h3", { className: "mem-h3", style: "margin-bottom:12px;" }, `${data.selected_year}년의 기록 (${data.posts.length})`),
-          el(
-            "div",
-            { className: "mem-post-grid" },
-            data.posts.map((p) => makePostMemoryCard(p))
-          )
-        )
+      const postsTotal = data.posts_total ?? data.posts.length;
+      let loadedCount = data.posts.length;
+      const postGrid = el(
+        "div",
+        { className: "mem-post-grid" },
+        data.posts.map((p) => makePostMemoryCard(p))
       );
+      const section = el(
+        "section",
+        { className: "mem-section" },
+        el("h3", { className: "mem-h3", style: "margin-bottom:12px;" }, `${data.selected_year}년의 기록 (${postsTotal.toLocaleString()})`),
+        postGrid
+      );
+      if (loadedCount < postsTotal) {
+        const morePostsBtn = el(
+          "button",
+          {
+            type: "button",
+            className: "btn",
+            style: "display:block;margin:18px auto 0;",
+            onClick: async () => {
+              morePostsBtn.disabled = true;
+              try {
+                const next = await api.memoriesYearbook({
+                  year: data.selected_year,
+                  posts_offset: loadedCount,
+                  posts_limit: 40,
+                });
+                if (seq !== subtabSeq) return;
+                for (const p of next.posts || []) {
+                  postGrid.appendChild(makePostMemoryCard(p));
+                }
+                loadedCount += (next.posts || []).length;
+                if (loadedCount >= postsTotal || (next.posts || []).length === 0) {
+                  morePostsBtn.remove();
+                } else {
+                  morePostsBtn.disabled = false;
+                  morePostsBtn.textContent = `기록 더 보기 (${loadedCount.toLocaleString()} / ${postsTotal.toLocaleString()})`;
+                }
+              } catch (err) {
+                morePostsBtn.disabled = false;
+                morePostsBtn.textContent = `다시 시도 (${err.message})`;
+              }
+            },
+          },
+          `기록 더 보기 (${loadedCount.toLocaleString()} / ${postsTotal.toLocaleString()})`
+        );
+        section.appendChild(morePostsBtn);
+      }
+      stageEl.appendChild(section);
+    }
+    } catch (err) {
+      if (seq !== subtabSeq) return;
+      renderStageError(err);
     }
   }
 
@@ -804,11 +871,14 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
   // Subtab 3: Inner Circle (Cross-platform People + Group Chats)
   // ------------------------------------------------------------------------
   async function renderInnerCircle() {
+    const seq = ++subtabSeq;
     clear(stageEl);
     stageEl.appendChild(skeletonCards(3));
 
-    const data = await api.memoriesPeople({ limit: 30 });
-    clear(stageEl);
+    try {
+      const data = await api.memoriesPeople({ limit: 30 });
+      if (seq !== subtabSeq) return;
+      clear(stageEl);
 
     if (data.people && data.people.length > 0) {
       stageEl.appendChild(
@@ -931,220 +1001,271 @@ export async function renderMemoriesView(container, ctx, params = new URLSearchP
         )
       );
     }
+    } catch (err) {
+      if (seq !== subtabSeq) return;
+      renderStageError(err);
+    }
   }
 
   // ------------------------------------------------------------------------
   // Subtab 4: Unified Photo Wall + Places Chips + LocalStorage Keepsakes
   // ------------------------------------------------------------------------
   async function renderPhotoWall(reset = true) {
+    const seq = ++subtabSeq;
     if (reset) {
       state.photoOffset = 0;
       state.photoItems = [];
+      photoGridEl = null;
+      photoLbMedia = [];
+      photoMoreBtn = null;
       clear(stageEl);
       stageEl.appendChild(skeletonGrid(12));
+    } else if (photoMoreBtn) {
+      photoMoreBtn.disabled = true;
     }
 
-    const queryParams = {
-      year: state.photoYear || undefined,
-      platform: state.photoPlatform || undefined,
-      place: state.photoPlace || undefined,
-      sort: state.photoSort,
-      offset: state.photoOffset,
-      limit: state.photoLimit,
-    };
-    if (state.photoFavoritesOnly) {
-      queryParams.media_ids = Array.from(keepsakes).join(",");
-    }
+    try {
+      let res;
+      if (state.photoFavoritesOnly && keepsakes.size === 0) {
+        res = { total: 0, items: [], places: [], years: [] };
+      } else {
+        const queryParams = {
+          year: state.photoYear || undefined,
+          platform: state.photoPlatform || undefined,
+          place: state.photoPlace || undefined,
+          sort: state.photoSort,
+          offset: state.photoOffset,
+          limit: state.photoLimit,
+        };
+        if (state.photoFavoritesOnly) {
+          queryParams.media_ids = Array.from(keepsakes).join(",");
+        }
+        res = await api.memoriesPhotos(queryParams);
+      }
+      if (seq !== subtabSeq) return;
 
-    const [res, ybMeta] = await Promise.all([
-      api.memoriesPhotos(queryParams),
-      api.memoriesYearbook(),
-    ]);
+      state.photoTotal = res.total;
+      if (res.places && res.places.length > 0) {
+        state.photoPlaces = res.places;
+      }
+      if (res.years && res.years.length > 0) {
+        state.photoYears = res.years;
+      }
 
-    state.photoTotal = res.total;
-    if (res.places && res.places.length > 0) {
-      state.photoPlaces = res.places;
-    }
-    state.photoItems = reset ? res.items : [...state.photoItems, ...res.items];
-
-    clear(stageEl);
-
-    const yearSelect = el(
-      "select",
-      { className: "select tabular", "aria-label": "연도 필터" },
-      el("option", { value: "", selected: !state.photoYear }, "전체 연도"),
-      (ybMeta.years || []).map((y) =>
-        el("option", { value: y.year, selected: state.photoYear === y.year }, `${y.year}년`)
-      )
-    );
-    yearSelect.addEventListener("change", () => {
-      state.photoYear = yearSelect.value ? Number(yearSelect.value) : null;
-      renderPhotoWall(true);
-    });
-
-    const platSelect = el(
-      "select",
-      { className: "select", "aria-label": "플랫폼 필터" },
-      el("option", { value: "", selected: state.photoPlatform === "" }, "전체 (IG + FB)"),
-      el("option", { value: "instagram", selected: state.photoPlatform === "instagram" }, "Instagram"),
-      el("option", { value: "facebook", selected: state.photoPlatform === "facebook" }, "Facebook")
-    );
-    platSelect.addEventListener("change", () => {
-      state.photoPlatform = platSelect.value;
-      renderPhotoWall(true);
-    });
-
-    const sortSelect = el(
-      "select",
-      { className: "select", "aria-label": "정렬" },
-      el("option", { value: "recent", selected: state.photoSort === "recent" }, "최신순"),
-      el("option", { value: "oldest", selected: state.photoSort === "oldest" }, "오래된순"),
-      el("option", { value: "random", selected: state.photoSort === "random" }, "랜덤 셔플")
-    );
-    sortSelect.addEventListener("change", () => {
-      state.photoSort = sortSelect.value;
-      renderPhotoWall(true);
-    });
-
-    const favBtn = el(
-      "button",
-      {
-        type: "button",
-        className: `btn btn-sm${state.photoFavoritesOnly ? " btn-primary" : ""}`,
-        onClick: () => {
-          state.photoFavoritesOnly = !state.photoFavoritesOnly;
-          renderPhotoWall(true);
-        },
-      },
-      icon(state.photoFavoritesOnly ? "starFilled" : "star", 14),
-      `즐겨찾기 (${keepsakes.size})`
-    );
-
-    const shuffleBtn =
-      state.photoSort === "random"
-        ? el(
-            "button",
-            {
-              type: "button",
-              className: "btn btn-ghost btn-sm",
-              onClick: () => renderPhotoWall(true),
-            },
-            icon("shuffle", 14),
-            "다시 섞기"
-          )
-        : null;
-
-    const toolbar = el(
-      "div",
-      { className: "card mem-photo-toolbar" },
-      el(
-        "div",
-        { className: "mem-photo-controls" },
-        yearSelect,
-        platSelect,
-        sortSelect,
-        shuffleBtn,
-        favBtn,
-        el(
-          "span",
-          { className: "mem-date-muted tabular", style: "margin-left:auto;" },
-          `총 ${state.photoTotal.toLocaleString()}장`
-        )
-      ),
-      state.photoPlaces.length > 0
-        ? el(
-            "div",
-            { className: "mem-places-row" },
-            el("span", { className: "mem-places-label" }, icon("pin", 13), "장소"),
-            state.photoPlace
-              ? el(
-                  "button",
-                  {
-                    type: "button",
-                    className: "mem-place-chip active",
-                    onClick: () => {
-                      state.photoPlace = "";
-                      renderPhotoWall(true);
-                    },
-                  },
-                  state.photoPlace,
-                  " ✕"
-                )
-              : null,
-            state.photoPlaces
-              .filter((pl) => pl.name !== state.photoPlace)
-              .slice(0, 18)
-              .map((pl) =>
-                el(
-                  "button",
-                  {
-                    type: "button",
-                    className: "mem-place-chip",
-                    onClick: () => {
-                      state.photoPlace = pl.name;
-                      renderPhotoWall(true);
-                    },
-                  },
-                  pl.name,
-                  el("span", { className: "tabular mem-place-cnt" }, pl.count)
-                )
-              )
-          )
-        : null
-    );
-    stageEl.appendChild(toolbar);
-
-    if (state.photoItems.length === 0) {
-      stageEl.appendChild(
-        el(
-          "div",
-          { className: "empty-box", style: "margin-top:14px;" },
-          state.photoFavoritesOnly
-            ? "아직 즐겨찾기에 담은 사진이 없습니다. 사진 우측 상단의 ★ 버튼을 눌러 나만의 보물창고를 만들어 보세요."
-            : "선택한 조건에 해당하는 사진/영상이 없습니다."
-        )
-      );
-      return;
-    }
-
-    const lbMedia = state.photoItems.map((p) => ({
-      local_path: p.local_path,
-      media_type: p.media_type,
-    }));
-
-    const grid = el(
-      "div",
-      { className: "mem-photo-grid" },
-      state.photoItems.map((item, idx) =>
-        makePhotoTile(item, lbMedia, idx, () => {
-          clear(favBtn);
-          favBtn.append(
+      const handleKeepsakeChange = () => {
+        if (photoFavBtn) {
+          clear(photoFavBtn);
+          photoFavBtn.append(
             icon(state.photoFavoritesOnly ? "starFilled" : "star", 14),
             `즐겨찾기 (${keepsakes.size})`
           );
-          if (state.photoFavoritesOnly) {
-            renderPhotoWall(true);
-          }
-        })
-      )
-    );
-    stageEl.appendChild(grid);
+        }
+        if (state.photoFavoritesOnly) {
+          renderPhotoWall(true);
+        }
+      };
 
-    if (state.photoSort !== "random" && state.photoItems.length < state.photoTotal) {
-      const moreBtn = el(
+      if (!reset && photoGridEl) {
+        const startIdx = state.photoItems.length;
+        state.photoItems.push(...res.items);
+        for (const p of res.items) {
+          photoLbMedia.push({ local_path: p.local_path, media_type: p.media_type });
+        }
+        res.items.forEach((item, i) => {
+          photoGridEl.appendChild(makePhotoTile(item, photoLbMedia, startIdx + i, handleKeepsakeChange));
+        });
+        if (photoMoreBtn) {
+          if (state.photoSort === "random" || state.photoItems.length >= state.photoTotal || res.items.length === 0) {
+            photoMoreBtn.remove();
+            photoMoreBtn = null;
+          } else {
+            photoMoreBtn.disabled = false;
+            photoMoreBtn.textContent = `더 보기 (${state.photoItems.length.toLocaleString()} / ${state.photoTotal.toLocaleString()})`;
+          }
+        }
+        return;
+      }
+
+      state.photoItems = [...res.items];
+      clear(stageEl);
+
+      const yearSelect = el(
+        "select",
+        { className: "select tabular", "aria-label": "연도 필터" },
+        el("option", { value: "", selected: !state.photoYear }, "전체 연도"),
+        state.photoYears.map((y) =>
+          el("option", { value: y, selected: state.photoYear === y }, `${y}년`)
+        )
+      );
+      yearSelect.addEventListener("change", () => {
+        state.photoYear = yearSelect.value ? Number(yearSelect.value) : null;
+        renderPhotoWall(true);
+      });
+
+      const platSelect = el(
+        "select",
+        { className: "select", "aria-label": "플랫폼 필터" },
+        el("option", { value: "", selected: state.photoPlatform === "" }, "전체 (IG + FB)"),
+        el("option", { value: "instagram", selected: state.photoPlatform === "instagram" }, "Instagram"),
+        el("option", { value: "facebook", selected: state.photoPlatform === "facebook" }, "Facebook")
+      );
+      platSelect.addEventListener("change", () => {
+        state.photoPlatform = platSelect.value;
+        renderPhotoWall(true);
+      });
+
+      const sortSelect = el(
+        "select",
+        { className: "select", "aria-label": "정렬" },
+        el("option", { value: "recent", selected: state.photoSort === "recent" }, "최신순"),
+        el("option", { value: "oldest", selected: state.photoSort === "oldest" }, "오래된순"),
+        el("option", { value: "random", selected: state.photoSort === "random" }, "랜덤 셔플")
+      );
+      sortSelect.addEventListener("change", () => {
+        state.photoSort = sortSelect.value;
+        renderPhotoWall(true);
+      });
+
+      const favBtn = el(
         "button",
         {
           type: "button",
-          className: "btn",
-          style: "display:block;margin:20px auto 0;",
+          className: `btn btn-sm${state.photoFavoritesOnly ? " btn-primary" : ""}`,
           onClick: () => {
-            state.photoOffset += state.photoLimit;
-            renderPhotoWall(false);
+            state.photoFavoritesOnly = !state.photoFavoritesOnly;
+            renderPhotoWall(true);
           },
         },
-        `더 보기 (${state.photoItems.length.toLocaleString()} / ${state.photoTotal.toLocaleString()})`
+        icon(state.photoFavoritesOnly ? "starFilled" : "star", 14),
+        `즐겨찾기 (${keepsakes.size})`
       );
-      stageEl.appendChild(moreBtn);
+      photoFavBtn = favBtn;
+
+      const shuffleBtn =
+        state.photoSort === "random"
+          ? el(
+              "button",
+              {
+                type: "button",
+                className: "btn btn-ghost btn-sm",
+                onClick: () => renderPhotoWall(true),
+              },
+              icon("shuffle", 14),
+              "다시 섞기"
+            )
+          : null;
+
+      const toolbar = el(
+        "div",
+        { className: "card mem-photo-toolbar" },
+        el(
+          "div",
+          { className: "mem-photo-controls" },
+          yearSelect,
+          platSelect,
+          sortSelect,
+          shuffleBtn,
+          favBtn,
+          el(
+            "span",
+            { className: "mem-date-muted tabular", style: "margin-left:auto;" },
+            `총 ${state.photoTotal.toLocaleString()}장`
+          )
+        ),
+        state.photoPlaces.length > 0
+          ? el(
+              "div",
+              { className: "mem-places-row" },
+              el("span", { className: "mem-places-label" }, icon("pin", 13), "장소"),
+              state.photoPlace
+                ? el(
+                    "button",
+                    {
+                      type: "button",
+                      className: "mem-place-chip active",
+                      onClick: () => {
+                        state.photoPlace = "";
+                        renderPhotoWall(true);
+                      },
+                    },
+                    state.photoPlace,
+                    " ✕"
+                  )
+                : null,
+              state.photoPlaces
+                .filter((pl) => pl.name !== state.photoPlace)
+                .slice(0, 18)
+                .map((pl) =>
+                  el(
+                    "button",
+                    {
+                      type: "button",
+                      className: "mem-place-chip",
+                      onClick: () => {
+                        state.photoPlace = pl.name;
+                        renderPhotoWall(true);
+                      },
+                    },
+                    pl.name,
+                    el("span", { className: "tabular mem-place-cnt" }, pl.count)
+                  )
+                )
+            )
+          : null
+      );
+      stageEl.appendChild(toolbar);
+
+      if (state.photoItems.length === 0) {
+        stageEl.appendChild(
+          el(
+            "div",
+            { className: "empty-box", style: "margin-top:14px;" },
+            state.photoFavoritesOnly
+              ? "아직 즐겨찾기에 담은 사진이 없습니다. 사진 우측 상단의 ★ 버튼을 눌러 나만의 보물창고를 만들어 보세요."
+              : "선택한 조건에 해당하는 사진/영상이 없습니다."
+          )
+        );
+        return;
+      }
+
+      photoLbMedia = state.photoItems.map((p) => ({
+        local_path: p.local_path,
+        media_type: p.media_type,
+      }));
+
+      photoGridEl = el(
+        "div",
+        { className: "mem-photo-grid" },
+        state.photoItems.map((item, idx) =>
+          makePhotoTile(item, photoLbMedia, idx, handleKeepsakeChange)
+        )
+      );
+      stageEl.appendChild(photoGridEl);
+
+      if (state.photoSort !== "random" && state.photoItems.length < state.photoTotal) {
+        photoMoreBtn = el(
+          "button",
+          {
+            type: "button",
+            className: "btn",
+            style: "display:block;margin:20px auto 0;",
+            onClick: () => {
+              state.photoOffset += state.photoLimit;
+              renderPhotoWall(false);
+            },
+          },
+          `더 보기 (${state.photoItems.length.toLocaleString()} / ${state.photoTotal.toLocaleString()})`
+        );
+        stageEl.appendChild(photoMoreBtn);
+      }
+    } catch (err) {
+      if (seq !== subtabSeq) return;
+      if (reset) {
+        renderStageError(err);
+      } else if (photoMoreBtn) {
+        photoMoreBtn.disabled = false;
+        photoMoreBtn.textContent = `다시 시도 (${err.message})`;
+      }
     }
   }
 

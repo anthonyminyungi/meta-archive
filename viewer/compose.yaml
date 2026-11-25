@@ -12,6 +12,15 @@ services:
       dockerfile: Dockerfile
     image: meta-archive-viewer:local
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # TrueNAS 데이터셋 권한이 특정 UID/GID(예: apps=568) 전용인 경우 아래 주석을 해제하세요.
+    # user: "568:568"
     ports:
       - "8080:8080"
     environment:

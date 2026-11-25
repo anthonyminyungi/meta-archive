@@ -1223,3 +1223,79 @@ def test_memories_on_this_day_yearbook_inner_circle_and_photo_wall(tmp_path: Pat
     assert "renderMemoriesView" in memories_js
 
 
+def test_archive_reader_final_audit_regressions(tmp_path: Path) -> None:
+    import unicodedata
+
+    from meta_archive_viewer.queries import ArchiveReader
+
+    archive_dir = _build_fixture_archive(tmp_path / "final_audit")
+    conn = sqlite3.connect(archive_dir / "archive.sqlite")
+    # Insert multi-word post into FTS5 + a deactivated '님' thread for Inner Circle guard
+    conn.execute(
+        """
+        INSERT INTO search_fts (entity_type, entity_id, platform, author, body, timestamp_unix)
+        VALUES ('post', 'ig:MULTI1', 'instagram', 'me', '서울에서 출발한 여름 여행 기록', 1715305000)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO message_threads (thread_id, platform, title, participants_json, is_e2ee, is_pending, message_count, last_timestamp_unix)
+        VALUES ('fb/deactivated_1', 'facebook', '님', '[{"full_name": "홍길동"}]', 0, 0, 500, 1715300000)
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    reader = ArchiveReader(archive_dir)
+
+    # 1. Multi-word non-adjacent Korean search + real total + offset pagination
+    multi = reader.search("서울 여행", limit=1, offset=0)
+    assert multi["total"] >= 1
+    assert multi["items"][0]["entity_id"] == "ig:MULTI1"
+    multi_p2 = reader.search("서울 여행", limit=1, offset=1)
+    assert multi_p2["total"] == multi["total"]
+    assert len(multi_p2["items"]) == max(0, multi["total"] - 1)
+
+    # 2. Mixed >=3 char and 1-2 char multi-token query + NFD input normalization
+    nfd_query = unicodedata.normalize("NFD", "서울에서 여행")
+    mixed = reader.search(nfd_query)
+    assert mixed["mode"] == "fts5_hybrid"
+    assert any(i["entity_id"] == "ig:MULTI1" for i in mixed["items"])
+
+    # 3. Inner Circle excludes deactivated '님' placeholder
+    ic = reader.get_memories_inner_circle(limit=20)
+    assert all(p["display_name"] != "님" for p in ic["people"])
+
+    # 4. Yearbook includes photos_total / posts_total and supports posts pagination
+    yb = reader.get_memories_yearbook(year=2025, posts_offset=0, posts_limit=1)
+    assert yb["photos_total"] >= len(yb["photos"])
+    assert yb["posts_total"] >= len(yb["posts"])
+    assert yb["posts_limit"] == 1
+
+    # 5. Photo Wall returns years on offset=0 and skips metadata queries on offset>0
+    pw0 = reader.list_memories_photos(offset=0, limit=1)
+    assert 2025 in pw0["years"]
+    assert len(pw0["places"]) >= 1
+    pw1 = reader.list_memories_photos(offset=1, limit=1)
+    assert pw1["years"] == []
+    assert pw1["places"] == []
+
+    # 6. Static asset regression guards (module version parity, CSS class fix, empty bubble fallback, mobile/touch)
+    static_dir = Path(__file__).resolve().parents[1] / "src" / "meta_archive_viewer" / "static"
+    for asset in static_dir.rglob("*.js"):
+        text = asset.read_text(encoding="utf-8")
+        assert "?v=3" not in text and "?v=4" not in text, f"Stale module query string in {asset}"
+        assert "http://" not in text and "https://" not in text, f"External URL in {asset}"
+
+    memories_js = (static_dir / "js" / "views" / "memories.js").read_text(encoding="utf-8")
+    assert "segmented-control mem-subnav" in memories_js
+    assert "seg-group" not in memories_js
+
+    messages_js = (static_dir / "js" / "views" / "messages.js").read_text(encoding="utf-8")
+    assert "(만료되었거나 표시할 수 없는 콘텐츠)" in messages_js
+
+    styles_css = (static_dir / "styles.css").read_text(encoding="utf-8")
+    assert "@media (hover: none)" in styles_css
+
+
+

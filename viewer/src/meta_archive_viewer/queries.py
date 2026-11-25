@@ -6,6 +6,7 @@ import contextlib
 import json
 import random
 import sqlite3
+import unicodedata
 import urllib.parse
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -41,6 +42,10 @@ class ArchiveNotReadyError(FileNotFoundError):
 
 class SchemaVersionError(RuntimeError):
     """Raised when archive.sqlite schema_version is missing or unsupported."""
+
+
+def _nfc(val: str | None) -> str:
+    return unicodedata.normalize("NFC", val) if isinstance(val, str) else ""
 
 
 def _loads_json(raw: str | None, default: Any) -> Any:
@@ -723,7 +728,7 @@ class ArchiveReader:
             clauses.append("relation = ?")
             params.append(relation)
         if q and q.strip():
-            needle = q.strip()
+            needle = _nfc(q).strip()
             clauses.append(
                 "(instr(lower(COALESCE(username, '')), lower(?)) > 0 "
                 "OR instr(lower(COALESCE(full_name, '')), lower(?)) > 0)"
@@ -818,7 +823,7 @@ class ArchiveReader:
             clauses.append("platform = ?")
             params.append(platform)
         if q and q.strip():
-            needle = q.strip()
+            needle = _nfc(q).strip()
             clauses.append(
                 "(instr(lower(COALESCE(title, '')), lower(?)) > 0 "
                 "OR instr(lower(COALESCE(participants_json, '')), lower(?)) > 0)"
@@ -947,7 +952,7 @@ class ArchiveReader:
             extra_mcols = "".join(
                 f", {c}" for c in ("share_text", "share_owner", "is_missed_call") if c in mcols
             )
-            filter_q = q.strip() if q and q.strip() else None
+            filter_q = _nfc(q).strip() if q and q.strip() else None
 
             if filter_q or media_only:
                 fclauses = ["thread_id = ?"]
@@ -1135,7 +1140,7 @@ class ArchiveReader:
                 clauses.append("activity_id = ?")
                 params.append(activity_id)
             if q and q.strip():
-                needle = q.strip()
+                needle = _nfc(q).strip()
                 clauses.append(
                     "(instr(lower(COALESCE(text, '')), lower(?)) > 0 "
                     "OR instr(lower(COALESCE(title, '')), lower(?)) > 0 "
@@ -1185,60 +1190,71 @@ class ArchiveReader:
         platform: str | None = None,
         entity_type: str | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> dict[str, Any]:
-        q = query.strip()
+        q = _nfc(query).strip()
         if not q:
-            return {"query": "", "mode": "empty", "total": 0, "items": []}
+            return {"query": "", "mode": "empty", "total": 0, "offset": offset, "limit": limit, "items": []}
 
-        extra_clauses: list[str] = []
-        extra_params: list[Any] = []
+        tokens = q.split()
+        fts_tokens = [t for t in tokens if len(t) >= 3]
+        short_tokens = [t for t in tokens if len(t) < 3]
+
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if fts_tokens:
+            fts_expr = " ".join('"' + t.replace('"', '""') + '"' for t in fts_tokens)
+            where_clauses.append("search_fts MATCH ?")
+            params.append(fts_expr)
+        for st in short_tokens:
+            where_clauses.append(
+                "(instr(lower(body), lower(?)) > 0 OR instr(lower(author), lower(?)) > 0)"
+            )
+            params.extend([st, st])
         if platform:
-            extra_clauses.append("platform = ?")
-            extra_params.append(platform)
+            where_clauses.append("platform = ?")
+            params.append(platform)
         if entity_type:
-            extra_clauses.append("entity_type = ?")
-            extra_params.append(entity_type)
-        extra_sql = f" AND {' AND '.join(extra_clauses)}" if extra_clauses else ""
+            where_clauses.append("entity_type = ?")
+            params.append(entity_type)
+
+        where_sql = " AND ".join(where_clauses)
+        if fts_tokens and short_tokens:
+            mode = "fts5_hybrid"
+        elif fts_tokens:
+            mode = "fts5_trigram"
+        else:
+            mode = "instr_short"
+        order_sql = "bm25(search_fts), timestamp_unix DESC" if fts_tokens else "timestamp_unix DESC"
 
         with self._connect() as conn:
             self._read_schema_meta(conn)
-            if len(q) >= 3:
-                mode = "fts5_trigram"
-                fts_expr = '"' + q.replace('"', '""') + '"'
-                rows = conn.execute(
-                    f"""
-                    SELECT entity_type, entity_id, platform, author, body, timestamp_unix
-                    FROM search_fts
-                    WHERE search_fts MATCH ?{extra_sql}
-                    ORDER BY bm25(search_fts), timestamp_unix DESC
-                    LIMIT ?
-                    """,
-                    [fts_expr, *extra_params, limit],
-                ).fetchall()
-            else:
-                mode = "instr_short"
-                rows = conn.execute(
-                    f"""
-                    SELECT entity_type, entity_id, platform, author, body, timestamp_unix
-                    FROM search_fts
-                    WHERE (instr(lower(body), lower(?)) > 0 OR instr(lower(author), lower(?)) > 0)
-                    {extra_sql}
-                    ORDER BY timestamp_unix DESC
-                    LIMIT ?
-                    """,
-                    [q, q, *extra_params, limit],
-                ).fetchall()
+            total = int(
+                conn.execute(f"SELECT COUNT(*) FROM search_fts WHERE {where_sql}", params).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT entity_type, entity_id, platform, author, body, timestamp_unix
+                FROM search_fts
+                WHERE {where_sql}
+                ORDER BY {order_sql}
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
 
             items = [dict(row) for row in rows]
             return {
                 "query": q,
                 "mode": mode,
-                "total": len(items),
+                "total": total,
+                "offset": offset,
+                "limit": limit,
                 "items": items,
             }
 
     def get_person_activity(self, identifier: str, limit: int = 50) -> dict[str, Any]:
-        ident = identifier.strip()
+        ident = _nfc(identifier).strip()
         if not ident:
             return {
                 "identifier": identifier,
@@ -1331,7 +1347,7 @@ class ArchiveReader:
 
     @staticmethod
     def _clean_person_key(name: str | None) -> str:
-        s = " ".join((name or "").split()).strip()
+        s = " ".join(_nfc(name).split()).strip()
         if s.endswith("님") and len(s) >= 2:
             s = s[:-1].strip()
         return s.lower()
@@ -1553,7 +1569,13 @@ class ArchiveReader:
                 "message_highlights": msg_highlights,
             }
 
-    def get_memories_yearbook(self, *, year: int | None = None) -> dict[str, Any]:
+    def get_memories_yearbook(
+        self,
+        *,
+        year: int | None = None,
+        posts_offset: int = 0,
+        posts_limit: int = 40,
+    ) -> dict[str, Any]:
         """Return 14-year index plus a cross-platform Yearbook page for the selected year."""
         with self._connect() as conn:
             self._read_schema_meta(conn)
@@ -1636,36 +1658,50 @@ class ArchiveReader:
             )
 
             # Photos & videos from that year (posts + stories, skip carousel covers)
+            year_media_union = f"""
+                SELECT m.id, m.owner_type, m.owner_id, m.platform, m.media_type, m.local_path,
+                       m.width, m.height, m.duration_sec,
+                       p.created_at, p.timestamp_unix, p.caption, p.location_name
+                FROM media m
+                JOIN posts p ON m.owner_type = 'post' AND m.owner_id = p.post_id
+                WHERE {_YEAR_EXPR.replace('timestamp_unix', 'p.timestamp_unix').replace('created_at', 'p.created_at')} = ?
+                  AND COALESCE(m.is_carousel_cover, 0) = 0
+                  AND m.media_type IN ('image', 'video')
+                  AND m.local_path IS NOT NULL AND m.local_path != ''
+                UNION ALL
+                SELECT m.id, m.owner_type, m.owner_id, m.platform, m.media_type, m.local_path,
+                       m.width, m.height, m.duration_sec,
+                       s.created_at, s.timestamp_unix, COALESCE(s.highlight_title, '') AS caption, s.location_name
+                FROM media m
+                JOIN stories s ON m.owner_type = 'story' AND m.owner_id = s.story_id
+                WHERE {_YEAR_EXPR.replace('timestamp_unix', 's.timestamp_unix').replace('created_at', 's.created_at')} = ?
+                  AND m.media_type IN ('image', 'video')
+                  AND m.local_path IS NOT NULL AND m.local_path != ''
+            """
+            photos_total = int(
+                conn.execute(f"SELECT COUNT(*) FROM ({year_media_union})", (selected_year, selected_year)).fetchone()[0]
+            )
             photo_rows = conn.execute(
                 f"""
-                SELECT * FROM (
-                    SELECT m.id, m.owner_type, m.owner_id, m.platform, m.media_type, m.local_path,
-                           m.width, m.height, m.duration_sec,
-                           p.created_at, p.timestamp_unix, p.caption, p.location_name
-                    FROM media m
-                    JOIN posts p ON m.owner_type = 'post' AND m.owner_id = p.post_id
-                    WHERE {_YEAR_EXPR.replace('timestamp_unix', 'p.timestamp_unix').replace('created_at', 'p.created_at')} = ?
-                      AND COALESCE(m.is_carousel_cover, 0) = 0
-                      AND m.media_type IN ('image', 'video')
-                      AND m.local_path IS NOT NULL AND m.local_path != ''
-                    UNION ALL
-                    SELECT m.id, m.owner_type, m.owner_id, m.platform, m.media_type, m.local_path,
-                           m.width, m.height, m.duration_sec,
-                           s.created_at, s.timestamp_unix, COALESCE(s.highlight_title, '') AS caption, s.location_name
-                    FROM media m
-                    JOIN stories s ON m.owner_type = 'story' AND m.owner_id = s.story_id
-                    WHERE {_YEAR_EXPR.replace('timestamp_unix', 's.timestamp_unix').replace('created_at', 's.created_at')} = ?
-                      AND m.media_type IN ('image', 'video')
-                      AND m.local_path IS NOT NULL AND m.local_path != ''
-                )
+                SELECT * FROM ({year_media_union})
                 ORDER BY COALESCE(timestamp_unix, 0) DESC, id DESC
-                LIMIT 48
+                LIMIT 18
                 """,
                 (selected_year, selected_year),
             ).fetchall()
             photos = [dict(r) for r in photo_rows]
 
             # Original posts (IG + FB non-shared) from that year
+            posts_total = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) FROM posts
+                    WHERE {_YEAR_EXPR} = ?
+                      AND NOT (platform = 'facebook' AND post_type = 'shared')
+                    """,
+                    (selected_year,),
+                ).fetchone()[0]
+            )
             post_rows = conn.execute(
                 f"""
                 SELECT post_id, platform, post_type, created_at, timestamp_unix,
@@ -1674,9 +1710,9 @@ class ArchiveReader:
                 WHERE {_YEAR_EXPR} = ?
                   AND NOT (platform = 'facebook' AND post_type = 'shared')
                 ORDER BY COALESCE(timestamp_unix, 0) DESC, post_id DESC
-                LIMIT 40
+                LIMIT ? OFFSET ?
                 """,
-                (selected_year,),
+                (selected_year, posts_limit, posts_offset),
             ).fetchall()
             pids = [r["post_id"] for r in post_rows]
             media_by_p: dict[str, list[dict[str, Any]]] = {}
@@ -1803,7 +1839,11 @@ class ArchiveReader:
                 "years": years_list,
                 "stats": selected_stats,
                 "photos": photos,
+                "photos_total": photos_total,
                 "posts": posts_out,
+                "posts_total": posts_total,
+                "posts_offset": posts_offset,
+                "posts_limit": posts_limit,
                 "places": places,
                 "top_commenters": top_commenters,
                 "top_threads": top_threads,
@@ -1814,7 +1854,7 @@ class ArchiveReader:
         with self._connect() as conn:
             self._read_schema_meta(conn)
             owners = self._owner_name_set(conn)
-            ignored_keys = {"", "instagram user", "instagram 사용자", "facebook user", "facebook 사용자"}
+            ignored_keys = {"", "님", "instagram user", "instagram 사용자", "facebook user", "facebook 사용자"}
 
             # Map username <-> full_name from connections so IG username & FB/Korean full_name unify
             alias_to_canon: dict[str, str] = {}
@@ -2046,10 +2086,10 @@ class ArchiveReader:
                 params.append(platform)
             if place:
                 clauses.append("location_name = ?")
-                params.append(place)
+                params.append(_nfc(place).strip())
             if media_ids is not None:
                 if not media_ids:
-                    return {"total": 0, "offset": offset, "limit": limit, "items": [], "places": []}
+                    return {"total": 0, "offset": offset, "limit": limit, "items": [], "places": [], "years": []}
                 ph = ",".join("?" for _ in media_ids)
                 clauses.append(f"id IN ({ph})")
                 params.extend(media_ids)
@@ -2069,21 +2109,35 @@ class ArchiveReader:
                 [*params, limit, offset],
             ).fetchall()
 
-            place_rows = conn.execute(
-                f"""
-                SELECT location_name, COUNT(*) AS cnt
-                FROM ({base_union}) u
-                WHERE location_name IS NOT NULL AND trim(location_name) != ''
-                GROUP BY location_name
-                ORDER BY cnt DESC, location_name ASC
-                LIMIT 30
-                """
-            ).fetchall()
+            places_out: list[dict[str, Any]] = []
+            years_out: list[int] = []
+            if offset == 0:
+                place_rows = conn.execute(
+                    f"""
+                    SELECT location_name, COUNT(*) AS cnt
+                    FROM ({base_union}) u
+                    WHERE location_name IS NOT NULL AND trim(location_name) != ''
+                    GROUP BY location_name
+                    ORDER BY cnt DESC, location_name ASC
+                    LIMIT 30
+                    """
+                ).fetchall()
+                places_out = [{"name": r["location_name"], "count": int(r["cnt"])} for r in place_rows]
+                year_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT year
+                    FROM ({base_union}) u
+                    WHERE year IS NOT NULL AND year >= 2000 AND year <= 2100
+                    ORDER BY year DESC
+                    """
+                ).fetchall()
+                years_out = [int(r["year"]) for r in year_rows]
 
             return {
                 "total": total,
                 "offset": offset,
                 "limit": limit,
                 "items": [dict(r) for r in rows],
-                "places": [{"name": r["location_name"], "count": int(r["cnt"])} for r in place_rows],
+                "places": places_out,
+                "years": years_out,
             }

@@ -1,6 +1,6 @@
 /** Full post detail modal with fixed-height split layout, keyboard carousel navigation, avatars, and nested comments. */
 
-import { api } from "../api.js?v=3";
+import { api } from "../api.js?v=5";
 import {
   avatarEl,
   clear,
@@ -12,15 +12,17 @@ import {
   reactionLabel,
   renderSharedCard,
   skeletonCards,
-} from "../dom.js?v=3";
-import { icon } from "../icons.js?v=3";
-import { renderCarousel } from "./carousel.js?v=3";
-import { renderCommentTree } from "./comments.js?v=3";
+} from "../dom.js?v=5";
+import { icon } from "../icons.js?v=5";
+import { renderCarousel } from "./carousel.js?v=5";
+import { renderCommentTree } from "./comments.js?v=5";
 
 export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson, isLightboxOpen = () => false }) {
   let activeCarouselStep = null;
+  let openSeq = 0;
 
   function close() {
+    openSeq += 1;
     activeCarouselStep = null;
     clear(hostEl);
     hostEl.classList.add("hidden");
@@ -44,6 +46,7 @@ export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson, isLightb
   });
 
   async function open(postId) {
+    const seq = ++openSeq;
     activeCarouselStep = null;
     clear(hostEl);
     const panel = el("div", { className: "modal-panel" }, skeletonCards(2));
@@ -52,6 +55,7 @@ export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson, isLightb
 
     try {
       const post = await api.postDetail(postId);
+      if (seq !== openSeq) return;
       clear(panel);
 
       const carousel = renderCarousel(post.media, onOpenLightbox, { eager: true });
@@ -218,6 +222,7 @@ export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson, isLightb
         panel.appendChild(commentsSection);
       }
     } catch (err) {
+      if (seq !== openSeq) return;
       clear(panel);
       panel.className = "modal-panel";
       panel.appendChild(el("div", { className: "error-box" }, `게시물 로드 실패: ${err.message}`));
@@ -225,6 +230,7 @@ export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson, isLightb
   }
 
   async function openCustom(title, renderBody) {
+    const seq = ++openSeq;
     activeCarouselStep = null;
     clear(hostEl);
     const panel = el(
@@ -248,6 +254,7 @@ export function createPostModal(hostEl, { onOpenLightbox, onOpenPerson, isLightb
     try {
       await renderBody(body, close);
     } catch (err) {
+      if (seq !== openSeq) return;
       clear(body);
       body.appendChild(el("div", { className: "error-box" }, `불러오기 실패: ${err.message}`));
     }

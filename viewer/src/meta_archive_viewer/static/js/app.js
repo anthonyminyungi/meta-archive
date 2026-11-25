@@ -1,16 +1,16 @@
 /** Main SPA hash router & shared controllers for Meta Archive viewer. */
 
-import { api } from "./api.js?v=4";
-import { clear, el } from "./dom.js?v=3";
-import { icon } from "./icons.js?v=4";
-import { createLightbox } from "./components/lightbox.js?v=3";
-import { createPersonDrawer } from "./components/person_drawer.js?v=3";
-import { createPostModal } from "./components/post_modal.js?v=3";
-import { renderFacebookView } from "./views/facebook.js?v=3";
-import { renderInstagramView } from "./views/instagram.js?v=3";
-import { renderMemoriesView } from "./views/memories.js?v=4";
-import { renderMessagesView } from "./views/messages.js?v=3";
-import { renderSearchView } from "./views/search.js?v=3";
+import { api } from "./api.js?v=5";
+import { clear, el } from "./dom.js?v=5";
+import { icon } from "./icons.js?v=5";
+import { createLightbox } from "./components/lightbox.js?v=5";
+import { createPersonDrawer } from "./components/person_drawer.js?v=5";
+import { createPostModal } from "./components/post_modal.js?v=5";
+import { renderFacebookView } from "./views/facebook.js?v=5";
+import { renderInstagramView } from "./views/instagram.js?v=5";
+import { renderMemoriesView } from "./views/memories.js?v=5";
+import { renderMessagesView } from "./views/messages.js?v=5";
+import { renderSearchView } from "./views/search.js?v=5";
 
 const mainEl = document.getElementById("app-main");
 const modalRoot = document.getElementById("modal-root");
@@ -131,24 +131,32 @@ async function refreshHeaderStats() {
   }
 }
 
+let routeSeq = 0;
+
 async function routeNow() {
+  const seq = ++routeSeq;
   const { route, params } = parseHash();
   setActiveTab(route);
 
+  clear(mainEl);
+  const viewContainer = el("div", { className: "route-view" });
+  mainEl.appendChild(viewContainer);
+
   try {
     if (route === "instagram") {
-      await renderInstagramView(mainEl, ctx);
+      await renderInstagramView(viewContainer, ctx);
     } else if (route === "facebook") {
-      await renderFacebookView(mainEl, ctx);
+      await renderFacebookView(viewContainer, ctx);
     } else if (route === "messages") {
-      await renderMessagesView(mainEl, ctx, params.get("thread"), params.get("ts"));
+      await renderMessagesView(viewContainer, ctx, params.get("thread"), params.get("ts"));
     } else if (route === "search") {
-      await renderSearchView(mainEl, ctx, params.get("q") || "");
+      await renderSearchView(viewContainer, ctx, params.get("q") || "");
     } else {
       setActiveTab("memories");
-      await renderMemoriesView(mainEl, ctx, params);
+      await renderMemoriesView(viewContainer, ctx, params);
     }
   } catch (err) {
+    if (seq !== routeSeq) return;
     clear(mainEl);
     mainEl.appendChild(
       el(

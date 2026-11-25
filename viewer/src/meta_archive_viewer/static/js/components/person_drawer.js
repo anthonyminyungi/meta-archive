@@ -1,11 +1,14 @@
 /** Slide-over People activity drawer with tabbed comments, likes, and DMs (direct timestamp jump). */
 
-import { api } from "../api.js?v=3";
-import { avatarEl, clear, el, formatDate, skeletonCards } from "../dom.js?v=3";
-import { icon } from "../icons.js?v=3";
+import { api } from "../api.js?v=5";
+import { avatarEl, clear, el, formatDate, skeletonCards } from "../dom.js?v=5";
+import { icon } from "../icons.js?v=5";
 
 export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
+  let openSeq = 0;
+
   function close() {
+    openSeq += 1;
     clear(hostEl);
     hostEl.classList.add("hidden");
   }
@@ -16,6 +19,7 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
 
   async function open(identifier) {
     if (!identifier) return;
+    const seq = ++openSeq;
     clear(hostEl);
     const panel = el("aside", { className: "drawer-panel" }, skeletonCards(3));
     hostEl.appendChild(panel);
@@ -23,6 +27,7 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
 
     try {
       const data = await api.person(identifier, 60);
+      if (seq !== openSeq) return;
       clear(panel);
 
       const firstConn = data.connections && data.connections[0];
@@ -194,6 +199,7 @@ export function createPersonDrawer(hostEl, { onOpenPost, onNavigateThread }) {
 
       renderTab();
     } catch (err) {
+      if (seq !== openSeq) return;
       clear(panel);
       panel.appendChild(el("div", { className: "error-box" }, `인물 정보 조회 실패: ${err.message}`));
     }

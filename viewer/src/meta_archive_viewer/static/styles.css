@@ -3053,15 +3053,49 @@ select {
   }
 }
 
+@media (hover: none) {
+  .mem-star-btn,
+  .mem-tile-post-btn,
+  .mem-photo-overlay {
+    opacity: 1;
+  }
+}
+
 @media (max-width: 640px) {
   .topbar-inner {
-    padding: 0 12px;
-    gap: 8px;
+    height: auto;
+    flex-wrap: wrap;
+    padding: 8px 12px 0;
+    gap: 4px 8px;
+  }
+
+  .brand-title {
+    font-size: 0.9rem;
+  }
+
+  .topbar-actions {
+    margin-left: auto;
+  }
+
+  .nav-tabs {
+    order: 3;
+    width: 100%;
+    height: 38px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    border-top: 1px solid var(--border);
+    justify-content: space-between;
+  }
+
+  .nav-tabs::-webkit-scrollbar {
+    display: none;
   }
 
   .nav-tab {
     padding: 0 8px;
     font-size: 0.82rem;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .app-main {

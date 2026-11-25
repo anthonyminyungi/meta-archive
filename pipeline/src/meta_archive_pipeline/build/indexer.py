@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import unicodedata
 import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -246,6 +247,23 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
 """
 
 
+def _nfc(val: str | None) -> str | None:
+    """Normalize text to Unicode NFC so Korean Hangul never splits into NFD jamo."""
+    return unicodedata.normalize("NFC", val) if isinstance(val, str) else val
+
+
+def _nfc_str(val: str | None) -> str:
+    return unicodedata.normalize("NFC", val) if isinstance(val, str) else ""
+
+
+def _nfc_dict_fields(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    out = dict(data)
+    for key in keys:
+        if isinstance(out.get(key), str):
+            out[key] = unicodedata.normalize("NFC", out[key])
+    return out
+
+
 def _load_json_list(path: Path) -> list[dict[str, Any]]:
     long_p = to_long_path(path)
     if not os.path.exists(long_p):
@@ -311,6 +329,10 @@ def _insert_comments_recursive(
 ) -> int:
     inserted = 0
     for c in comments:
+        author_username = _nfc(c.author.username)
+        author_name = _nfc(c.author.full_name)
+        comment_text = _nfc_str(c.text)
+        stickers_nfc = [_nfc_str(s) if isinstance(s, str) else s for s in c.stickers]
         conn.execute(
             """
             INSERT INTO comments (
@@ -325,29 +347,29 @@ def _insert_comments_recursive(
                 parent_comment_id,
                 platform,
                 depth,
-                c.author.username,
-                c.author.full_name,
-                c.text,
+                author_username,
+                author_name,
+                comment_text,
                 c.created_at.isoformat() if c.created_at else None,
                 c.timestamp_unix,
                 c.like_count,
                 json.dumps([m.model_dump(mode="json") for m in c.media], ensure_ascii=False),
-                json.dumps(c.stickers, ensure_ascii=False),
+                json.dumps(stickers_nfc, ensure_ascii=False),
                 c.reactions.model_dump_json() if c.reactions else None,
             ),
         )
         inserted += 1
 
         author_str = " ".join(
-            part for part in (c.author.username, c.author.full_name) if part
+            part for part in (author_username, author_name) if part
         )
-        if c.text or author_str:
+        if comment_text or author_str:
             conn.execute(
                 """
                 INSERT INTO search_fts (entity_type, entity_id, platform, author, body, timestamp_unix)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                ("comment", post_id, platform, author_str, c.text, c.timestamp_unix or 0),
+                ("comment", post_id, platform, author_str, comment_text, c.timestamp_unix or 0),
             )
 
         if c.replies:
@@ -421,9 +443,9 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                 (
                     prof.platform,
                     prof.user_id,
-                    prof.username,
-                    prof.full_name,
-                    prof.bio,
+                    _nfc(prof.username),
+                    _nfc(prof.full_name),
+                    _nfc_str(prof.bio),
                     prof.avatar_local_path,
                     prof.counts.model_dump_json(),
                     prof.exported_at.isoformat() if prof.exported_at else None,
@@ -432,9 +454,32 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
             counts["profiles"] += 1
 
         for post in posts:
-            loc_name = post.location.name if post.location else None
+            loc_name = _nfc(post.location.name) if post.location else None
             loc_lat = post.location.lat if post.location else None
             loc_lng = post.location.lng if post.location else None
+            author_username = _nfc(post.author.username)
+            author_name = _nfc(post.author.full_name)
+            caption_nfc = _nfc_str(post.caption)
+            activity_title_nfc = _nfc(post.activity_title)
+            hashtags_nfc = [_nfc_str(t) for t in post.hashtags]
+            album_name_nfc = _nfc(post.album_name)
+            group_name_nfc = _nfc(post.group_name)
+            audience_nfc = _nfc(post.audience)
+            tagged_users_nfc = [
+                _nfc_dict_fields(u.model_dump(mode="json"), ("username", "full_name"))
+                for u in post.tagged_users
+            ]
+            shared_post_json = (
+                json.dumps(
+                    _nfc_dict_fields(
+                        post.shared_post.model_dump(mode="json"),
+                        ("title", "text", "author_name", "domain"),
+                    ),
+                    ensure_ascii=False,
+                )
+                if post.shared_post
+                else None
+            )
             conn.execute(
                 """
                 INSERT OR REPLACE INTO posts (
@@ -452,28 +497,25 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     post.shortcode,
                     post.url,
                     post.post_type,
-                    post.author.username,
-                    post.author.full_name,
+                    author_username,
+                    author_name,
                     post.created_at.isoformat() if post.created_at else None,
                     post.timestamp_unix,
-                    post.caption,
-                    post.activity_title,
-                    json.dumps(post.hashtags, ensure_ascii=False),
+                    caption_nfc,
+                    activity_title_nfc,
+                    json.dumps(hashtags_nfc, ensure_ascii=False),
                     loc_name,
                     loc_lat,
                     loc_lng,
-                    json.dumps(
-                        [u.model_dump(mode="json") for u in post.tagged_users],
-                        ensure_ascii=False,
-                    ),
+                    json.dumps(tagged_users_nfc, ensure_ascii=False),
                     post.likes.count,
                     int(post.likes.is_truncated),
                     post.reactions.total,
                     post.reactions.model_dump_json(),
-                    post.album_name,
-                    post.group_name,
-                    post.shared_post.model_dump_json() if post.shared_post else None,
-                    post.audience,
+                    album_name_nfc,
+                    group_name_nfc,
+                    shared_post_json,
+                    audience_nfc,
                     int(post.is_archived),
                     int(post.is_collab),
                     post.source,
@@ -494,19 +536,26 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     INSERT INTO likes (post_id, platform, user_id, username, full_name, profile_url)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (post.post_id, post.platform, u.user_id, u.username, u.full_name, u.profile_url),
+                    (
+                        post.post_id,
+                        post.platform,
+                        u.user_id,
+                        _nfc(u.username),
+                        _nfc(u.full_name),
+                        u.profile_url,
+                    ),
                 )
                 counts["likes"] += 1
 
             post_author = " ".join(
-                p for p in (post.author.username, post.author.full_name) if p
+                p for p in (author_username, author_name) if p
             )
             shared_parts = (
                 (
-                    post.shared_post.title,
-                    post.shared_post.text,
-                    post.shared_post.author_name,
-                    post.shared_post.domain,
+                    _nfc(post.shared_post.title),
+                    _nfc(post.shared_post.text),
+                    _nfc(post.shared_post.author_name),
+                    _nfc(post.shared_post.domain),
                 )
                 if post.shared_post
                 else ()
@@ -514,12 +563,12 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
             post_body = " ".join(
                 p
                 for p in (
-                    post.caption,
-                    post.activity_title,
+                    caption_nfc,
+                    activity_title_nfc,
                     loc_name,
-                    post.album_name,
-                    post.group_name,
-                    " ".join(f"#{t}" for t in post.hashtags),
+                    album_name_nfc,
+                    group_name_nfc,
+                    " ".join(f"#{t}" for t in hashtags_nfc),
                     *shared_parts,
                 )
                 if p
@@ -534,7 +583,10 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                 )
 
         for story in stories:
-            loc_name = story.location.name if story.location else None
+            loc_name = _nfc(story.location.name) if story.location else None
+            story_caption = _nfc(story.caption)
+            story_hl_title = _nfc(story.highlight_title)
+            story_stickers = [_nfc_str(s) if isinstance(s, str) else s for s in story.stickers]
             conn.execute(
                 """
                 INSERT OR REPLACE INTO stories (
@@ -548,13 +600,13 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     story.platform,
                     story.created_at.isoformat() if story.created_at else None,
                     story.timestamp_unix,
-                    story.caption,
+                    story_caption,
                     story.source,
                     story.highlight_id,
-                    story.highlight_title,
+                    story_hl_title,
                     story.highlight_cover,
                     loc_name,
-                    json.dumps(story.stickers, ensure_ascii=False),
+                    json.dumps(story_stickers, ensure_ascii=False),
                     story.likes_count,
                     story.model_dump_json(),
                 ),
@@ -565,7 +617,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     conn, "story", story.story_id, story.platform, [story.media]
                 )
             story_body = " ".join(
-                p for p in (story.caption, story.highlight_title, loc_name, *story.stickers) if p
+                p for p in (story_caption, story_hl_title, loc_name, *(s for s in story_stickers if isinstance(s, str))) if p
             )
             if story_body:
                 conn.execute(
@@ -577,6 +629,8 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                 )
 
         for c in connections:
+            c_username = _nfc(c.username)
+            c_full_name = _nfc(c.full_name)
             conn.execute(
                 """
                 INSERT INTO connections (
@@ -589,8 +643,8 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     c.platform,
                     c.relation,
                     c.user_id,
-                    c.username,
-                    c.full_name,
+                    c_username,
+                    c_full_name,
                     c.profile_url,
                     c.avatar_local_path,
                     c.connected_at.isoformat() if c.connected_at else None,
@@ -599,7 +653,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                 ),
             )
             counts["connections"] += 1
-            conn_author = " ".join(p for p in (c.username, c.full_name) if p)
+            conn_author = " ".join(p for p in (c_username, c_full_name) if p)
             if conn_author:
                 conn.execute(
                     """
@@ -608,7 +662,7 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     """,
                     (
                         "connection",
-                        c.username or c.full_name or "",
+                        c_username or c_full_name or "",
                         c.platform,
                         conn_author,
                         conn_author,
@@ -618,6 +672,11 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
 
         for thread in threads:
             last_ts = max((m.timestamp_unix or 0 for m in thread.messages), default=0)
+            thread_title = _nfc(thread.title)
+            participants_nfc = [
+                _nfc_dict_fields(p.model_dump(mode="json"), ("username", "full_name"))
+                for p in thread.participants
+            ]
             conn.execute(
                 """
                 INSERT OR REPLACE INTO message_threads (
@@ -628,12 +687,9 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                 (
                     thread.thread_id,
                     thread.platform,
-                    thread.title,
+                    thread_title,
                     thread.avatar_local_path,
-                    json.dumps(
-                        [p.model_dump(mode="json") for p in thread.participants],
-                        ensure_ascii=False,
-                    ),
+                    json.dumps(participants_nfc, ensure_ascii=False),
                     int(thread.is_e2ee),
                     int(thread.is_pending),
                     len(thread.messages),
@@ -643,6 +699,14 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
             counts["message_threads"] += 1
 
             for seq, msg in enumerate(thread.messages):
+                msg_sender = _nfc(msg.sender)
+                msg_text = _nfc_str(msg.text)
+                msg_share_text = _nfc(msg.share_text)
+                msg_share_owner = _nfc(msg.share_owner)
+                reactions_nfc = [
+                    _nfc_dict_fields(r.model_dump(mode="json"), ("actor", "reaction"))
+                    for r in msg.reactions
+                ]
                 conn.execute(
                     """
                     INSERT INTO messages (
@@ -657,19 +721,16 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                         msg.message_id,
                         thread.platform,
                         seq,
-                        msg.sender,
+                        msg_sender,
                         msg.timestamp_unix,
                         msg.timestamp_ms,
                         msg.created_at.isoformat() if msg.created_at else None,
-                        msg.text,
-                        json.dumps(
-                            [r.model_dump(mode="json") for r in msg.reactions],
-                            ensure_ascii=False,
-                        ),
+                        msg_text,
+                        json.dumps(reactions_nfc, ensure_ascii=False),
                         msg.reply_to_id,
                         msg.shared_link,
-                        msg.share_text,
-                        msg.share_owner,
+                        msg_share_text,
+                        msg_share_owner,
                         int(msg.is_unsent),
                         int(msg.is_missed_call),
                         msg.call_duration,
@@ -684,8 +745,8 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                         thread.platform,
                         msg.media,
                     )
-                msg_body = " ".join(p for p in (msg.text, msg.share_text, msg.share_owner) if p)
-                if msg_body or msg.sender:
+                msg_body = " ".join(p for p in (msg_text, msg_share_text, msg_share_owner) if p)
+                if msg_body or msg_sender:
                     conn.execute(
                         """
                         INSERT INTO search_fts (entity_type, entity_id, platform, author, body, timestamp_unix)
@@ -695,13 +756,17 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                             "message",
                             thread.thread_id,
                             thread.platform,
-                            msg.sender,
+                            msg_sender or "",
                             msg_body,
                             msg.timestamp_unix or 0,
                         ),
                     )
 
         for act in activities:
+            act_text = _nfc_str(act.text)
+            act_title = _nfc(act.title)
+            act_target = _nfc(act.target_author)
+            act_group = _nfc(act.group_name)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO activities (
@@ -715,10 +780,10 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                     act.kind,
                     act.created_at.isoformat() if act.created_at else None,
                     act.timestamp_unix,
-                    act.text,
-                    act.title,
-                    act.target_author,
-                    act.group_name,
+                    act_text,
+                    act_title,
+                    act_target,
+                    act_group,
                     act.url,
                     act.source,
                     act.model_dump_json(),
@@ -729,8 +794,8 @@ def build_sqlite_index(archive_root: Path) -> IndexBuildResult:
                 counts["media"] += _insert_media_rows(
                     conn, "activity", act.activity_id, act.platform, act.media
                 )
-            act_author = " ".join(p for p in (act.target_author, act.group_name) if p)
-            act_body = " ".join(p for p in (act.text, act.title, act.group_name) if p)
+            act_author = " ".join(p for p in (act_target, act_group) if p)
+            act_body = " ".join(p for p in (act_text, act_title, act_group) if p)
             if act_body or act_author:
                 conn.execute(
                     """
@@ -786,35 +851,37 @@ def search_archive(
     query: str,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    """Run hybrid Korean search (FTS5 trigram for >=3 chars, INSTR fallback for 1-2 chars)."""
-    q = query.strip()
+    """Run hybrid Korean search (multi-token AND across FTS5 trigram >=3 chars and INSTR 1-2 chars)."""
+    q = _nfc_str(query).strip()
     if not q:
         return []
 
-    if len(q) >= 3:
-        fts_expr = '"' + q.replace('"', '""') + '"'
-        rows = conn.execute(
-            """
-            SELECT entity_type, entity_id, platform, author, body, timestamp_unix
-            FROM search_fts
-            WHERE search_fts MATCH ?
-            ORDER BY bm25(search_fts), timestamp_unix DESC
-            LIMIT ?
-            """,
-            (fts_expr, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT entity_type, entity_id, platform, author, body, timestamp_unix
-            FROM search_fts
-            WHERE instr(lower(body), lower(?)) > 0
-               OR instr(lower(author), lower(?)) > 0
-            ORDER BY timestamp_unix DESC
-            LIMIT ?
-            """,
-            (q, q, limit),
-        ).fetchall()
+    tokens = q.split()
+    fts_tokens = [t for t in tokens if len(t) >= 3]
+    short_tokens = [t for t in tokens if len(t) < 3]
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if fts_tokens:
+        fts_expr = " ".join('"' + t.replace('"', '""') + '"' for t in fts_tokens)
+        clauses.append("search_fts MATCH ?")
+        params.append(fts_expr)
+    for st in short_tokens:
+        clauses.append("(instr(lower(body), lower(?)) > 0 OR instr(lower(author), lower(?)) > 0)")
+        params.extend([st, st])
+
+    where_sql = " AND ".join(clauses)
+    order_sql = "bm25(search_fts), timestamp_unix DESC" if fts_tokens else "timestamp_unix DESC"
+    rows = conn.execute(
+        f"""
+        SELECT entity_type, entity_id, platform, author, body, timestamp_unix
+        FROM search_fts
+        WHERE {where_sql}
+        ORDER BY {order_sql}
+        LIMIT ?
+        """,
+        [*params, limit],
+    ).fetchall()
 
     return [dict(row) for row in rows]
 

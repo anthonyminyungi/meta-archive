@@ -1,8 +1,8 @@
 /** Zero-flicker full-screen media lightbox with persistent chrome, decode() swap, and keyboard navigation. */
 
-import { mediaUrl, preloadImage } from "../api.js?v=3";
-import { clear, el, isAudioMedia, isDocumentMedia, isVideoMedia } from "../dom.js?v=3";
-import { icon } from "../icons.js?v=3";
+import { mediaUrl, preloadImage } from "../api.js?v=5";
+import { clear, el, isAudioMedia, isDocumentMedia, isVideoMedia } from "../dom.js?v=5";
+import { icon } from "../icons.js?v=5";
 
 function isPlainImage(item) {
   return Boolean(item && item.local_path && !isAudioMedia(item) && !isVideoMedia(item) && !isDocumentMedia(item));

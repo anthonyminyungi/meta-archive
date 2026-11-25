@@ -1,8 +1,8 @@
 /** Recursive nested comment/reply tree renderer with commenter avatars and clean speech bubbles. */
 
-import { mediaUrl } from "../api.js?v=3";
-import { avatarEl, el, formatDate, isAudioMedia, isVideoMedia, personButton } from "../dom.js?v=3";
-import { icon } from "../icons.js?v=3";
+import { mediaUrl } from "../api.js?v=5";
+import { avatarEl, el, formatDate, isAudioMedia, isVideoMedia, personButton } from "../dom.js?v=5";
+import { icon } from "../icons.js?v=5";
 
 function renderCommentNode(comment, onOpenPerson, onOpenLightbox) {
   const repliesNode =

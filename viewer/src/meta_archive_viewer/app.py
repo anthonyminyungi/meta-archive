@@ -151,6 +151,7 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
         version=__version__,
         docs_url=None,
         redoc_url=None,
+        openapi_url=None,
     )
     fastapi_app.state.archive_dir = resolved_archive
     fastapi_app.state.reader = reader
@@ -158,6 +159,7 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
     @fastapi_app.middleware("http")
     async def _static_cache_middleware(request: Request, call_next: Any) -> Response:
         response: Response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
         path = request.url.path
         if path.startswith("/static/fonts/"):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
@@ -316,12 +318,14 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
         q: str = "",
         platform: str | None = None,
         entity_type: str | None = None,
+        offset: int = Query(default=0, ge=0),
         limit: int = Query(default=50, ge=1, le=200),
     ) -> dict[str, Any]:
         return reader.search(
             query=q,
             platform=platform,
             entity_type=entity_type,
+            offset=offset,
             limit=limit,
         )
 
@@ -349,8 +353,14 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
     @fastapi_app.get("/api/memories/yearbook")
     def api_memories_yearbook(
         year: int | None = Query(default=None, ge=2000, le=2100),
+        posts_offset: int = Query(default=0, ge=0),
+        posts_limit: int = Query(default=40, ge=1, le=200),
     ) -> dict[str, Any]:
-        return reader.get_memories_yearbook(year=year)
+        return reader.get_memories_yearbook(
+            year=year,
+            posts_offset=posts_offset,
+            posts_limit=posts_limit,
+        )
 
     @fastapi_app.get("/api/memories/people")
     def api_memories_people(
@@ -390,6 +400,10 @@ def create_app(archive_dir: Path | None = None) -> FastAPI:
             "Accept-Ranges": "bytes",
             "Cache-Control": "public, max-age=31536000, immutable",
         }
+        if not media_type.startswith(("image/", "video/", "audio/")) and media_type != "application/pdf":
+            ascii_name = "".join(ch if 32 <= ord(ch) < 127 and ch not in {'"', "\\"} else "_" for ch in target.name) or "download"
+            encoded_name = urllib.parse.quote(target.name, safe="")
+            base_headers["Content-Disposition"] = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"
 
         range_header = request.headers.get("range")
         if not range_header:
