@@ -315,10 +315,24 @@ class ResponseCollector:
         self.url_substrings = tuple(url_substrings)
         self.responses: list[CapturedResponse] = []
         self.safety_error: SafetyStopError | None = None
+        self._attached_page: Any = None
 
     def attach(self, page: Any) -> None:
         """Attach response listener to a Playwright Page."""
+        self._attached_page = page
         page.on("response", self.handle_response)
+
+    def detach(self) -> None:
+        """Detach response listener from the attached Playwright Page if supported."""
+        if self._attached_page is None:
+            return
+        remover = getattr(self._attached_page, "remove_listener", None)
+        if callable(remover):
+            try:
+                remover("response", self.handle_response)
+            except Exception:
+                pass
+        self._attached_page = None
 
     def handle_response(self, response: Any) -> None:
         """Handle a single Playwright Response event."""

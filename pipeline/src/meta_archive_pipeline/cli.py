@@ -461,3 +461,144 @@ def build(
         for fail in failures[:10]:
             console.print(f"[red]매니페스트 검증 실패:[/red] {fail}")
         raise typer.Exit(code=1)
+
+
+@app.command()
+def sync(
+    archive_dir: Annotated[
+        Path,
+        typer.Option("--archive-dir", help="기존 표준 아카이브 디렉터리"),
+    ] = Path("workspace_data/archive"),
+    staging_dir: Annotated[
+        Path,
+        typer.Option("--staging-dir", help="증분 수집 임시 스테이징 디렉터리"),
+    ] = Path("workspace_data/sync-staging"),
+    cdp_url: Annotated[
+        str,
+        typer.Option("--cdp-url", help="실행 중인 Chrome CDP 주소"),
+    ] = "http://127.0.0.1:9222",
+    apply: Annotated[
+        bool,
+        typer.Option("--apply/--dry-run", help="실제 아카이브에 반영(--apply) 또는 사전 점검(--dry-run)"),
+    ] = False,
+    offline_only: Annotated[
+        bool,
+        typer.Option("--offline-only", help="브라우저 연결 없이 오프라인 FB 중복 병합만 수행"),
+    ] = False,
+    ig: Annotated[
+        bool,
+        typer.Option("--ig/--no-ig", help="Instagram 증분 점검 및 미디어/오디오 복구 포함"),
+    ] = True,
+    fb: Annotated[
+        bool,
+        typer.Option("--fb/--no-fb", help="Facebook 메신저(E2EE 포함) 및 타임라인 증분 점검 포함"),
+    ] = True,
+    dedup_fb: Annotated[
+        bool,
+        typer.Option("--dedup-fb/--no-dedup-fb", help="기존 아카이브 내 Facebook 빈 스텁 중복 병합 포함"),
+    ] = True,
+    wait_pin_sec: Annotated[
+        int,
+        typer.Option("--wait-pin-sec", help="FB 메신저 E2EE PIN 입력 대기 시간(초)"),
+    ] = 90,
+    report_out: Annotated[
+        Path | None,
+        typer.Option("--report-out", help="동기화 점검/반영 리포트 JSON 저장 경로"),
+    ] = Path("workspace_data/sync_report.json"),
+    tz_offset: Annotated[
+        str,
+        typer.Option("--tz-offset", help="신규 미디어 XMP 사이드카 타임존 오프셋"),
+    ] = "+09:00",
+) -> None:
+    """Incrementally check/sync new IG & FB data via Playwright CDP, repair gaps, and patch archive in place."""
+    from meta_archive_pipeline.build.patcher import SyncDelta, apply_sync_delta
+    from meta_archive_pipeline.collect.sync import SyncConfig, collect_incremental_sync
+    from meta_archive_pipeline.utils.fs import atomic_write_bytes
+
+    def _resolve_workspace_path(p: Path, *, must_exist: bool = False) -> Path:
+        if p.is_absolute():
+            return p
+        if p.exists():
+            return p
+        parent_cand = Path.cwd().parent / p
+        if parent_cand.exists() or (not must_exist and Path.cwd().name == "pipeline" and (Path.cwd().parent / "workspace_data").exists()):
+            return parent_cand
+        return p
+
+    archive_dir = _resolve_workspace_path(archive_dir, must_exist=True)
+    staging_dir = _resolve_workspace_path(staging_dir)
+    if report_out is not None:
+        report_out = _resolve_workspace_path(report_out)
+
+    if offline_only:
+        delta = SyncDelta()
+    else:
+        cfg = SyncConfig(
+            archive_dir=archive_dir,
+            staging_dir=staging_dir,
+            cdp_url=cdp_url,
+            sync_ig=ig,
+            sync_fb=fb,
+            wait_pin_sec=wait_pin_sec,
+        )
+        delta = collect_incremental_sync(cfg)
+
+    summary = apply_sync_delta(
+        archive_dir,
+        delta,
+        apply=apply,
+        dedup_fb=dedup_fb,
+        tz_offset=tz_offset,
+    )
+
+    mode_tag = "[green]APPLIED[/green]" if summary.applied else "[cyan]DRY-RUN[/cyan]"
+    console.print(f"동기화 결과 ({mode_tag})")
+    table = Table(title="증분 점검 · 빈틈 복구 요약")
+    table.add_column("항목")
+    table.add_column("건수", justify="right")
+    table.add_row("FB 중복 빈 스텁 병합", str(summary.fb_stubs_merged))
+    table.add_row("FB 잔여 모호 매칭", str(summary.fb_ambiguous_remaining))
+    table.add_row("IG DM 신규 메시지", f"{summary.ig_new_messages} (갱신 {summary.ig_updated_threads} / 신규방 {summary.ig_new_threads})")
+    table.add_row("FB 메신저 신규 메시지", f"{summary.fb_new_messages} (갱신 {summary.fb_updated_threads} / 신규방 {summary.fb_new_threads})")
+    table.add_row("IG DM 누락 이미지 복구", str(summary.dm_media_repaired))
+    table.add_row("IG 무음 영상 오디오 복구", str(summary.videos_audio_repaired))
+    table.add_row("IG 무음 영상 원본무음 확정", str(summary.videos_confirmed_silent))
+    table.add_row("게시물 추가 / 댓글·좋아요 갱신", f"{summary.posts_added} / {summary.posts_updated}")
+    table.add_row("스토리 추가", str(summary.stories_added))
+    table.add_row("팔로우·친구 추가", str(summary.connections_added))
+    console.print(table)
+
+    if summary.thread_previews:
+        console.print("[bold]변경된 대화방 미리보기:[/bold]")
+        for tp in summary.thread_previews[:15]:
+            e2ee_tag = " [E2EE]" if tp.get("is_e2ee") else ""
+            console.print(
+                f"  - [{tp['platform']}{e2ee_tag}] {tp['title']} (+{tp['added_messages']}건, 최근={tp.get('latest_at') or '-'}) {tp.get('sample_text') or ''}"
+            )
+
+    if summary.video_outcomes:
+        console.print("[bold]IG 무음 영상 10건 점검 결과:[/bold]")
+        for vo in summary.video_outcomes:
+            console.print(f"  - {vo['shortcode']}#{vo['media_index']}: {vo['status']} ({vo['detail']})")
+
+    for note in summary.notes:
+        console.print(f"[yellow]참고:[/yellow] {note}")
+
+    if summary.applied:
+        console.print(
+            f"[green]반영 완료[/green]: 백업={summary.backup_dir}, 미디어복사={summary.media_copied}, "
+            f"XMP={summary.xmp_written}, 매니페스트 검증={summary.manifest_verified}건"
+        )
+        if summary.manifest_failures:
+            for fail in summary.manifest_failures[:10]:
+                console.print(f"[red]매니페스트 검증 실패:[/red] {fail}")
+            raise typer.Exit(code=1)
+    else:
+        console.print("[cyan]--dry-run 모드이므로 아카이브를 수정하지 않았습니다. 반영하려면 --apply 옵션을 붙여 실행하세요.[/cyan]")
+
+    if report_out is not None:
+        atomic_write_bytes(
+            report_out,
+            json.dumps(summary.to_dict(), ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        console.print(f"리포트 저장: {report_out}")

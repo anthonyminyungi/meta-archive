@@ -611,3 +611,81 @@ def test_fb_official_duplicate_empty_share_stubs_dedup_and_merge_with_playwright
     assert merged_posts[0].shared_post is not None
     assert merged_posts[0].shared_post.author_name == "임진호"
     assert merged_posts[0].shared_post.thumbnail_local_path == "media/facebook/links/3361571257310715_thumb.jpg"
+
+
+def test_fb_exact_empty_status_stubs_mention_markup_and_group_isolation() -> None:
+    ts = 1722346904
+    # 1. Empty status update stub with ts_delta == 0 merges cleanly
+    off_status = Post(
+        platform="facebook",
+        post_id="fb_official_1",
+        post_type="post",
+        timestamp_unix=ts,
+        caption="",
+        activity_title="민윤기님이 상태를 업데이트했습니다.",
+        source="official_export",
+    )
+    pw_status = Post(
+        platform="facebook",
+        post_id="3162337327234110",
+        post_type="post",
+        timestamp_unix=ts,
+        caption="",
+        source="playwright",
+    )
+    # 2. Facebook @[id:type:Name] mention markup normalizes to Name
+    off_mention = Post(
+        platform="facebook",
+        post_id="fb_official_2",
+        post_type="shared",
+        timestamp_unix=ts - 1000,
+        caption="@[100007046917539:2048:김재원]",
+        source="official_export",
+    )
+    pw_mention = Post(
+        platform="facebook",
+        post_id="674555589345642",
+        post_type="shared",
+        timestamp_unix=ts - 1000,
+        caption="김재원",
+        source="playwright",
+    )
+    # 3. Official group_post does not steal a non-group Playwright timeline post
+    off_group = Post(
+        platform="facebook",
+        post_id="fb_group_1",
+        post_type="group_post",
+        group_name="테스트그룹",
+        timestamp_unix=ts - 2000 + 53,
+        caption="http://soundshub.cf 공유 테스트",
+        source="official_export",
+    )
+    off_timeline = Post(
+        platform="facebook",
+        post_id="fb_official_3",
+        post_type="shared",
+        timestamp_unix=ts - 2000,
+        caption="http://soundshub.cf 공유 테스트",
+        source="official_export",
+    )
+    pw_timeline = Post(
+        platform="facebook",
+        post_id="1594486164019242",
+        post_type="shared",
+        timestamp_unix=ts - 2000,
+        caption="http://soundshub.cf 공유 테스트",
+        source="playwright",
+    )
+
+    merged_posts, amb = merge_posts(
+        [off_status, off_mention, off_group, off_timeline],
+        [pw_status, pw_mention, pw_timeline],
+    )
+    assert amb == []
+    assert len(merged_posts) == 4
+    by_id = {p.post_id: p for p in merged_posts}
+    assert by_id["3162337327234110"].source == "merged"
+    assert by_id["3162337327234110"].activity_title == "민윤기님이 상태를 업데이트했습니다."
+    assert by_id["674555589345642"].source == "merged"
+    assert by_id["1594486164019242"].source == "merged"
+    assert by_id["fb_group_1"].source == "official_export"

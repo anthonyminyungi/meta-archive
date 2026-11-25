@@ -151,6 +151,30 @@ uv --directory pipeline run meta-archive build `
 
 - 빌드가 끝나면 `workspace_data\archive\data\ambiguous_matches.json`에 보류된 모호 매칭 항목이 있는지 확인하세요.
 
+### 7. 공식 재내보내기 없이 증분 점검 · 빈틈 복구 (`sync`)
+
+공식 반출본을 다시 기다리지 않고, 기존 `workspace_data\archive` 기준으로 **이후에 추가된 IG DM / FB 메신저(E2EE 포함) / 신규 게시물·댓글·스토리·팔로우 변동**과 **기존 빈틈(FB 중복 빈 스텁 100건, IG DM 누락 이미지 13건, IG 무음 영상 10건 오디오 확인/복구)**을 Playwright(CDP)로 점검·반영할 수 있습니다.
+
+```powershell
+# 1단계: 전용 Chrome 실행 후 Instagram & Facebook 로그인 확인
+uv --directory pipeline run meta-archive launch-chrome --profile-dir "workspace_data\chrome-profile" --port 9222
+
+# 2단계: 사전 점검 (--dry-run, 아카이브를 건드리지 않고 추가/복구될 내역만 리포트)
+uv --directory pipeline run meta-archive sync `
+  --archive-dir "workspace_data\archive" `
+  --cdp-url "http://127.0.0.1:9222" `
+  --dry-run
+
+# 3단계: 리포트 확인 후 실제 반영 (--apply: 자동 백업 → 병합 → 미디어/XMP → SQLite/manifest.sha256 재빌드)
+uv --directory pipeline run meta-archive sync `
+  --archive-dir "workspace_data\archive" `
+  --cdp-url "http://127.0.0.1:9222" `
+  --apply
+```
+
+- FB 중복 빈 스텁 정리만 브라우저 없이 바로 돌릴 때는 `--offline-only` 옵션을 붙이면 됩니다.
+- FB 메신저에서 E2EE PIN 입력 화면이 뜨면 열린 Chrome 창에서 PIN을 입력할 때까지 기본 90초(`--wait-pin-sec`) 대기합니다.
+
 ---
 
 ## 로컬 웹 뷰어 미리보기 (`viewer/`)

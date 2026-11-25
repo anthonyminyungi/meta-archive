@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
 import urllib.parse
@@ -131,8 +132,12 @@ def _resolve_source_file(rel_path: str | None, roots: Sequence[Path]) -> Path | 
     return None
 
 
+_FB_MENTION_RE = re.compile(r"@\[\d+:\d+:([^\]]+)\]")
+
+
 def _norm_caption(text: str) -> str:
-    return " ".join(text.split()).lower()
+    cleaned = _FB_MENTION_RE.sub(r"\1", text)
+    return " ".join(cleaned.split()).lower()
 
 
 def _non_cover_media(post: Post) -> list[MediaItem]:
@@ -372,6 +377,9 @@ def _score_post_pair(
     off_hashes: Sequence[int],
     pw_hashes: Sequence[int],
 ) -> tuple[float, dict[str, Any]] | None:
+    if off.post_type == "group_post" and pw.post_type != "group_post" and not pw.group_name:
+        return None
+
     ts_delta: int | None = None
     score = 0.0
 
@@ -422,8 +430,9 @@ def _score_post_pair(
     if off_url_key and pw_url_key and off_url_key == pw_url_key:
         score += 3.0
 
-    # Meta official FB exports strip the body/URL of shared FB posts, leaving an empty
-    # share stub ("~님이 게시물을 공유했습니다.") with identical timestamp (±60s) to the rich Playwright share.
+    # Meta official FB exports strip the body/URL of shared FB posts and status updates,
+    # leaving empty stubs ("~님이 게시물을 공유했습니다.", "~님이 상태를 업데이트했습니다.")
+    # with matching timestamps against Playwright timeline posts.
     off_is_share_stub = (
         off.platform == "facebook"
         and off_cnt == 0
@@ -438,10 +447,25 @@ def _score_post_pair(
         )
         and (pw.post_type == "shared" or pw.shared_post is not None)
     )
+    off_is_exact_empty_fb_stub = (
+        off.platform == "facebook"
+        and off_cnt == 0
+        and pw_cnt == 0
+        and not off_cap
+        and not pw_cap
+        and off.post_type in ("post", "shared")
+        and pw.post_type in ("post", "shared")
+        and ts_delta is not None
+        and ts_delta <= 2
+    )
     if off_is_share_stub and ts_delta is not None and ts_delta <= 60:
         score += 1.5
         if ts_delta <= 2:
             score += 1.5
+    elif off_is_exact_empty_fb_stub:
+        score += 1.5
+        if ts_delta == 0:
+            score += 0.5
 
     if score < 2.5:
         return None
